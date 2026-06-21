@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -11,4 +12,11 @@ pub struct LoginResponse {
     pub access_token: String,
     pub token_type: String,
     pub expires_in: i64,
+}
+
+#[derive(Serialize)]
+pub struct MeResponse {
+    pub id: Uuid,
+    pub username: String,
+    pub roles: Vec<String>,
 }

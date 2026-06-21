@@ -6,6 +6,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/auth/login", post(crate::auth::handlers::login))
+        .route("/auth/me", get(crate::auth::handlers::me))
         .with_state(state)
 }
 
