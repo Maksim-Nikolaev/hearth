@@ -33,6 +33,29 @@ impl SignalingHub {
         }
     }
 
+    /// The user's display name and current room, if they have joined one.
+    pub fn user_context(&self, user: Uuid) -> Option<(String, String)> {
+        let peers = self.peers.lock().unwrap();
+        let peer = peers.get(&user)?;
+        let room = peer.room.clone()?;
+
+        Some((peer.username.clone(), room))
+    }
+
+    /// Send a message to every member of a room (including the originator).
+    pub fn broadcast(&self, room: &str, msg: ServerMessage) {
+        let peers = self.peers.lock().unwrap();
+        let rooms = self.rooms.lock().unwrap();
+
+        if let Some(members) = rooms.get(room) {
+            for id in members {
+                if let Some(p) = peers.get(id) {
+                    let _ = p.tx.send(msg.clone());
+                }
+            }
+        }
+    }
+
     pub fn join_room(&self, user: Uuid, room: &str) {
         let mut peers = self.peers.lock().unwrap();
         let mut rooms = self.rooms.lock().unwrap();

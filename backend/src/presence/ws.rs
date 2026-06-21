@@ -53,7 +53,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, id: uuid::Uuid, usern
         match msg {
             Message::Text(text) => {
                 if let Ok(cm) = serde_json::from_str::<crate::signaling::message::ClientMessage>(&text) {
-                    dispatch(&state, id, cm);
+                    dispatch(&state, id, cm).await;
                 }
             }
             Message::Close(_) => break,
@@ -66,15 +66,41 @@ async fn handle_socket(socket: WebSocket, state: AppState, id: uuid::Uuid, usern
     state.presence.mark_offline(id, &username);
 }
 
-fn dispatch(state: &AppState, from: uuid::Uuid, msg: crate::signaling::message::ClientMessage) {
-    use crate::signaling::message::{ClientMessage, ServerMessage};
+async fn dispatch(state: &AppState, from: uuid::Uuid, msg: crate::signaling::message::ClientMessage) {
+    use crate::signaling::message::{ChatEntry, ClientMessage, ServerMessage};
 
     match msg {
-        ClientMessage::Join { room } => state.signaling.join_room(from, &room),
+        ClientMessage::Join { room } => {
+            state.signaling.join_room(from, &room);
+
+            // Deliver recent history to the joiner (oldest first).
+            if let Ok(rows) = crate::chat::repository::recent(&state.pool, &room, 50).await {
+                let messages: Vec<ChatEntry> = rows
+                    .into_iter()
+                    .rev()
+                    .map(|r| ChatEntry {
+                        from: r.from_user,
+                        username: r.username,
+                        body: r.body,
+                        at: (r.created_at.unix_timestamp_nanos() / 1_000_000) as i64,
+                    })
+                    .collect();
+
+                state.signaling.relay(from, ServerMessage::ChatHistory { messages });
+            }
+        }
         ClientMessage::Offer { to, flow, sdp } => state.signaling.relay(to, ServerMessage::Offer { from, flow, sdp }),
         ClientMessage::Answer { to, flow, sdp } => state.signaling.relay(to, ServerMessage::Answer { from, flow, sdp }),
         ClientMessage::Ice { to, flow, mline, candidate } => state.signaling.relay(to, ServerMessage::Ice { from, flow, mline, candidate }),
-        ClientMessage::Chat { .. } => {} // handled in Task 3
+        ClientMessage::Chat { body } => {
+            if let Some((username, room)) = state.signaling.user_context(from) {
+                if let Ok(m) = crate::chat::repository::insert(&state.pool, &room, from, &body).await {
+                    let at = (m.created_at.unix_timestamp_nanos() / 1_000_000) as i64;
+
+                    state.signaling.broadcast(&room, ServerMessage::Chat { from, username, body, at });
+                }
+            }
+        }
         ClientMessage::Leave => state.signaling.leave_room(from),
     }
 }
