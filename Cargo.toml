@@ -1,0 +1,5 @@
+[workspace]
+resolver = "2"
+members = ["protocol", "engine", "backend"]
+exclude = ["engine-spike"]
+# "desktop" is added in Task 7.
