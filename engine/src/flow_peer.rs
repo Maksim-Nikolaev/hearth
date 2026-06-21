@@ -96,29 +96,34 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
                 let encoder = encoders::detect().0.unwrap_or("x265enc");
                 build_screen_send_branch(&pipeline, &webrtc, encoder)?;
             }
-            Flow::Voice => anyhow::bail!("voice send branch lands in T5"),
+            Flow::Voice => build_voice_send_branch(&pipeline, &webrtc)?,
             Flow::Webcam => anyhow::bail!("webcam flow is out of M5 scope"),
         }
     }
 
-    // Pre-create the display sink so a gtk4paintablesink's paintable is read on
-    // the caller's (main) thread, never on a streaming thread.
-    let video_sink = match cfg.sink {
-        VideoSink::Auto => gst::ElementFactory::make("autovideosink")
-            .property("sync", false)
-            .build()?,
-        VideoSink::Paintable => {
-            let s = gst::ElementFactory::make("gtk4paintablesink").build()?;
-            if let Some(cb) = on_paintable.take() {
-                cb(s.property::<glib::Object>("paintable"));
+    // Pre-create the display sink (video flows only) so a gtk4paintablesink's
+    // paintable is read on the caller's (main) thread, never on a streaming thread.
+    let video_sink = if cfg.flow == Flow::Voice {
+        None
+    } else {
+        let s = match cfg.sink {
+            VideoSink::Auto => gst::ElementFactory::make("autovideosink")
+                .property("sync", false)
+                .build()?,
+            VideoSink::Paintable => {
+                let s = gst::ElementFactory::make("gtk4paintablesink").build()?;
+                if let Some(cb) = on_paintable.take() {
+                    cb(s.property::<glib::Object>("paintable"));
+                }
+                s
             }
-            s
-        }
+        };
+        Some(Arc::new(s))
     };
-    let video_sink = Arc::new(video_sink);
 
-    // Incoming media (answerer): decode + display.
+    // Incoming media (answerer): the flow fixes the media type, so no caps-sniffing.
     let pipeline_weak = pipeline.downgrade();
+    let flow = cfg.flow;
     let vsink = video_sink.clone();
     webrtc.connect_pad_added(move |_w, pad| {
         if pad.direction() != gst::PadDirection::Src {
@@ -128,20 +133,14 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
             return;
         };
 
-        let depay = gst::ElementFactory::make("rtph265depay").build().unwrap();
-        let parse = gst::ElementFactory::make("h265parse").build().unwrap();
-        let dec = gst::ElementFactory::make("avdec_h265").build().unwrap();
-        let conv = gst::ElementFactory::make("videoconvert").build().unwrap();
-
-        pipeline.add_many([&depay, &parse, &dec, &conv]).unwrap();
-        pipeline.add(vsink.as_ref()).unwrap();
-        gst::Element::link_many([&depay, &parse, &dec, &conv, vsink.as_ref()]).unwrap();
-        for e in [&depay, &parse, &dec, &conv] {
-            e.sync_state_with_parent().unwrap();
+        match flow {
+            Flow::Voice => link_voice_recv(&pipeline, pad),
+            _ => {
+                if let Some(vsink) = vsink.as_ref() {
+                    link_video_recv(&pipeline, pad, vsink);
+                }
+            }
         }
-        vsink.sync_state_with_parent().unwrap();
-        pad.link(&depay.static_pad("sink").unwrap()).unwrap();
-        println!("incoming stream linked -> displaying");
     });
 
     // Local ICE -> signaling (buffer until we know the target).
@@ -219,6 +218,68 @@ fn build_screen_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element, enc
 
     pipeline.add_many([cap.upcast_ref(), &rate, &scale, &raw_caps, &enc, &parse, &pay, &caps])?;
     gst::Element::link_many([cap.upcast_ref(), &rate, &scale, &raw_caps, &enc, &parse, &pay, &caps])?;
+    caps.link(webrtc)?;
+
+    Ok(())
+}
+
+fn link_video_recv(pipeline: &gst::Pipeline, pad: &gst::Pad, vsink: &gst::Element) {
+    let depay = gst::ElementFactory::make("rtph265depay").build().unwrap();
+    let parse = gst::ElementFactory::make("h265parse").build().unwrap();
+    let dec = gst::ElementFactory::make("avdec_h265").build().unwrap();
+    let conv = gst::ElementFactory::make("videoconvert").build().unwrap();
+
+    pipeline.add_many([&depay, &parse, &dec, &conv]).unwrap();
+    pipeline.add(vsink).unwrap();
+    gst::Element::link_many([&depay, &parse, &dec, &conv, vsink]).unwrap();
+    for e in [&depay, &parse, &dec, &conv] {
+        e.sync_state_with_parent().unwrap();
+    }
+    vsink.sync_state_with_parent().unwrap();
+    pad.link(&depay.static_pad("sink").unwrap()).unwrap();
+    println!("incoming video linked -> displaying");
+}
+
+fn link_voice_recv(pipeline: &gst::Pipeline, pad: &gst::Pad) {
+    let depay = gst::ElementFactory::make("rtpopusdepay").build().unwrap();
+    let dec = gst::ElementFactory::make("opusdec").build().unwrap();
+    let conv = gst::ElementFactory::make("audioconvert").build().unwrap();
+    let resample = gst::ElementFactory::make("audioresample").build().unwrap();
+    // deafen gate: drop=true silences incoming audio without tearing the flow down.
+    let valve = gst::ElementFactory::make("valve").name("spk_valve").property("drop", false).build().unwrap();
+    let sink = gst::ElementFactory::make("autoaudiosink").property("sync", false).build().unwrap();
+
+    pipeline.add_many([&depay, &dec, &conv, &resample, &valve, &sink]).unwrap();
+    gst::Element::link_many([&depay, &dec, &conv, &resample, &valve, &sink]).unwrap();
+    for e in [&depay, &dec, &conv, &resample, &valve, &sink] {
+        e.sync_state_with_parent().unwrap();
+    }
+    pad.link(&depay.static_pad("sink").unwrap()).unwrap();
+    println!("incoming voice linked -> playing");
+}
+
+fn build_voice_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element) -> Result<()> {
+    let src = gst::parse::bin_from_description(
+        "autoaudiosrc ! audioconvert ! audioresample ! queue",
+        true,
+    )?;
+    // mute gate: drop=true stops sending mic audio without renegotiating.
+    let valve = gst::ElementFactory::make("valve").name("mic_valve").property("drop", false).build()?;
+    let enc = gst::ElementFactory::make("opusenc").build()?;
+    let pay = gst::ElementFactory::make("rtpopuspay").build()?;
+    let caps = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gst::Caps::builder("application/x-rtp")
+                .field("media", "audio")
+                .field("encoding-name", "OPUS")
+                .field("payload", 97i32)
+                .build(),
+        )
+        .build()?;
+
+    pipeline.add_many([src.upcast_ref(), &valve, &enc, &pay, &caps])?;
+    gst::Element::link_many([src.upcast_ref(), &valve, &enc, &pay, &caps])?;
     caps.link(webrtc)?;
 
     Ok(())

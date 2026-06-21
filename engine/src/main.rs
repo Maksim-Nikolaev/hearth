@@ -14,8 +14,13 @@ fn main() -> anyhow::Result<()> {
             println!("capture chain: {}", engine::capture::capture_chain());
             println!("selected encoder: {chosen:?}");
         }
-        "share" | "view" => {
-            let share = mode == "share";
+        "share" | "view" | "call" | "listen" => {
+            let share = matches!(mode.as_str(), "share" | "call");
+            let flow = if matches!(mode.as_str(), "call" | "listen") {
+                engine::flow::Flow::Voice
+            } else {
+                engine::flow::Flow::Screen
+            };
             let http = std::env::var("HEARTH_HTTP").unwrap_or("http://127.0.0.1:8080".into());
             let ws = std::env::var("HEARTH_WS").unwrap_or("ws://127.0.0.1:8080".into());
             let user = std::env::var("HEARTH_USER").expect("HEARTH_USER");
@@ -29,7 +34,7 @@ fn main() -> anyhow::Result<()> {
                 password: &pass,
                 room: &room,
                 share,
-                flow: engine::flow::Flow::Screen,
+                flow,
                 sink: engine::flow::VideoSink::Auto,
             };
 
