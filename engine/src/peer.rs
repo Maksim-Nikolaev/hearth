@@ -42,7 +42,42 @@ pub async fn run(
         .name("wrtc")
         .property_from_str("stun-server", "stun://stun.l.google.com:19302")
         .build()?;
+
+    // Optional TURN relay, e.g. HEARTH_TURN="turn://user:pass@host:3478".
+    // Lets the cross-machine test fall back to relay without a code change when
+    // direct ICE fails across the two real networks.
+    if let Ok(turn) = std::env::var("HEARTH_TURN") {
+        if !turn.trim().is_empty() {
+            webrtc.set_property_from_str("turn-server", &turn);
+            println!("using TURN relay: {turn}");
+        }
+    }
+
     pipeline.add(&webrtc)?;
+
+    // Surface pipeline errors/warnings instead of letting element failures stay
+    // silent — the primary diagnostic for the remote Windows run.
+    let bus = pipeline.bus().expect("pipeline has a bus");
+    let _bus_watch = bus.add_watch(move |_, msg| {
+        use gst::MessageView;
+
+        match msg.view() {
+            MessageView::Error(e) => {
+                eprintln!(
+                    "pipeline error from {:?}: {} ({:?})",
+                    e.src().map(|s| s.path_string()),
+                    e.error(),
+                    e.debug()
+                );
+            }
+            MessageView::Warning(w) => {
+                eprintln!("pipeline warning: {} ({:?})", w.error(), w.debug());
+            }
+            _ => {}
+        }
+
+        glib::ControlFlow::Continue
+    })?;
 
     if share {
         let encoder = encoders::detect().0.unwrap_or("x265enc");
@@ -125,8 +160,20 @@ pub async fn run(
 
 fn build_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element, encoder: &str) -> Result<()> {
     // Linux: ximagesrc; Windows: d3d11screencapturesrc + d3d11download. capture_chain() encodes the OS choice.
-    let cap = gst::parse::bin_from_description(capture::capture_chain(), true)?;
+    let cap = gst::parse::bin_from_description(&capture::capture_chain(), true)?;
+
+    // videorate + videoscale + caps pin framerate (and optionally resolution) to
+    // a known format regardless of the native capture size, so both ends and the
+    // measurements agree. videoscale is a passthrough when no size is pinned.
+    let rate = gst::ElementFactory::make("videorate").build()?;
+    let scale = gst::ElementFactory::make("videoscale").build()?;
+    let raw_caps = gst::ElementFactory::make("capsfilter")
+        .property("caps", capture::video_caps().parse::<gst::Caps>()?)
+        .build()?;
+
     let enc = gst::ElementFactory::make(encoder).build()?;
+    tune_encoder(&enc);
+
     let parse = gst::ElementFactory::make("h265parse").build()?;
     let pay = gst::ElementFactory::make("rtph265pay")
         .property("config-interval", -1i32)
@@ -142,11 +189,30 @@ fn build_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element, encoder: &
         )
         .build()?;
 
-    pipeline.add_many([cap.upcast_ref(), &enc, &parse, &pay, &caps])?;
-    gst::Element::link_many([cap.upcast_ref(), &enc, &parse, &pay, &caps])?;
+    pipeline.add_many([cap.upcast_ref(), &rate, &scale, &raw_caps, &enc, &parse, &pay, &caps])?;
+    gst::Element::link_many([cap.upcast_ref(), &rate, &scale, &raw_caps, &enc, &parse, &pay, &caps])?;
     caps.link(webrtc)?;
 
     Ok(())
+}
+
+/// Apply low-latency / bitrate hints where the chosen encoder exposes them.
+/// Property names and units vary across encoders, so each is set by string only
+/// when present (`set_property_from_str` adapts to the property's type). Bitrate
+/// is in kbps (the VA-API / x265 convention); override with HEARTH_BITRATE_KBPS.
+fn tune_encoder(enc: &gst::Element) {
+    let bitrate = std::env::var("HEARTH_BITRATE_KBPS").unwrap_or_else(|_| "8000".into());
+
+    set_if_present(enc, "bitrate", &bitrate);
+    // Cap keyframe interval so a peer joining mid-stream recovers within ~2s @ 30fps.
+    set_if_present(enc, "key-int-max", "60");
+}
+
+fn set_if_present(el: &gst::Element, prop: &str, val: &str) {
+    if el.find_property(prop).is_some() {
+        el.set_property_from_str(prop, val);
+        println!("encoder: set {prop}={val}");
+    }
 }
 
 fn handle_signal(

@@ -24,15 +24,36 @@ engine share          # capture this screen and send to the first room peer
 engine view           # receive and display a peer's screen
 ```
 
-`share`/`view` read configuration from the environment:
+`share`/`view` read configuration from the environment. The capture/quality
+knobs let one binary adapt per machine with no recompile (important for the
+Windows run, where element names may differ):
 
-| var          | default                  |
-|--------------|--------------------------|
-| `HEARTH_HTTP`| `http://127.0.0.1:8080`  |
-| `HEARTH_WS`  | `ws://127.0.0.1:8080`    |
-| `HEARTH_USER`| (required)               |
-| `HEARTH_PASS`| (required)               |
-| `HEARTH_ROOM`| `main`                   |
+| var                  | default                  | effect |
+|----------------------|--------------------------|--------|
+| `HEARTH_HTTP`        | `http://127.0.0.1:8080`  | backend REST base |
+| `HEARTH_WS`          | `ws://127.0.0.1:8080`    | backend WebSocket base |
+| `HEARTH_USER`        | (required)               | login username |
+| `HEARTH_PASS`        | (required)               | login password |
+| `HEARTH_ROOM`        | `main`                   | room to join |
+| `HEARTH_CAPTURE`     | per-OS default           | override the capture sub-pipeline entirely |
+| `HEARTH_FPS`         | `30`                     | pinned framerate |
+| `HEARTH_WIDTH`/`HEIGHT` | native              | pin resolution (set both, e.g. 1920/1080) |
+| `HEARTH_BITRATE_KBPS`| `8000`                   | encoder bitrate hint (kbps) |
+| `HEARTH_TURN`        | (none)                   | TURN relay, e.g. `turn://user:pass@host:3478` |
+
+### Latency bench
+
+For reproducible glass-to-glass latency (phone-camera stopwatch), share a clock
+instead of the screen — identical on Linux and Windows:
+
+```bash
+HEARTH_CAPTURE="videotestsrc is-live=true ! timeoverlay ! videoconvert" engine share
+```
+
+### Cross-machine (Windows ↔ Linux)
+
+See [`docs/windows-setup.md`](docs/windows-setup.md) for the full Task 5 runbook
+(toolchain, GStreamer MSVC install, element-name fallbacks, measurements, coturn).
 
 ## Verification log
 
