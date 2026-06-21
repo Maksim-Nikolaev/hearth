@@ -3,6 +3,7 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod presence;
 pub mod security;
 pub mod state;
 pub mod users;

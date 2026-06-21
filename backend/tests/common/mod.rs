@@ -1,4 +1,4 @@
-use hearth_backend::{config::AppConfig, db, state::AppState};
+use hearth_backend::{config::AppConfig, db, presence::registry::PresenceRegistry, state::AppState};
 use std::net::SocketAddr;
 
 fn test_config() -> AppConfig {
@@ -17,7 +17,7 @@ pub async fn test_pool() -> sqlx::PgPool {
 
 pub async fn spawn_app() -> SocketAddr {
     let pool = test_pool().await;
-    let state = AppState { pool, config: test_config() };
+    let state = AppState { pool, config: test_config(), presence: PresenceRegistry::new() };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

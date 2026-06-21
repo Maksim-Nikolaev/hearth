@@ -10,6 +10,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/refresh", post(crate::auth::handlers::refresh))
         .route("/auth/logout", post(crate::auth::handlers::logout))
         .route("/users", post(crate::users::handlers::create_user))
+        .route("/ws", get(crate::presence::ws::ws_handler))
         .with_state(state)
 }
 
