@@ -57,17 +57,17 @@ async fn offer_and_ice_relay_between_two_peers_in_a_room() {
     let b_id = joined["user"].as_str().unwrap().to_string();
 
     // A sends an offer addressed to B; B receives it with from = A.
-    wsa.send(Message::Text(format!(r#"{{"type":"offer","to":"{b_id}","sdp":"v=0"}}"#).into())).await.unwrap();
+    wsa.send(Message::Text(format!(r#"{{"type":"offer","to":"{b_id}","flow":"screen","sdp":"v=0"}}"#).into())).await.unwrap();
     let offer = wait_for_type(&mut wsb, "offer").await;
     assert_eq!(offer["sdp"], "v=0");
     let a_id = offer["from"].as_str().unwrap().to_string();
 
     // B answers A; then B sends an ICE candidate to A.
-    wsb.send(Message::Text(format!(r#"{{"type":"answer","to":"{a_id}","sdp":"v=1"}}"#).into())).await.unwrap();
+    wsb.send(Message::Text(format!(r#"{{"type":"answer","to":"{a_id}","flow":"screen","sdp":"v=1"}}"#).into())).await.unwrap();
     let answer = wait_for_type(&mut wsa, "answer").await;
     assert_eq!(answer["sdp"], "v=1");
 
-    wsb.send(Message::Text(format!(r#"{{"type":"ice","to":"{a_id}","mline":0,"candidate":"cand"}}"#).into())).await.unwrap();
+    wsb.send(Message::Text(format!(r#"{{"type":"ice","to":"{a_id}","flow":"screen","mline":0,"candidate":"cand"}}"#).into())).await.unwrap();
     let ice = wait_for_type(&mut wsa, "ice").await;
     assert_eq!(ice["candidate"], "cand");
 

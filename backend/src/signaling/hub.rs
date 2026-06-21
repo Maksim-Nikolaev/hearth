@@ -128,7 +128,7 @@ mod tests {
         let _ = rx_a.try_recv(); // drain peer_joined(b)
         let _ = rx_b.try_recv(); // drain room_peers roster
 
-        hub.relay(b, ServerMessage::Offer { from: a, sdp: "v=0".into() });
+        hub.relay(b, ServerMessage::Offer { from: a, flow: hearth_protocol::Flow::Screen, sdp: "v=0".into() });
         let got = rx_b.try_recv().unwrap();
         assert!(matches!(got, ServerMessage::Offer { from, .. } if from == a));
 

@@ -1,1 +1,1 @@
-pub use hearth_protocol::{ClientMessage, PeerInfo, ServerMessage};
+pub use hearth_protocol::{ChatEntry, ClientMessage, Flow, PeerInfo, ServerMessage};

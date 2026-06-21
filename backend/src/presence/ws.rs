@@ -71,9 +71,10 @@ fn dispatch(state: &AppState, from: uuid::Uuid, msg: crate::signaling::message::
 
     match msg {
         ClientMessage::Join { room } => state.signaling.join_room(from, &room),
-        ClientMessage::Offer { to, sdp } => state.signaling.relay(to, ServerMessage::Offer { from, sdp }),
-        ClientMessage::Answer { to, sdp } => state.signaling.relay(to, ServerMessage::Answer { from, sdp }),
-        ClientMessage::Ice { to, mline, candidate } => state.signaling.relay(to, ServerMessage::Ice { from, mline, candidate }),
+        ClientMessage::Offer { to, flow, sdp } => state.signaling.relay(to, ServerMessage::Offer { from, flow, sdp }),
+        ClientMessage::Answer { to, flow, sdp } => state.signaling.relay(to, ServerMessage::Answer { from, flow, sdp }),
+        ClientMessage::Ice { to, flow, mline, candidate } => state.signaling.relay(to, ServerMessage::Ice { from, flow, mline, candidate }),
+        ClientMessage::Chat { .. } => {} // handled in Task 3
         ClientMessage::Leave => state.signaling.leave_room(from),
     }
 }

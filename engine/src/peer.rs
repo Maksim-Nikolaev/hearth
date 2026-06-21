@@ -8,7 +8,7 @@ use gstreamer::glib;
 use gstreamer::prelude::*;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
-use hearth_protocol::{ClientMessage, ServerMessage};
+use hearth_protocol::{ClientMessage, Flow, ServerMessage};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -123,7 +123,7 @@ pub async fn run(
 
             let target = *state.target.lock().unwrap();
             match target {
-                Some(to) => client.send(ClientMessage::Ice { to, mline, candidate: cand }),
+                Some(to) => client.send(ClientMessage::Ice { to, flow: Flow::Screen, mline, candidate: cand }),
                 None => state.pending_ice.lock().unwrap().push((mline, cand)),
             }
             None
@@ -235,7 +235,7 @@ fn handle_signal(
                 set_target_and_offer(webrtc, client, state, user);
             }
         }
-        ServerMessage::Offer { from, sdp } => {
+        ServerMessage::Offer { from, flow: _, sdp } => {
             *state.target.lock().unwrap() = Some(from);
             flush_ice(client, state);
 
@@ -260,21 +260,23 @@ fn handle_signal(
                 w.emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
                 let _ = tx.send(ClientMessage::Answer {
                     to,
+                    flow: Flow::Screen,
                     sdp: answer.sdp().as_text().unwrap().to_string(),
                 });
             });
             webrtc.emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &promise]);
         }
-        ServerMessage::Answer { from: _, sdp } => {
+        ServerMessage::Answer { from: _, flow: _, sdp } => {
             let sdp = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes()).unwrap();
             let answer =
                 gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, sdp);
             webrtc.emit_by_name::<()>("set-remote-description", &[&answer, &None::<gst::Promise>]);
         }
-        ServerMessage::Ice { from: _, mline, candidate } => {
+        ServerMessage::Ice { from: _, flow: _, mline, candidate } => {
             webrtc.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
         }
         ServerMessage::PeerLeft { .. } => {}
+        ServerMessage::Chat { .. } | ServerMessage::ChatHistory { .. } => {} // not handled by the CLI peer
     }
 }
 
@@ -313,6 +315,7 @@ fn set_target_and_offer(
         w.emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
         let _ = tx.send(ClientMessage::Offer {
             to: target,
+            flow: Flow::Screen,
             sdp: offer.sdp().as_text().unwrap().to_string(),
         });
     });
@@ -327,6 +330,6 @@ fn flush_ice(client: &SignalingClient, state: &Arc<State>) {
     let mut pending = state.pending_ice.lock().unwrap();
 
     for (mline, candidate) in pending.drain(..) {
-        client.send(ClientMessage::Ice { to: target, mline, candidate });
+        client.send(ClientMessage::Ice { to: target, flow: Flow::Screen, mline, candidate });
     }
 }
