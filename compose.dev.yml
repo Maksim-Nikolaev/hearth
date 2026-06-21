@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: hearth
+      POSTGRES_PASSWORD: hearth
+      POSTGRES_DB: hearth
+    ports:
+      - "5433:5432"
+    volumes:
+      - hearth_pg:/var/lib/postgresql
+
+volumes:
+  hearth_pg:
