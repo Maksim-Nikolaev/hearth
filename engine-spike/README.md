@@ -45,9 +45,13 @@ VA-API exposes hardware **HEVC** (Main + Main10) and **AV1** encode entrypoints
 (`vainfo`); a headless `ximagesrc -> vah265enc -> fakesink` 30-frame encode
 completed in ~1.2 s. Hardware encode path confirmed.
 
-### Local pipeline (B)
+### Local pipeline (B) (2026-06-21, AMD box)
 
-_TBD on run._
+Full local chain proven: `ximagesrc -> videoconvert -> vah265enc -> h265parse ->
+avdec_h265 -> videoconvert -> fakesink` ran 60 frames in ~2.6 s with a clean EOS
+(HW HEVC encode **and** decode both working). `autovideosink` instantiates and
+accepts a frame (EOS in ~40 ms, no error), so the on-screen display path is good.
+Capture + hardware encode + decode + display all confirmed on one machine.
 
 ### Two-peer webrtcbin (C)
 
