@@ -22,8 +22,19 @@ fn main() -> anyhow::Result<()> {
             let pass = std::env::var("HEARTH_PASS").expect("HEARTH_PASS");
             let room = std::env::var("HEARTH_ROOM").unwrap_or("main".into());
 
+            let cfg = engine::flow_peer::PeerConfig {
+                http_base: &http,
+                ws_base: &ws,
+                username: &user,
+                password: &pass,
+                room: &room,
+                share,
+                flow: engine::flow::Flow::Screen,
+                sink: engine::flow::VideoSink::Auto,
+            };
+
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(engine::peer::run(&http, &ws, &user, &pass, &room, share))?;
+            rt.block_on(engine::flow_peer::run(cfg, None))?;
         }
         other => anyhow::bail!("unknown mode: {other}"),
     }

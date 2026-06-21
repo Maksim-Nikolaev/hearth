@@ -1,5 +1,6 @@
 use crate::{
     capture, encoders,
+    flow::VideoSink,
     signaling::{login, SignalingClient},
 };
 use anyhow::Result;
@@ -12,29 +13,42 @@ use hearth_protocol::{ClientMessage, Flow, ServerMessage};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+/// Invoked once, on the calling thread, with the incoming video's `gdk::Paintable`
+/// (typed opaquely as a `glib::Object` so the engine stays decoupled from gtk4).
+pub type PaintableCb = Box<dyn FnOnce(glib::Object)>;
+
+/// One media flow between this peer and one other, carried by a single
+/// `webrtcbin`. `share == true` captures and offers; otherwise it answers and
+/// displays/plays.
+pub struct PeerConfig<'a> {
+    pub http_base: &'a str,
+    pub ws_base: &'a str,
+    pub username: &'a str,
+    pub password: &'a str,
+    pub room: &'a str,
+    pub share: bool,
+    pub flow: Flow,
+    pub sink: VideoSink,
+}
+
 struct State {
     target: Mutex<Option<Uuid>>,
     pending_ice: Mutex<Vec<(u32, String)>>,
     offer_created: Mutex<bool>,
+    flow: Flow,
 }
 
-pub async fn run(
-    http_base: &str,
-    ws_base: &str,
-    username: &str,
-    password: &str,
-    room: &str,
-    share: bool,
-) -> Result<()> {
+pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> Result<()> {
     gst::init()?;
 
-    let token = login(http_base, username, password).await?;
-    let (client, mut inbound) = SignalingClient::connect(ws_base, &token).await?;
+    let token = login(cfg.http_base, cfg.username, cfg.password).await?;
+    let (client, mut inbound) = SignalingClient::connect(cfg.ws_base, &token).await?;
     let client = Arc::new(client);
     let state = Arc::new(State {
         target: Mutex::new(None),
         pending_ice: Mutex::new(Vec::new()),
         offer_created: Mutex::new(false),
+        flow: cfg.flow,
     });
 
     let pipeline = gst::Pipeline::new();
@@ -44,8 +58,6 @@ pub async fn run(
         .build()?;
 
     // Optional TURN relay, e.g. HEARTH_TURN="turn://user:pass@host:3478".
-    // Lets the cross-machine test fall back to relay without a code change when
-    // direct ICE fails across the two real networks.
     if let Ok(turn) = std::env::var("HEARTH_TURN") {
         if !turn.trim().is_empty() {
             webrtc.set_property_from_str("turn-server", &turn);
@@ -55,8 +67,7 @@ pub async fn run(
 
     pipeline.add(&webrtc)?;
 
-    // Surface pipeline errors/warnings instead of letting element failures stay
-    // silent — the primary diagnostic for the remote Windows run.
+    // Surface pipeline errors/warnings instead of letting element failures stay silent.
     let bus = pipeline.bus().expect("pipeline has a bus");
     let _bus_watch = bus.add_watch(move |_, msg| {
         use gst::MessageView;
@@ -79,14 +90,36 @@ pub async fn run(
         glib::ControlFlow::Continue
     })?;
 
-    if share {
-        let encoder = encoders::detect().0.unwrap_or("x265enc");
-
-        build_send_branch(&pipeline, &webrtc, encoder)?;
+    if cfg.share {
+        match cfg.flow {
+            Flow::Screen => {
+                let encoder = encoders::detect().0.unwrap_or("x265enc");
+                build_screen_send_branch(&pipeline, &webrtc, encoder)?;
+            }
+            Flow::Voice => anyhow::bail!("voice send branch lands in T5"),
+            Flow::Webcam => anyhow::bail!("webcam flow is out of M5 scope"),
+        }
     }
 
-    // Incoming media (viewer): decode + display.
+    // Pre-create the display sink so a gtk4paintablesink's paintable is read on
+    // the caller's (main) thread, never on a streaming thread.
+    let video_sink = match cfg.sink {
+        VideoSink::Auto => gst::ElementFactory::make("autovideosink")
+            .property("sync", false)
+            .build()?,
+        VideoSink::Paintable => {
+            let s = gst::ElementFactory::make("gtk4paintablesink").build()?;
+            if let Some(cb) = on_paintable.take() {
+                cb(s.property::<glib::Object>("paintable"));
+            }
+            s
+        }
+    };
+    let video_sink = Arc::new(video_sink);
+
+    // Incoming media (answerer): decode + display.
     let pipeline_weak = pipeline.downgrade();
+    let vsink = video_sink.clone();
     webrtc.connect_pad_added(move |_w, pad| {
         if pad.direction() != gst::PadDirection::Src {
             return;
@@ -99,16 +132,14 @@ pub async fn run(
         let parse = gst::ElementFactory::make("h265parse").build().unwrap();
         let dec = gst::ElementFactory::make("avdec_h265").build().unwrap();
         let conv = gst::ElementFactory::make("videoconvert").build().unwrap();
-        let sink = gst::ElementFactory::make("autovideosink")
-            .property("sync", false)
-            .build()
-            .unwrap();
 
-        pipeline.add_many([&depay, &parse, &dec, &conv, &sink]).unwrap();
-        gst::Element::link_many([&depay, &parse, &dec, &conv, &sink]).unwrap();
-        for e in [&depay, &parse, &dec, &conv, &sink] {
+        pipeline.add_many([&depay, &parse, &dec, &conv]).unwrap();
+        pipeline.add(vsink.as_ref()).unwrap();
+        gst::Element::link_many([&depay, &parse, &dec, &conv, vsink.as_ref()]).unwrap();
+        for e in [&depay, &parse, &dec, &conv] {
             e.sync_state_with_parent().unwrap();
         }
+        vsink.sync_state_with_parent().unwrap();
         pad.link(&depay.static_pad("sink").unwrap()).unwrap();
         println!("incoming stream linked -> displaying");
     });
@@ -123,7 +154,7 @@ pub async fn run(
 
             let target = *state.target.lock().unwrap();
             match target {
-                Some(to) => client.send(ClientMessage::Ice { to, flow: Flow::Screen, mline, candidate: cand }),
+                Some(to) => client.send(ClientMessage::Ice { to, flow: state.flow, mline, candidate: cand }),
                 None => state.pending_ice.lock().unwrap().push((mline, cand)),
             }
             None
@@ -136,12 +167,13 @@ pub async fn run(
     });
 
     pipeline.set_state(gst::State::Playing)?;
-    client.send(ClientMessage::Join { room: room.to_string() });
+    client.send(ClientMessage::Join { room: cfg.room.to_string() });
 
-    // Drive negotiation from inbound signaling on a blocking-friendly task.
+    // Drive negotiation from inbound signaling.
     let webrtc_loop = webrtc.clone();
     let client_loop = client.clone();
     let state_loop = state.clone();
+    let share = cfg.share;
     let main_loop = glib::MainLoop::new(None, false);
     let ml = main_loop.clone();
 
@@ -158,13 +190,9 @@ pub async fn run(
     Ok(())
 }
 
-fn build_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element, encoder: &str) -> Result<()> {
-    // Linux: ximagesrc; Windows: d3d11screencapturesrc + d3d11download. capture_chain() encodes the OS choice.
+fn build_screen_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element, encoder: &str) -> Result<()> {
     let cap = gst::parse::bin_from_description(&capture::capture_chain(), true)?;
 
-    // videorate + videoscale + caps pin framerate (and optionally resolution) to
-    // a known format regardless of the native capture size, so both ends and the
-    // measurements agree. videoscale is a passthrough when no size is pinned.
     let rate = gst::ElementFactory::make("videorate").build()?;
     let scale = gst::ElementFactory::make("videoscale").build()?;
     let raw_caps = gst::ElementFactory::make("capsfilter")
@@ -196,15 +224,10 @@ fn build_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element, encoder: &
     Ok(())
 }
 
-/// Apply low-latency / bitrate hints where the chosen encoder exposes them.
-/// Property names and units vary across encoders, so each is set by string only
-/// when present (`set_property_from_str` adapts to the property's type). Bitrate
-/// is in kbps (the VA-API / x265 convention); override with HEARTH_BITRATE_KBPS.
 fn tune_encoder(enc: &gst::Element) {
     let bitrate = std::env::var("HEARTH_BITRATE_KBPS").unwrap_or_else(|_| "8000".into());
 
     set_if_present(enc, "bitrate", &bitrate);
-    // Cap keyframe interval so a peer joining mid-stream recovers within ~2s @ 30fps.
     set_if_present(enc, "key-int-max", "60");
 }
 
@@ -240,14 +263,13 @@ fn handle_signal(
             flush_ice(client, state);
 
             let sdp = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes()).unwrap();
-            let offer =
-                gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Offer, sdp);
+            let offer = gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Offer, sdp);
             webrtc.emit_by_name::<()>("set-remote-description", &[&offer, &None::<gst::Promise>]);
 
             let w = webrtc.clone();
             let to = from;
+            let flow = state.flow;
             let tx = client.sender();
-            // Create the answer; send it back to `from`.
             let promise = gst::Promise::with_change_func(move |reply| {
                 let Ok(Some(reply)) = reply else {
                     return;
@@ -260,7 +282,7 @@ fn handle_signal(
                 w.emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
                 let _ = tx.send(ClientMessage::Answer {
                     to,
-                    flow: Flow::Screen,
+                    flow,
                     sdp: answer.sdp().as_text().unwrap().to_string(),
                 });
             });
@@ -268,24 +290,18 @@ fn handle_signal(
         }
         ServerMessage::Answer { from: _, flow: _, sdp } => {
             let sdp = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes()).unwrap();
-            let answer =
-                gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, sdp);
+            let answer = gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, sdp);
             webrtc.emit_by_name::<()>("set-remote-description", &[&answer, &None::<gst::Promise>]);
         }
         ServerMessage::Ice { from: _, flow: _, mline, candidate } => {
             webrtc.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate]);
         }
         ServerMessage::PeerLeft { .. } => {}
-        ServerMessage::Chat { .. } | ServerMessage::ChatHistory { .. } => {} // not handled by the CLI peer
+        ServerMessage::Chat { .. } | ServerMessage::ChatHistory { .. } => {}
     }
 }
 
-fn set_target_and_offer(
-    webrtc: &gst::Element,
-    client: &SignalingClient,
-    state: &Arc<State>,
-    target: Uuid,
-) {
+fn set_target_and_offer(webrtc: &gst::Element, client: &SignalingClient, state: &Arc<State>, target: Uuid) {
     {
         let mut t = state.target.lock().unwrap();
         if t.is_some() {
@@ -302,6 +318,7 @@ fn set_target_and_offer(
     *created = true;
 
     let w = webrtc.clone();
+    let flow = state.flow;
     let tx = client.sender();
     let promise = gst::Promise::with_change_func(move |reply| {
         let Ok(Some(reply)) = reply else {
@@ -315,7 +332,7 @@ fn set_target_and_offer(
         w.emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
         let _ = tx.send(ClientMessage::Offer {
             to: target,
-            flow: Flow::Screen,
+            flow,
             sdp: offer.sdp().as_text().unwrap().to_string(),
         });
     });
@@ -330,6 +347,6 @@ fn flush_ice(client: &SignalingClient, state: &Arc<State>) {
     let mut pending = state.pending_ice.lock().unwrap();
 
     for (mline, candidate) in pending.drain(..) {
-        client.send(ClientMessage::Ice { to: target, flow: Flow::Screen, mline, candidate });
+        client.send(ClientMessage::Ice { to: target, flow: state.flow, mline, candidate });
     }
 }
