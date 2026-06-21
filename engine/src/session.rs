@@ -320,6 +320,13 @@ impl Session {
         }
     }
 
+    /// Tear down every active media flow (the other peers and chat are untouched).
+    pub fn stop_all(&mut self) {
+        for (_, p) in self.peers.drain() {
+            p.stop();
+        }
+    }
+
     pub fn mute(&self, on: bool) {
         for p in self.peers.values() {
             if p.flow == Flow::Voice {

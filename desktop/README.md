@@ -40,3 +40,18 @@ line shows the `ChatHistory([])` event – confirming login → `Session::start`
 inbound pump → `handle` → event → UI end-to-end. (A transient
 `Child name 'connecting' not found` GTK warning appears at startup and is
 harmless.)
+
+### T8 – presence + chat (2026-06-22)
+
+Two instances (`HEARTH_TITLE=alice|bob`, distinct app ids). Each window shows
+the other in the **Online** list and the shared **chat history**; live messages
+sent from one appear in the other and persist.
+
+### T9 – in-window video + share/voice controls (2026-06-22)
+
+Room toolbar: **Share screen / Call / Mute / Deafen / Stop** + a connection-state
+chip. alice clicks **Share screen** → bob's window renders **alice's screen
+in-window** (via `gtk4paintablesink` → `gtk::Picture`), status shows
+`Screen: Connected`. Per-flow transports: stopping one flow leaves chat (and any
+voice) running. Voice itself was loopback-verified at the engine level (T5).
+
