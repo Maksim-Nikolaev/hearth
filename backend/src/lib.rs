@@ -5,5 +5,6 @@ pub mod db;
 pub mod error;
 pub mod presence;
 pub mod security;
+pub mod signaling;
 pub mod state;
 pub mod users;
