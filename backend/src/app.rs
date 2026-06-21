@@ -1,9 +1,12 @@
 use crate::state::AppState;
-use axum::{routing::get, Json, Router};
+use axum::{routing::{get, post}, Json, Router};
 use serde_json::{json, Value};
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new().route("/health", get(health)).with_state(state)
+    Router::new()
+        .route("/health", get(health))
+        .route("/auth/login", post(crate::auth::handlers::login))
+        .with_state(state)
 }
 
 async fn health() -> Json<Value> {
