@@ -550,10 +550,13 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
+ "hex",
  "jsonwebtoken",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "time",
  "tokio",

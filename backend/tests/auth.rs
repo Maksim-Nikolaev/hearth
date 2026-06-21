@@ -52,3 +52,38 @@ async fn me_requires_valid_bearer_token() {
     let body: serde_json::Value = me.json().await.unwrap();
     assert_eq!(body["username"], name);
 }
+
+#[tokio::test]
+async fn refresh_rotates_and_logout_revokes() {
+    let pool = common::test_pool().await;
+    let addr = common::spawn_app().await;
+    let name = format!("refresh_{}", uuid::Uuid::now_v7());
+
+    repository::create(&pool, &name, &password::hash("pw").unwrap(), Role::User).await.unwrap();
+
+    let client = reqwest::Client::new();
+
+    let login: serde_json::Value = client.post(format!("http://{addr}/auth/login"))
+        .json(&serde_json::json!({ "username": name, "password": "pw" }))
+        .send().await.unwrap().json().await.unwrap();
+    let refresh = login["refresh_token"].as_str().unwrap().to_string();
+
+    let refreshed = client.post(format!("http://{addr}/auth/refresh"))
+        .json(&serde_json::json!({ "refresh_token": refresh })).send().await.unwrap();
+    assert_eq!(refreshed.status(), 200);
+
+    let new_body: serde_json::Value = refreshed.json().await.unwrap();
+    let new_refresh = new_body["refresh_token"].as_str().unwrap().to_string();
+
+    // Old token no longer works after rotation.
+    let reused = client.post(format!("http://{addr}/auth/refresh"))
+        .json(&serde_json::json!({ "refresh_token": refresh })).send().await.unwrap();
+    assert_eq!(reused.status(), 401);
+
+    // Logout revokes the new token.
+    let access = new_body["access_token"].as_str().unwrap();
+    let out = client.post(format!("http://{addr}/auth/logout"))
+        .bearer_auth(access)
+        .json(&serde_json::json!({ "refresh_token": new_refresh })).send().await.unwrap();
+    assert_eq!(out.status(), 204);
+}
