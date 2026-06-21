@@ -232,22 +232,48 @@ pub struct Session {
     _client: Option<SignalingClient>,
 }
 
-impl Session {
-    /// Log in, open the WebSocket, and return the session plus the inbound
-    /// `ServerMessage` stream (pump it on the main thread into `handle`) and the
-    /// high-level `SessionEvent` stream (drive the UI).
-    pub async fn connect(
-        http_base: &str,
-        ws_base: &str,
-        username: &str,
-        password: &str,
-        sink: VideoSink,
-    ) -> Result<(Self, UnboundedReceiver<ServerMessage>, UnboundedReceiver<SessionEvent>)> {
-        gst::init()?;
+/// The `Send` result of opening a connection: handed back from an async task,
+/// then turned into a (non-`Send`) [`Session`] on the main thread via
+/// [`Session::start`].
+pub struct Connection {
+    client: SignalingClient,
+    inbound: UnboundedReceiver<ServerMessage>,
+    token: String,
+}
 
+impl Connection {
+    /// The access token, for persisting so a later launch can skip the password.
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+}
+
+impl Session {
+    /// Log in (username/password) and open the WebSocket. Async + `Send`, so it
+    /// runs in a background task.
+    pub async fn open(http_base: &str, ws_base: &str, username: &str, password: &str) -> Result<Connection> {
         let token = login(http_base, username, password).await?;
-        let (client, inbound) = SignalingClient::connect(ws_base, &token).await?;
-        let out_tx = client.sender();
+        Self::open_with_token(ws_base, &token).await
+    }
+
+    /// Open the WebSocket with an existing token (skips the password). Errors if
+    /// the token is rejected, so the caller can fall back to a fresh login.
+    pub async fn open_with_token(ws_base: &str, token: &str) -> Result<Connection> {
+        let (client, inbound) = SignalingClient::connect(ws_base, token).await?;
+
+        Ok(Connection { client, inbound, token: token.to_string() })
+    }
+
+    /// Build the session on the main thread, returning the inbound `ServerMessage`
+    /// stream (pump into [`Session::handle`] on the main thread) and the
+    /// high-level `SessionEvent` stream (drive the UI).
+    pub fn start(
+        conn: Connection,
+        sink: VideoSink,
+    ) -> (Self, UnboundedReceiver<ServerMessage>, UnboundedReceiver<SessionEvent>) {
+        let _ = gst::init();
+
+        let out_tx = conn.client.sender();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();
 
         let session = Session {
@@ -255,10 +281,10 @@ impl Session {
             evt_tx,
             sink,
             peers: HashMap::new(),
-            _client: Some(client),
+            _client: Some(conn.client),
         };
 
-        Ok((session, inbound, evt_rx))
+        (session, conn.inbound, evt_rx)
     }
 
     pub fn join(&self, room: &str) {

@@ -1,0 +1,16 @@
+[package]
+name = "desktop"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+relm4 = "0.9"
+gtk = { package = "gtk4", version = "0.9" }
+engine = { path = "../engine" }
+hearth-protocol = { path = "../protocol" }
+gstreamer = "0.23"
+tokio = { version = "1", features = ["full"] }
+keyring = "3"
+directories = "5"
+anyhow = "1"
+uuid = { version = "1", features = ["v7", "serde"] }
