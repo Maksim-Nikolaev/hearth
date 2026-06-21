@@ -17,6 +17,8 @@ fn main() -> anyhow::Result<()> {
             println!("\nselected encoder: {:?}", chosen);
         }
         "local" => pipeline::run_local()?,
+        "offer" => pipeline::run_peer(true)?,
+        "answer" => pipeline::run_peer(false)?,
         other => anyhow::bail!("unknown mode: {other}"),
     }
 
