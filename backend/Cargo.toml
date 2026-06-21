@@ -1,0 +1,22 @@
+[package]
+name = "hearth-backend"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "hearth_backend"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hearth-backend"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws", "macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tower = "0.5"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
