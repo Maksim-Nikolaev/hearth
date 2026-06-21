@@ -1,8 +1,8 @@
 use crate::config::Config;
 use engine::flow::VideoSink;
-use engine::session::{Connection, Session, SessionEvent};
+use engine::session::{Connection, Presence, Session, SessionEvent};
 use gtk::prelude::*;
-use hearth_protocol::ServerMessage;
+use hearth_protocol::{ChatEntry, PeerInfo, ServerMessage};
 use relm4::prelude::*;
 
 #[derive(PartialEq, Clone, Copy)]
@@ -14,14 +14,18 @@ enum Screen {
 
 pub struct AppModel {
     config: Config,
+    title: String,
     screen: Screen,
     status: String,
     session: Option<Session>,
+    peers: Vec<PeerInfo>,
+    messages: Vec<ChatEntry>,
 }
 
 #[derive(Debug)]
 pub enum AppMsg {
     Login { username: String, password: String },
+    SendChat(String),
 }
 
 /// Async/command results. Manual `Debug` because `Connection` is opaque.
@@ -52,7 +56,7 @@ impl Component for AppModel {
 
     view! {
         gtk::Window {
-            set_title: Some("Hearth"),
+            set_title: Some(model.title.as_str()),
             set_default_width: 960,
             set_default_height: 640,
 
@@ -109,15 +113,51 @@ impl Component for AppModel {
                 },
 
                 add_named[Some("room")] = &gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
-                    set_spacing: 8,
-                    gtk::Label {
-                        set_label: "Room: main",
-                        add_css_class: "title-2",
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_spacing: 12,
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_spacing: 6,
+                        set_width_request: 200,
+
+                        gtk::Label { set_label: "Online", add_css_class: "heading", set_xalign: 0.0 },
+                        gtk::Label {
+                            #[watch]
+                            set_label: &model.peers_text(),
+                            set_xalign: 0.0,
+                            set_valign: gtk::Align::Start,
+                        },
                     },
-                    gtk::Label {
-                        #[watch]
-                        set_label: &model.status,
+
+                    gtk::Separator { set_orientation: gtk::Orientation::Vertical },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Vertical,
+                        set_spacing: 6,
+                        set_hexpand: true,
+
+                        gtk::ScrolledWindow {
+                            set_vexpand: true,
+                            gtk::Label {
+                                #[watch]
+                                set_label: &model.chat_text(),
+                                set_xalign: 0.0,
+                                set_valign: gtk::Align::End,
+                                set_wrap: true,
+                            },
+                        },
+
+                        gtk::Entry {
+                            set_placeholder_text: Some("Message…"),
+                            connect_activate[sender] => move |entry| {
+                                let body = entry.text().to_string();
+                                if !body.is_empty() {
+                                    sender.input(AppMsg::SendChat(body));
+                                    entry.set_text("");
+                                }
+                            },
+                        },
                     },
                 },
             }
@@ -138,7 +178,19 @@ impl Component for AppModel {
             });
         }
 
-        let model = AppModel { config, screen, status: String::new(), session: None };
+        let title = std::env::var("HEARTH_TITLE")
+            .map(|t| format!("Hearth - {t}"))
+            .unwrap_or_else(|_| "Hearth".into());
+
+        let model = AppModel {
+            config,
+            title,
+            screen,
+            status: String::new(),
+            session: None,
+            peers: Vec::new(),
+            messages: Vec::new(),
+        };
         let widgets = view_output!();
 
         ComponentParts { model, widgets }
@@ -158,6 +210,11 @@ impl Component for AppModel {
                         Err(e) => Cmd::Failed(e.to_string()),
                     }
                 });
+            }
+            AppMsg::SendChat(body) => {
+                if let Some(s) = self.session.as_ref() {
+                    s.send_chat(&body);
+                }
             }
         }
     }
@@ -206,19 +263,45 @@ impl Component for AppModel {
                     s.handle(m);
                 }
             }
-            Cmd::Event(e) => {
-                self.status = format!("{e:?}");
-            }
+            Cmd::Event(e) => self.on_event(e),
         }
     }
 }
 
 impl AppModel {
+    fn on_event(&mut self, event: SessionEvent) {
+        match event {
+            SessionEvent::Presence(Presence::Roster(list)) => self.peers = list,
+            SessionEvent::Presence(Presence::Joined { user, username }) => {
+                if !self.peers.iter().any(|p| p.user == user) {
+                    self.peers.push(PeerInfo { user, username });
+                }
+            }
+            SessionEvent::Presence(Presence::Left { user }) => self.peers.retain(|p| p.user != user),
+            SessionEvent::Chat(entry) => self.messages.push(entry),
+            SessionEvent::ChatHistory(list) => self.messages = list,
+            SessionEvent::FlowState { .. } => {} // T9
+            SessionEvent::VideoReady { .. } => {} // T9
+            SessionEvent::Error(e) => self.status = e,
+        }
+    }
+
     fn screen_name(&self) -> &'static str {
         match self.screen {
             Screen::Login => "login",
             Screen::Connecting => "connecting",
             Screen::Room => "room",
         }
+    }
+
+    fn peers_text(&self) -> String {
+        if self.peers.is_empty() {
+            return "(no one else here)".into();
+        }
+        self.peers.iter().map(|p| format!("● {}", p.username)).collect::<Vec<_>>().join("\n")
+    }
+
+    fn chat_text(&self) -> String {
+        self.messages.iter().map(|m| format!("{}: {}", m.username, m.body)).collect::<Vec<_>>().join("\n")
     }
 }

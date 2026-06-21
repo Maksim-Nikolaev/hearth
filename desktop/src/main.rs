@@ -9,7 +9,17 @@ fn main() {
 
     let config = config::Config::load();
 
-    let app = RelmApp::new("dev.hearth.desktop");
+    // A distinct app id per HEARTH_TITLE lets several instances run side by side
+    // (GtkApplication is otherwise single-instance per id).
+    let app_id = match std::env::var("HEARTH_TITLE") {
+        Ok(t) if !t.is_empty() => {
+            let suffix: String = t.chars().filter(|c| c.is_alphanumeric()).collect();
+            format!("dev.hearth.desktop.{suffix}")
+        }
+        _ => "dev.hearth.desktop".into(),
+    };
+
+    let app = RelmApp::new(&app_id);
     app.run::<app::AppModel>(config);
 }
 
