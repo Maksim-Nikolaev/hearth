@@ -1,0 +1,11 @@
+[package]
+name = "engine-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+gstreamer = "0.23"
+gstreamer-webrtc = "0.23"
+gstreamer-sdp = "0.23"
+anyhow = "1"
