@@ -23,7 +23,7 @@ congests independently (revised from the earlier single-bundle "Approach A").
 | M3 signaling | ✅ done, green | `backend/src/signaling/` relays join/offer/answer/ice/leave over `/ws` |
 | M4 networked engine (Tasks 1–4) | ✅ done, Linux loopback GO | real `engine/` crate driven by the server, no `/tmp` |
 | M4 Task 5 (cross-machine) | ⏸ blocked – user-run on Windows | the Approach-A go/no-go; needs the Windows 11 box |
-| M5 Rust GTK4 desktop shell | ▶ **next (design agreed, spec pending)** | relm4 app: login + presence + chat + screenshare share/view in-window; per-flow framework |
+| M5 Rust GTK4 desktop shell | ✅ done, verified | relm4 app: login + presence + chat + voice (engine) + screenshare share/view **in-window**; per-flow framework. 9 tasks, all committed on `main` |
 
 ## Component state
 
@@ -60,27 +60,33 @@ single screenshare track end-to-end through the server, no-recompile env config.
 - **Backend features** – text-chat persistence, attachments (RustFS two-phase
   upload per the Lezio pattern) not started.
 
-## Next step: M5 Rust GTK4 desktop shell (design agreed, spec pending)
+## M5 done (2026-06-22)
 
-A pure-Rust desktop client (GTK4 + relm4) calling the `engine` crate directly:
-- login screen → `/auth/login` (token stored via the `keyring` crate)
-- room / presence view (who is online)
-- text chat (needs a backend slice: `messages` table/repo/migration + WS relay)
-- screenshare **share / view** shown in-window via `gtk4paintablesink` → `gtk::Picture`
-- the per-flow framework + flow-tagged signaling
+Pure-Rust desktop client (`desktop/`, GTK4 + relm4) calling `engine` directly, in
+a root Cargo workspace (`protocol`, `engine`, `backend`, `desktop`). Verified with
+two live instances against the backend: login (token via `keyring`), presence,
+text chat (+ backend `messages` slice), and **screenshare displayed in-window**
+via `gtk4paintablesink` → `gtk::Picture`. Engine refactored to a library API
+(`Session` / `Flow` / `FlowPeer`, per-flow `webrtcbin`s, `SessionEvent`); voice
+flow loopback-verified at the engine level; mute/deafen + Stop wired. CLI
+`probe/share/view/call/listen` still work, so M4 Task 5 is unaffected. Spec +
+plan: `docs/superpowers/{specs,plans}/2026-06-21-hearth-m5-desktop-shell*`.
 
-GTK and GStreamer share the GLib main loop, so the engine needs no separate
-loop/thread and no bridge; tokio runs the WS/REST off-thread, events reach the UI
-as relm4 messages. The engine's CLI `peer::run` is refactored into a library API
-(`Session`, `Flow`, `FlowPeer`); `probe/share/view` stay working so Task 5 is
-unaffected. New root Cargo workspace (`protocol`, `engine`, `backend`, `desktop`).
+Runtime note: in-window video needs `gtk4paintablesink` from `gst-plugins-rs`,
+built locally and installed to `~/.local/lib/hearth-gst-plugins/`; the desktop
+app prepends it to `GST_PLUGIN_PATH` automatically.
 
-**Out of M5 / next:** voice + webcam flows (additive to the framework),
-multi-peer mesh, theming, packaging/auto-update, TURN/coturn (M6 = Traefik proxy
-+ coturn relay).
+## Next candidates
 
-Design was brainstormed 2026-06-21; spec to be written to
-`docs/superpowers/specs/2026-06-21-hearth-m5-desktop-shell-design.md`.
+- **M4 Task 5** – cross-machine Windows↔Linux measurement (user-run; see
+  `engine/docs/windows-setup.md`).
+- **Voice + webcam in the UI** – voice works in the engine; wire the call UX and
+  add the webcam flow (additive to the per-flow framework).
+- **Multi-peer mesh** – media is 1:1 today (targets the first peer); presence
+  already shows everyone.
+- **Polish** – fix the transient `connecting` GtkStack warning, theming,
+  scroll-to-bottom chat, token-restore UX.
+- **M6 deployment** – Traefik proxy + coturn relay; packaging/auto-update.
 
 ## How to resume / run
 
