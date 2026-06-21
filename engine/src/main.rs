@@ -14,6 +14,17 @@ fn main() -> anyhow::Result<()> {
             println!("capture chain: {}", engine::capture::capture_chain());
             println!("selected encoder: {chosen:?}");
         }
+        "share" | "view" => {
+            let share = mode == "share";
+            let http = std::env::var("HEARTH_HTTP").unwrap_or("http://127.0.0.1:8080".into());
+            let ws = std::env::var("HEARTH_WS").unwrap_or("ws://127.0.0.1:8080".into());
+            let user = std::env::var("HEARTH_USER").expect("HEARTH_USER");
+            let pass = std::env::var("HEARTH_PASS").expect("HEARTH_PASS");
+            let room = std::env::var("HEARTH_ROOM").unwrap_or("main".into());
+
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(engine::peer::run(&http, &ws, &user, &pass, &room, share))?;
+        }
         other => anyhow::bail!("unknown mode: {other}"),
     }
 
