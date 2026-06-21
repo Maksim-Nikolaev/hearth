@@ -17,7 +17,12 @@ pub async fn test_pool() -> sqlx::PgPool {
 
 pub async fn spawn_app() -> SocketAddr {
     let pool = test_pool().await;
-    let state = AppState { pool, config: test_config(), presence: PresenceRegistry::new() };
+    let state = AppState {
+        pool,
+        config: test_config(),
+        presence: PresenceRegistry::new(),
+        signaling: hearth_backend::signaling::hub::SignalingHub::default(),
+    };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

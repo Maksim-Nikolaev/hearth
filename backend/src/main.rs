@@ -1,10 +1,10 @@
-use hearth_backend::{app, config::AppConfig, db, presence::registry::PresenceRegistry, state::AppState};
+use hearth_backend::{app, config::AppConfig, db, presence::registry::PresenceRegistry, signaling::hub::SignalingHub, state::AppState};
 
 #[tokio::main]
 async fn main() {
     let config = AppConfig::from_env();
     let pool = db::connect(&config.database_url).await;
-    let state = AppState { pool, config, presence: PresenceRegistry::new() };
+    let state = AppState { pool, config, presence: PresenceRegistry::new(), signaling: SignalingHub::default() };
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
 
