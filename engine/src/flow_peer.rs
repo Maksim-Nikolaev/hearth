@@ -189,7 +189,7 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
     Ok(())
 }
 
-fn build_screen_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element, encoder: &str) -> Result<()> {
+pub(crate) fn build_screen_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element, encoder: &str) -> Result<()> {
     let cap = gst::parse::bin_from_description(&capture::capture_chain(), true)?;
 
     let rate = gst::ElementFactory::make("videorate").build()?;
@@ -223,7 +223,7 @@ fn build_screen_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element, enc
     Ok(())
 }
 
-fn link_video_recv(pipeline: &gst::Pipeline, pad: &gst::Pad, vsink: &gst::Element) {
+pub(crate) fn link_video_recv(pipeline: &gst::Pipeline, pad: &gst::Pad, vsink: &gst::Element) {
     let depay = gst::ElementFactory::make("rtph265depay").build().unwrap();
     let parse = gst::ElementFactory::make("h265parse").build().unwrap();
     let dec = gst::ElementFactory::make("avdec_h265").build().unwrap();
@@ -240,7 +240,7 @@ fn link_video_recv(pipeline: &gst::Pipeline, pad: &gst::Pad, vsink: &gst::Elemen
     println!("incoming video linked -> displaying");
 }
 
-fn link_voice_recv(pipeline: &gst::Pipeline, pad: &gst::Pad) {
+pub(crate) fn link_voice_recv(pipeline: &gst::Pipeline, pad: &gst::Pad) {
     let depay = gst::ElementFactory::make("rtpopusdepay").build().unwrap();
     let dec = gst::ElementFactory::make("opusdec").build().unwrap();
     let conv = gst::ElementFactory::make("audioconvert").build().unwrap();
@@ -258,7 +258,7 @@ fn link_voice_recv(pipeline: &gst::Pipeline, pad: &gst::Pad) {
     println!("incoming voice linked -> playing");
 }
 
-fn build_voice_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element) -> Result<()> {
+pub(crate) fn build_voice_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element) -> Result<()> {
     let src = gst::parse::bin_from_description(
         "autoaudiosrc ! audioconvert ! audioresample ! queue",
         true,

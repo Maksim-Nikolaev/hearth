@@ -10,7 +10,7 @@ pub struct PeerInfo {
 /// Which independent media transport a signaling message belongs to. Each flow
 /// is carried by its own per-peer `webrtcbin`, so they connect and drop
 /// independently.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum Flow {
     Voice,
