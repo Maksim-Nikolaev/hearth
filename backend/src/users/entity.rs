@@ -3,6 +3,7 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "text", rename_all = "UPPERCASE")]
+#[serde(rename_all = "UPPERCASE")]
 pub enum Role {
     User,
     Admin,
