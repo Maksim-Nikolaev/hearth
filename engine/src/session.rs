@@ -364,19 +364,20 @@ impl Session {
             ServerMessage::ChatHistory { messages } => self.emit(SessionEvent::ChatHistory(messages)),
             ServerMessage::Offer { from, flow, sdp } => {
                 let key = (from, flow);
-                if !self.peers.contains_key(&key) {
-                    match FlowPeer::new(flow, Role::Answerer, from, self.sink, self.out_tx.clone(), self.evt_tx.clone()) {
-                        Ok(p) => {
-                            self.peers.insert(key, p);
-                        }
-                        Err(e) => {
-                            self.emit(SessionEvent::Error(format!("create answerer: {e}")));
-                            return;
-                        }
-                    }
+
+                // A fresh offer starts a new session for this flow. Drop any stale
+                // peer first so re-sharing after a Stop renegotiates cleanly (and
+                // releases the old webrtcbin's ICE port).
+                if let Some(old) = self.peers.remove(&key) {
+                    old.stop();
                 }
-                if let Some(p) = self.peers.get(&key) {
-                    p.handle_offer(&sdp);
+
+                match FlowPeer::new(flow, Role::Answerer, from, self.sink, self.out_tx.clone(), self.evt_tx.clone()) {
+                    Ok(p) => {
+                        p.handle_offer(&sdp);
+                        self.peers.insert(key, p);
+                    }
+                    Err(e) => self.emit(SessionEvent::Error(format!("create answerer: {e}"))),
                 }
             }
             ServerMessage::Answer { from, flow, sdp } => {
