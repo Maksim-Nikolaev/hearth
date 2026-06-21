@@ -68,8 +68,6 @@ impl Component for AppModel {
 
             gtk::Stack {
                 set_margin_all: 24,
-                #[watch]
-                set_visible_child_name: model.screen_name(),
 
                 add_named[Some("login")] = &gtk::Box {
                     set_orientation: gtk::Orientation::Vertical,
@@ -212,6 +210,11 @@ impl Component for AppModel {
                         },
                     },
                 },
+
+                // Set after the pages are added so the initial value always
+                // resolves to an existing child (no startup warning).
+                #[watch]
+                set_visible_child_name: model.screen_name(),
             }
         }
     }

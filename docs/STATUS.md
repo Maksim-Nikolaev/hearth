@@ -84,8 +84,8 @@ app prepends it to `GST_PLUGIN_PATH` automatically.
   add the webcam flow (additive to the per-flow framework).
 - **Multi-peer mesh** – media is 1:1 today (targets the first peer); presence
   already shows everyone.
-- **Polish** – fix the transient `connecting` GtkStack warning, theming,
-  scroll-to-bottom chat, token-restore UX.
+- **Polish** – theming, scroll-to-bottom chat, token-restore UX. (The startup
+  GtkStack warning is fixed; presence verified race-free on simultaneous join.)
 - **M6 deployment** – Traefik proxy + coturn relay; packaging/auto-update.
 
 ## How to resume / run
