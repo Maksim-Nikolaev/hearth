@@ -588,6 +588,22 @@ impl Session {
         self.preview_pipeline.as_ref().map(|(_, p)| p.clone())
     }
 
+    /// Start a local-only preview pipeline for the given config so the picker
+    /// can show a live preview before going live. Any prior preview is torn
+    /// down first. Does NOT start the actual WebRTC share.
+    pub fn start_preview(&mut self, cfg: ShareConfig) {
+        self.stop_preview();
+        self.share_config = cfg;
+        self.preview_pipeline = self.build_preview_pipeline();
+    }
+
+    /// Stop the local preview pipeline. No-op when not running.
+    pub fn stop_preview(&mut self) {
+        if let Some((pipe, _)) = self.preview_pipeline.take() {
+            let _ = pipe.set_state(gst::State::Null);
+        }
+    }
+
     pub fn start_call(&mut self, peer: Uuid) -> Result<()> {
         self.start_offerer(peer, Flow::Voice)
     }

@@ -3,6 +3,7 @@ pub mod chat;
 pub mod login;
 pub mod members;
 pub mod meter;
+pub mod screenshare_picker;
 pub mod self_panel;
 pub mod settings;
 pub mod stage;

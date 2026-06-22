@@ -56,10 +56,14 @@ pub enum WorkspaceInput {
     ToggleVoice,
     Mute(bool),
     Deafen(bool),
-    Share(bool),
+    OpenSharePicker,
+    StopShare,
     SelectSharer(Uuid),
     SendChat(String),
     OpenSettings,
+    /// Programmatically reset the Share toggle in the self-panel (true = active,
+    /// false = inactive) without triggering the toggled handler.
+    SetShareActive(bool),
 }
 
 #[derive(Debug)]
@@ -68,7 +72,7 @@ pub enum WorkspaceOutput {
     LeaveVoice,
     Mute(bool),
     Deafen(bool),
-    StartShare,
+    OpenSharePicker,
     StopShare,
     SendChat(String),
     OpenSettings,
@@ -146,7 +150,8 @@ impl SimpleComponent for Workspace {
             .forward(sender.input_sender(), |out| match out {
                 SelfPanelOutput::Mute(b) => WorkspaceInput::Mute(b),
                 SelfPanelOutput::Deafen(b) => WorkspaceInput::Deafen(b),
-                SelfPanelOutput::Share(b) => WorkspaceInput::Share(b),
+                SelfPanelOutput::OpenSharePicker => WorkspaceInput::OpenSharePicker,
+                SelfPanelOutput::StopShare => WorkspaceInput::StopShare,
                 SelfPanelOutput::OpenSettings => WorkspaceInput::OpenSettings,
             });
 
@@ -253,15 +258,17 @@ impl SimpleComponent for Workspace {
             WorkspaceInput::Deafen(b) => {
                 let _ = sender.output(WorkspaceOutput::Deafen(b));
             }
-            WorkspaceInput::Share(b) => {
-                let _ = sender.output(if b {
-                    WorkspaceOutput::StartShare
-                } else {
-                    WorkspaceOutput::StopShare
-                });
+            WorkspaceInput::OpenSharePicker => {
+                let _ = sender.output(WorkspaceOutput::OpenSharePicker);
+            }
+            WorkspaceInput::StopShare => {
+                let _ = sender.output(WorkspaceOutput::StopShare);
             }
             WorkspaceInput::OpenSettings => {
                 let _ = sender.output(WorkspaceOutput::OpenSettings);
+            }
+            WorkspaceInput::SetShareActive(active) => {
+                let _ = self.self_panel.sender().send(SelfPanelInput::SetShareActive(active));
             }
         }
 

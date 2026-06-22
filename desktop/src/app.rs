@@ -1,11 +1,14 @@
-use crate::config::{ActivationKind, Config, NsLevel};
+use crate::config::{ActivationKind, Config, ContentKind, NsLevel, Settings};
 use crate::ui::login::{LoginForm, LoginInput, LoginOutput};
+use crate::ui::screenshare_picker::{PickerInput, PickerOutput, ScreenSharePicker};
 use crate::ui::settings::{SettingsInput, SettingsOutput, SettingsWindow};
 use crate::ui::workspace::{Screens, Workspace, WorkspaceInput, WorkspaceOutput};
 use engine::audio::devices::list_devices;
 use engine::audio::dsp::{DspConfig, NsLevel as EngineNsLevel};
 use engine::audio::gate::ActivationMode;
 use engine::flow::VideoSink;
+use engine::screen::audio::ShareAudio;
+use engine::screen::sources::{list_windows, ContentType, ShareConfig, ShareSource};
 use engine::session::{Connection, Presence, Session, SessionEvent};
 use gtk::prelude::*;
 use hearth_protocol::ServerMessage;
@@ -30,6 +33,12 @@ pub struct AppModel {
     login: Controller<LoginForm>,
     workspace: Controller<Workspace>,
     settings_window: Controller<SettingsWindow>,
+    /// The picker window. Created once and re-presented each time the user
+    /// clicks "Share screen". Hidden on Cancel / GoLive / StopShare.
+    share_picker: Controller<ScreenSharePicker>,
+    /// Owned by the root so the non-`Send` paintable can be set on the main
+    /// thread without riding a relm4 message. Passed to the picker via Init.
+    preview_picture: gtk::Picture,
 }
 
 #[derive(Debug)]
@@ -37,6 +46,7 @@ pub enum AppMsg {
     Login { username: String, password: String },
     Workspace(WorkspaceOutput),
     Settings(SettingsOutput),
+    Picker(PickerOutput),
 }
 
 /// Async/command results. Manual `Debug` because `Connection` is opaque.
@@ -124,6 +134,12 @@ impl Component for AppModel {
             .launch(())
             .forward(sender.input_sender(), AppMsg::Settings);
 
+        let preview_picture = gtk::Picture::new();
+
+        let share_picker = ScreenSharePicker::builder()
+            .launch(preview_picture.clone())
+            .forward(sender.input_sender(), AppMsg::Picker);
+
         let model = AppModel {
             config,
             title,
@@ -133,6 +149,8 @@ impl Component for AppModel {
             login,
             workspace,
             settings_window,
+            share_picker,
+            preview_picture,
         };
 
         let login_widget = model.login.widget();
@@ -170,6 +188,33 @@ impl Component for AppModel {
                         );
                         self.settings_window.widget().present();
                     }
+                    WorkspaceOutput::OpenSharePicker => {
+                        // Refresh the window list so newly-opened windows appear.
+                        let windows = list_windows();
+                        let _ = self.share_picker.sender().send(PickerInput::SetWindows(windows));
+
+                        // Load persisted share settings and pre-fill picker controls.
+                        // ApplySettings also sets the model fields directly so that
+                        // Go Live without any user interaction uses the correct config.
+                        let saved = self.config.load_settings();
+                        let (content, audio) = settings_to_share(&saved);
+                        let _ = self.share_picker.sender().send(PickerInput::ApplySettings {
+                            width: saved.share_width,
+                            height: saved.share_height,
+                            fps: saved.share_fps,
+                            content,
+                            audio,
+                        });
+
+                        // Start the preview, then set the paintable on the picture directly.
+                        let default_cfg = settings_to_config(&saved);
+                        if let Some(s) = self.session.as_mut() {
+                            s.start_preview(default_cfg);
+                        }
+                        self.sync_preview_paintable();
+
+                        self.share_picker.widget().present();
+                    }
                     out => {
                         if let Some(s) = self.session.as_mut() {
                             match out {
@@ -177,10 +222,17 @@ impl Component for AppModel {
                                 WorkspaceOutput::LeaveVoice => s.leave_voice(),
                                 WorkspaceOutput::Mute(b) => s.mute(b),
                                 WorkspaceOutput::Deafen(b) => s.deafen(b),
-                                WorkspaceOutput::StartShare => s.start_share(engine::screen::ShareConfig::default()),
-                                WorkspaceOutput::StopShare => s.stop_share(),
+                                WorkspaceOutput::StopShare => {
+                                    s.stop_preview();
+                                    s.stop_share();
+                                    self.share_picker.widget().set_visible(false);
+                                    let _ = self.workspace.sender().send(
+                                        WorkspaceInput::SetShareActive(false),
+                                    );
+                                }
                                 WorkspaceOutput::SendChat(body) => s.send_chat(&body),
                                 WorkspaceOutput::OpenSettings => unreachable!(),
+                                WorkspaceOutput::OpenSharePicker => unreachable!(),
                             }
                         }
                     }
@@ -188,6 +240,9 @@ impl Component for AppModel {
             }
             AppMsg::Settings(out) => {
                 self.apply_settings_output(out);
+            }
+            AppMsg::Picker(out) => {
+                self.handle_picker(out);
             }
         }
     }
@@ -314,9 +369,61 @@ impl AppModel {
         }
     }
 
+    /// Handle outputs from the screen-share picker.
+    fn handle_picker(&mut self, out: PickerOutput) {
+        match out {
+            PickerOutput::ConfigChanged(cfg) => {
+                if let Some(s) = self.session.as_mut() {
+                    s.stop_preview();
+                    s.start_preview(cfg);
+                }
+                self.sync_preview_paintable();
+            }
+            PickerOutput::GoLive(cfg) => {
+                self.share_picker.widget().set_visible(false);
+                let mut settings = self.config.load_settings();
+                settings.share_width = cfg.width;
+                settings.share_height = cfg.height;
+                settings.share_fps = cfg.fps;
+                settings.share_content = match cfg.content {
+                    ContentType::Smoothness => ContentKind::Smoothness,
+                    ContentType::Clarity => ContentKind::Clarity,
+                };
+                self.config.save_settings(&settings);
+
+                if let Some(s) = self.session.as_mut() {
+                    s.stop_preview();
+                    s.start_share(cfg);
+                }
+            }
+            PickerOutput::Cancel => {
+                self.share_picker.widget().set_visible(false);
+                if let Some(s) = self.session.as_mut() {
+                    s.stop_preview();
+                }
+                // Reset the Share toggle so it doesn't lie that a share is active.
+                let _ = self.workspace.sender().send(WorkspaceInput::SetShareActive(false));
+            }
+        }
+    }
+
+    /// Set the preview paintable on the owned `gtk::Picture` directly from the
+    /// current session state. Must be called after the mutable session borrow
+    /// is released, since `Picture` is not `Send` and the paintable must not
+    /// ride a relm4 message.
+    fn sync_preview_paintable(&self) {
+        let paintable = self
+            .session
+            .as_ref()
+            .and_then(|s| s.preview_paintable())
+            .and_then(|obj| obj.downcast::<gtk::gdk::Paintable>().ok());
+
+        self.preview_picture.set_paintable(paintable.as_ref());
+    }
+
     /// Persist a settings change and, if connected, apply it to the live session.
     fn apply_settings_output(&mut self, out: SettingsOutput) {
-        let mut settings = self.config.load_settings();
+        let mut settings: Settings = self.config.load_settings();
 
         match out {
             SettingsOutput::InputDevice(id) => settings.input_device = id,
@@ -346,7 +453,7 @@ impl AppModel {
     }
 
     /// Push all audio-relevant settings to a live `Session`.
-    fn apply_settings_to_session(session: &mut Session, s: &crate::config::Settings) {
+    fn apply_settings_to_session(session: &mut Session, s: &Settings) {
         session.set_dsp(DspConfig {
             echo_cancel: s.echo_cancellation,
             noise_suppression: match s.noise_suppression {
@@ -369,5 +476,32 @@ impl AppModel {
         session.set_input_device(s.input_device.clone());
         session.set_output_device(s.output_device.clone());
         session.set_ptt_key(s.ptt_key.clone());
+    }
+}
+
+/// Convert persisted `Settings` into the engine `ContentType` and `ShareAudio`
+/// needed to pre-fill the picker and build a default `ShareConfig`.
+fn settings_to_share(s: &Settings) -> (ContentType, ShareAudio) {
+    let content = match s.share_content {
+        ContentKind::Smoothness => ContentType::Smoothness,
+        ContentKind::Clarity => ContentType::Clarity,
+    };
+
+    let audio = ShareAudio::None;
+
+    (content, audio)
+}
+
+/// Build a `ShareConfig` from persisted settings (Screen { monitor: 0 } default source).
+fn settings_to_config(s: &Settings) -> ShareConfig {
+    let (content, audio) = settings_to_share(s);
+
+    ShareConfig {
+        source: ShareSource::Screen { monitor: 0 },
+        width: s.share_width,
+        height: s.share_height,
+        fps: s.share_fps,
+        content,
+        audio,
     }
 }
