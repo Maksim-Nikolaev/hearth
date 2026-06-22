@@ -6,6 +6,8 @@ mod ui;
 use relm4::RelmApp;
 
 fn main() {
+    install_panic_logger();
+
     ensure_gst_plugin_path();
     gstreamer::init().expect("init gstreamer");
 
@@ -24,6 +26,23 @@ fn main() {
     let app = RelmApp::new(&app_id);
     theme::load();
     app.run::<app::AppModel>(config);
+}
+
+/// Log every panic with its thread, location, and a forced backtrace, then run
+/// the default hook. A panic on a GStreamer streaming thread otherwise leaves
+/// little trace before the process dies; this makes such failures diagnosable
+/// regardless of the `RUST_BACKTRACE` setting.
+fn install_panic_logger() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        let backtrace = std::backtrace::Backtrace::force_capture();
+
+        eprintln!("FATAL panic on thread '{name}': {info}\n{backtrace}");
+
+        default(info);
+    }));
 }
 
 /// Dev convenience: make the locally-built `gtk4paintablesink` discoverable so
