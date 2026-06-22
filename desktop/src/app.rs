@@ -40,6 +40,10 @@ pub struct AppModel {
     /// Owned by the root so the non-`Send` paintable can be set on the main
     /// thread without riding a relm4 message. Passed to the picker via Init.
     preview_picture: gtk::Picture,
+    /// The source currently driving the live preview pipeline. `None` when
+    /// no preview is running. Used to skip pipeline rebuilds on config changes
+    /// that only affect bitrate, fps, or quality (not the capture source).
+    previewed_source: Option<ShareSource>,
 }
 
 #[derive(Debug)]
@@ -152,6 +156,7 @@ impl Component for AppModel {
             settings_window,
             share_picker,
             preview_picture,
+            previewed_source: None,
         };
 
         let login_widget = model.login.widget();
@@ -215,6 +220,7 @@ impl Component for AppModel {
                         // Start the preview, then set the paintable on the picture directly.
                         let default_cfg = settings_to_config(&saved);
                         if let Some(s) = self.session.as_mut() {
+                            self.previewed_source = Some(default_cfg.source.clone());
                             s.start_preview(default_cfg);
                         }
                         self.sync_preview_paintable();
@@ -229,6 +235,7 @@ impl Component for AppModel {
                                 WorkspaceOutput::Mute(b) => s.mute(b),
                                 WorkspaceOutput::Deafen(b) => s.deafen(b),
                                 WorkspaceOutput::StopShare => {
+                                    self.previewed_source = None;
                                     s.stop_preview();
                                     s.stop_share();
                                     self.share_picker.widget().set_visible(false);
@@ -379,11 +386,19 @@ impl AppModel {
     fn handle_picker(&mut self, out: PickerOutput) {
         match out {
             PickerOutput::ConfigChanged(cfg) => {
-                if let Some(s) = self.session.as_mut() {
-                    s.stop_preview();
-                    s.start_preview(cfg);
+                // Only rebuild the capture pipeline when the source changes.
+                // Bitrate, fps, and quality adjustments do not require tearing
+                // down and restarting ximagesrc, which would saturate X/GPU.
+                let source_changed = self.previewed_source.as_ref() != Some(&cfg.source);
+
+                if source_changed {
+                    if let Some(s) = self.session.as_mut() {
+                        self.previewed_source = Some(cfg.source.clone());
+                        s.stop_preview();
+                        s.start_preview(cfg);
+                    }
+                    self.sync_preview_paintable();
                 }
-                self.sync_preview_paintable();
             }
             PickerOutput::GoLive(cfg) => {
                 self.share_picker.widget().set_visible(false);
@@ -399,6 +414,7 @@ impl AppModel {
                 self.config.save_settings(&settings);
 
                 if let Some(s) = self.session.as_mut() {
+                    self.previewed_source = None;
                     s.stop_preview();
                     s.start_share(cfg);
                 }
@@ -408,6 +424,7 @@ impl AppModel {
             PickerOutput::Cancel => {
                 self.share_picker.widget().set_visible(false);
                 if let Some(s) = self.session.as_mut() {
+                    self.previewed_source = None;
                     s.stop_preview();
                 }
                 // Reset the Share toggle and sharing indicator – the user cancelled.

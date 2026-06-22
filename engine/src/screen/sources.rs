@@ -1,5 +1,5 @@
 /// Which display surface to capture.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShareSource {
     /// Capture a full monitor by index (0 = primary).
     Screen { monitor: usize },
