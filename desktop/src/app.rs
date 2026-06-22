@@ -369,6 +369,13 @@ impl AppModel {
                 }
             }
             SessionEvent::Error(e) => self.status = e,
+            // Group voice + share events are consumed by the workspace components
+            // introduced in M6 Tasks 5–7; ignored by this transitional shell.
+            SessionEvent::VoiceState(_)
+            | SessionEvent::VoiceJoined { .. }
+            | SessionEvent::VoiceLeft { .. }
+            | SessionEvent::ShareStarted { .. }
+            | SessionEvent::ShareStopped { .. } => {}
         }
     }
 

@@ -32,7 +32,19 @@ pub enum SessionEvent {
     ChatHistory(Vec<ChatEntry>),
     FlowState { peer: Uuid, flow: Flow, state: String },
     VideoReady { peer: Uuid, flow: Flow },
+    VoiceState(Vec<PeerInfo>),
+    VoiceJoined { user: Uuid, username: String },
+    VoiceLeft { user: Uuid },
+    ShareStarted { user: Uuid },
+    ShareStopped { user: Uuid },
     Error(String),
+}
+
+/// In a voice mesh both sides want to connect, so a deterministic rule decides
+/// who offers: the peer with the smaller `Uuid`. The other side answers the
+/// incoming offer. (Screenshare is directional – the sharer always offers.)
+pub(crate) fn should_offer(me: Uuid, peer: Uuid) -> bool {
+    me < peer
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -228,8 +240,23 @@ pub struct Session {
     out_tx: UnboundedSender<ClientMessage>,
     evt_tx: UnboundedSender<SessionEvent>,
     sink: VideoSink,
+    /// The logged-in user, decoded from the JWT `sub` claim. Drives the voice
+    /// offerer rule (smaller `Uuid` offers).
+    self_id: Uuid,
     peers: HashMap<(Uuid, Flow), FlowPeer>,
     _client: Option<SignalingClient>,
+}
+
+/// Read the user id from a JWT's `sub` claim without verifying the signature:
+/// the server already authenticated us, this only needs our own identity.
+fn self_id_from_token(token: &str) -> Option<Uuid> {
+    use base64::Engine;
+
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+
+    claims.get("sub")?.as_str()?.parse().ok()
 }
 
 /// The `Send` result of opening a connection: handed back from an async task,
@@ -275,11 +302,13 @@ impl Session {
 
         let out_tx = conn.client.sender();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();
+        let self_id = self_id_from_token(&conn.token).unwrap_or_default();
 
         let session = Session {
             out_tx,
             evt_tx,
             sink,
+            self_id,
             peers: HashMap::new(),
             _client: Some(conn.client),
         };
@@ -293,6 +322,42 @@ impl Session {
 
     pub fn send_chat(&self, body: &str) {
         let _ = self.out_tx.send(ClientMessage::Chat { body: body.to_string() });
+    }
+
+    /// Join the Voice channel. The mesh is built reactively from the resulting
+    /// `VoiceState`/`VoiceJoined` server messages.
+    pub fn join_voice(&self) {
+        let _ = self.out_tx.send(ClientMessage::VoiceJoin);
+    }
+
+    /// Leave Voice: tear down every Voice flow, then tell the server.
+    pub fn leave_voice(&mut self) {
+        let voice_peers: Vec<Uuid> = self
+            .peers
+            .keys()
+            .filter(|(_, f)| *f == Flow::Voice)
+            .map(|(p, _)| *p)
+            .collect();
+
+        for p in voice_peers {
+            self.stop_flow(p, Flow::Voice);
+        }
+
+        let _ = self.out_tx.send(ClientMessage::VoiceLeave);
+    }
+
+    /// Open a Voice flow to one mesh member, offering only if our `Uuid` is the
+    /// smaller one; otherwise we wait for their offer (answered in `handle`).
+    fn connect_voice(&mut self, peer: Uuid) {
+        if peer == self.self_id || self.peers.contains_key(&(peer, Flow::Voice)) {
+            return;
+        }
+
+        if should_offer(self.self_id, peer) {
+            if let Err(e) = self.start_offerer(peer, Flow::Voice) {
+                self.emit(SessionEvent::Error(format!("voice offer: {e}")));
+            }
+        }
     }
 
     pub fn start_share(&mut self, peer: Uuid) -> Result<()> {
@@ -390,11 +455,22 @@ impl Session {
                     p.add_ice(mline, &candidate);
                 }
             }
-            ServerMessage::VoiceState { .. }
-            | ServerMessage::VoiceJoined { .. }
-            | ServerMessage::VoiceLeft { .. }
-            | ServerMessage::ShareStarted { .. }
-            | ServerMessage::ShareStopped { .. } => {}
+            ServerMessage::VoiceState { members } => {
+                for m in &members {
+                    self.connect_voice(m.user);
+                }
+                self.emit(SessionEvent::VoiceState(members));
+            }
+            ServerMessage::VoiceJoined { user, username } => {
+                self.connect_voice(user);
+                self.emit(SessionEvent::VoiceJoined { user, username });
+            }
+            ServerMessage::VoiceLeft { user } => {
+                self.stop_flow(user, Flow::Voice);
+                self.emit(SessionEvent::VoiceLeft { user });
+            }
+            ServerMessage::ShareStarted { user } => self.emit(SessionEvent::ShareStarted { user }),
+            ServerMessage::ShareStopped { user } => self.emit(SessionEvent::ShareStopped { user }),
         }
     }
 
@@ -415,11 +491,27 @@ mod tests {
                 out_tx,
                 evt_tx,
                 sink: VideoSink::Auto,
+                self_id: Uuid::nil(),
                 peers: HashMap::new(),
                 _client: None,
             };
             (s, evt_rx)
         }
+    }
+
+    #[test]
+    fn smaller_uuid_offers() {
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        assert!(should_offer(a, b));
+        assert!(!should_offer(b, a));
+    }
+
+    #[test]
+    fn voice_state_is_surfaced() {
+        let (mut s, mut rx) = Session::for_test();
+        s.handle(ServerMessage::VoiceState { members: vec![] });
+        assert!(matches!(rx.try_recv().unwrap(), SessionEvent::VoiceState(m) if m.is_empty()));
     }
 
     #[test]
