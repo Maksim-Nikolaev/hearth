@@ -266,6 +266,32 @@ pub(crate) fn build_screen_send_branch(
     Ok(())
 }
 
+/// Re-base a buffer's PTS/DTS onto a 0-origin set by the first buffer seen on a
+/// per-viewer `appsrc` (`base` holds that first PTS in nanoseconds; `u64::MAX`
+/// means unset).
+///
+/// The shared `ScreenSource` stamps frames against its own pipeline clock, whose
+/// running-time is far ahead of a freshly-started viewer pipeline. Forwarded
+/// unchanged, webrtcbin's transport sink clock-syncs each RTP buffer to that
+/// far-future time and waits ~forever to send it, so video never reaches the
+/// peer (the connection is up but the stage stays black). A 0-origin keeps
+/// timestamps at/behind the viewer pipeline's running-time, so RTP goes out now.
+fn rebase_to_origin(buffer: &mut gst::Buffer, base: &std::sync::atomic::AtomicU64) {
+    use std::sync::atomic::Ordering;
+
+    let Some(pts) = buffer.pts() else { return };
+
+    let origin = match base.compare_exchange(u64::MAX, pts.nseconds(), Ordering::Relaxed, Ordering::Relaxed) {
+        Ok(_) => pts.nseconds(),
+        Err(existing) => existing,
+    };
+
+    let buf = buffer.make_mut();
+    buf.set_pts(gst::ClockTime::from_nseconds(pts.nseconds().saturating_sub(origin)));
+    let dts = buf.dts();
+    buf.set_dts(dts.map(|d| gst::ClockTime::from_nseconds(d.nseconds().saturating_sub(origin))));
+}
+
 /// Screen offerer send branch fed by the shared `ScreenSource` appsink (no
 /// per-peer capture/encode). The caller registers the returned `AppSrc` with
 /// `ScreenSource::register_viewer` so encoded H265 frames flow into it.
@@ -297,35 +323,15 @@ pub(crate) fn build_screen_send_appsrc_branch(
     appsrc.set_property("max-bytes", 2_000_000u64);
     appsrc.set_property_from_str("leaky-type", "downstream");
 
-    // Re-base every access unit to this viewer's first frame (PTS/DTS origin 0).
-    // The shared `ScreenSource` stamps frames against its own pipeline's clock,
-    // whose running-time is far ahead of this freshly-started viewer pipeline;
-    // forwarded unchanged, webrtcbin's transport sink would clock-sync each RTP
-    // buffer to that far-future time and wait ~forever to send it, so video RTP
-    // never reaches the peer (connection is up, but the stage stays black). A
-    // 0-origin keeps timestamps at/behind this pipeline's running-time, so the
-    // payloaded RTP is sent immediately. Per-viewer (each appsrc has its own
-    // base) so a peer that joins an ongoing share still starts at 0.
+    // Re-base each access unit onto a per-viewer 0-origin so RTP is sent
+    // immediately instead of clock-synced to the shared encoder's far-future
+    // timestamps. Own base per appsrc, so a peer joining an ongoing share also
+    // starts at 0. See [`rebase_to_origin`].
     if let Some(src_pad) = appsrc.static_pad("src") {
         let base = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         src_pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-            use std::sync::atomic::Ordering;
             if let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data {
-                if let Some(pts) = buffer.pts() {
-                    let base = match base.compare_exchange(
-                        u64::MAX,
-                        pts.nseconds(),
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    ) {
-                        Ok(_) => pts.nseconds(),
-                        Err(existing) => existing,
-                    };
-                    let buf = buffer.make_mut();
-                    buf.set_pts(gst::ClockTime::from_nseconds(pts.nseconds().saturating_sub(base)));
-                    let dts = buf.dts();
-                    buf.set_dts(dts.map(|d| gst::ClockTime::from_nseconds(d.nseconds().saturating_sub(base))));
-                }
+                rebase_to_origin(buffer, &base);
             }
             gst::PadProbeReturn::Ok
         });
@@ -695,5 +701,141 @@ fn flush_ice(client: &SignalingClient, state: &Arc<State>) {
 
     for (mline, candidate) in pending.drain(..) {
         client.send(ClientMessage::Ice { to: target, flow: state.flow, mline, candidate });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// `rebase_to_origin` zeroes the first frame and offsets the rest relative to
+    /// it, however far in the future the source timestamps are.
+    #[test]
+    fn rebase_to_origin_zeroes_first_and_offsets_rest() {
+        gst::init().unwrap();
+        let base = AtomicU64::new(u64::MAX);
+
+        // ~1000h, the running-time the shared encoder actually produced.
+        let far = gst::ClockTime::from_seconds(3_600_000);
+
+        let mut first = gst::Buffer::new();
+        first.get_mut().unwrap().set_pts(far);
+        rebase_to_origin(&mut first, &base);
+        assert_eq!(first.pts(), Some(gst::ClockTime::ZERO));
+
+        let mut later = gst::Buffer::new();
+        later.get_mut().unwrap().set_pts(far + gst::ClockTime::from_mseconds(33));
+        rebase_to_origin(&mut later, &base);
+        assert_eq!(later.pts(), Some(gst::ClockTime::from_mseconds(33)));
+    }
+
+    /// End-to-end guard for the screen send branch: synthetic H265 fed with
+    /// deliberately far-future timestamps (the original bug condition) must still
+    /// produce RTP (byte-stream payloading) with re-based timestamps. Gated behind
+    /// `HEARTH_CAPTURE` because it needs a real H265 encoder + GStreamer runtime.
+    #[test]
+    fn screen_send_branch_emits_rtp_with_rebased_timestamps() {
+        if std::env::var("HEARTH_CAPTURE").unwrap_or_default().is_empty() {
+            return;
+        }
+        gst::init().unwrap();
+
+        let Some(samples) = generate_h265_aus(20) else {
+            return; // no usable H265 encoder in this environment
+        };
+
+        let pipeline = gst::Pipeline::new();
+        let fakesink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .build()
+            .unwrap();
+        pipeline.add(&fakesink).unwrap();
+
+        // fakesink stands in for webrtcbin; it accepts the application/x-rtp caps.
+        let appsrc = build_screen_send_appsrc_branch(&pipeline, &fakesink, None).unwrap();
+
+        let rtp_count = Arc::new(AtomicU64::new(0));
+        let max_pts_ns = Arc::new(AtomicU64::new(0));
+        {
+            let rtp_count = rtp_count.clone();
+            let max_pts_ns = max_pts_ns.clone();
+            let sink_pad = fakesink.static_pad("sink").unwrap();
+            sink_pad.add_probe(
+                gst::PadProbeType::BUFFER | gst::PadProbeType::BUFFER_LIST,
+                move |_, info| {
+                    let (n, pts) = match &info.data {
+                        Some(gst::PadProbeData::Buffer(b)) => (1, b.pts()),
+                        Some(gst::PadProbeData::BufferList(l)) => {
+                            (l.len() as u64, l.get(0).and_then(|b| b.pts()))
+                        }
+                        _ => (0, None),
+                    };
+                    rtp_count.fetch_add(n, Ordering::Relaxed);
+                    if let Some(p) = pts {
+                        max_pts_ns.fetch_max(p.nseconds(), Ordering::Relaxed);
+                    }
+                    gst::PadProbeReturn::Ok
+                },
+            );
+        }
+
+        pipeline.set_state(gst::State::Playing).unwrap();
+
+        let far = gst::ClockTime::from_seconds(3_600_000);
+        for (i, sample) in samples.iter().enumerate() {
+            let mut buf = sample.copy();
+            {
+                let b = buf.get_mut().unwrap();
+                let t = far + gst::ClockTime::from_mseconds(33 * i as u64);
+                b.set_pts(t);
+                b.set_dts(t);
+            }
+            let _ = appsrc.push_buffer(buf);
+        }
+        let _ = appsrc.end_of_stream();
+
+        // Condition-based wait: poll until RTP appears or the budget expires.
+        let mut waited_ms = 0;
+        while rtp_count.load(Ordering::Relaxed) == 0 && waited_ms < 3000 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            waited_ms += 20;
+        }
+        let _ = pipeline.set_state(gst::State::Null);
+
+        assert!(
+            rtp_count.load(Ordering::Relaxed) > 0,
+            "rtph265pay produced no RTP (byte-stream payloading regressed?)"
+        );
+        assert!(
+            max_pts_ns.load(Ordering::Relaxed) < gst::ClockTime::from_seconds(60).nseconds(),
+            "far-future PTS reached the sink (timestamp re-base regressed?)"
+        );
+    }
+
+    /// Encode `n` frames of `videotestsrc` to byte-stream H265 access units.
+    /// Returns `None` when no H265 encoder is available.
+    fn generate_h265_aus(n: u32) -> Option<Vec<gst::Buffer>> {
+        let encoder = encoders::detect().0.unwrap_or("x265enc");
+        let desc = format!(
+            "videotestsrc num-buffers={n} ! video/x-raw,width=320,height=240,framerate=30/1 ! \
+             videoconvert ! {encoder} ! h265parse config-interval=-1 ! \
+             video/x-h265,stream-format=byte-stream,alignment=au ! appsink name=out sync=false"
+        );
+        let pipeline = gst::parse::launch(&desc).ok()?.downcast::<gst::Pipeline>().ok()?;
+        let appsink = pipeline.by_name("out")?.downcast::<gst_app::AppSink>().ok()?;
+
+        pipeline.set_state(gst::State::Playing).ok()?;
+
+        let mut aus = Vec::new();
+        while let Ok(sample) = appsink.pull_sample() {
+            if let Some(buf) = sample.buffer() {
+                aus.push(buf.copy());
+            }
+        }
+
+        let _ = pipeline.set_state(gst::State::Null);
+
+        (!aus.is_empty()).then_some(aus)
     }
 }

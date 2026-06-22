@@ -159,13 +159,27 @@ impl FlowPeer {
 
         pipeline.add(&webrtc)?;
 
-        // Bus errors/warnings -> events.
+        // Bus errors -> events; warnings are logged. Both are also printed so a
+        // silent stall (e.g. a mis-negotiated send branch) leaves a trace.
         let bus = pipeline.bus().expect("pipeline has a bus");
         let evt_bus = evt_tx.clone();
         let _bus_watch = bus.add_watch(move |_, msg| {
             use gst::MessageView;
-            if let MessageView::Error(e) = msg.view() {
-                let _ = evt_bus.send(SessionEvent::Error(format!("{} ({:?})", e.error(), e.debug())));
+            match msg.view() {
+                MessageView::Error(e) => {
+                    let detail = format!("{} ({:?})", e.error(), e.debug());
+                    eprintln!("{flow:?} pipeline error from {:?}: {detail}", e.src().map(|s| s.path_string()));
+                    let _ = evt_bus.send(SessionEvent::Error(detail));
+                }
+                MessageView::Warning(w) => {
+                    eprintln!(
+                        "{flow:?} pipeline warning from {:?}: {} ({:?})",
+                        w.src().map(|s| s.path_string()),
+                        w.error(),
+                        w.debug()
+                    );
+                }
+                _ => {}
             }
             glib::ControlFlow::Continue
         })?;

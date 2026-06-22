@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gstreamer as gst;
@@ -17,11 +17,14 @@ use crate::screen::sources::ShareConfig;
 /// cheap (few full-screen XShm grabs per second) regardless of the share rate.
 const PREVIEW_FPS_CAP: u32 = 10;
 
-/// One fan-out slot: a viewer's `appsrc` plus a readiness gate. The encoder
-/// pushes encoded H265 into the appsrc only once the flag is set (the viewer's
-/// `webrtcbin` is connected). Feeding a not-yet-negotiated peer wedges its
-/// `rtph265pay` and no video RTP ever flows, so the share stays black.
-type Viewer = (gst_app::AppSrc, Arc<AtomicBool>);
+/// One fan-out slot: a viewer's `appsrc` and its readiness gate.
+struct Viewer {
+    appsrc: gst_app::AppSrc,
+    /// Set true once the viewer's `webrtcbin` is connected. The encoder pushes
+    /// to `appsrc` only while this is set: feeding a not-yet-negotiated peer
+    /// wedges its `rtph265pay`, so no video RTP flows and the share stays black.
+    ready: Arc<AtomicBool>,
+}
 
 /// One capture+encode+preview pipeline. Encoded H265 is fanned out to every
 /// registered viewer `AppSrc` from the single appsink callback; the same raw
@@ -136,29 +139,69 @@ impl ScreenSource {
 
             // Fan-out callback: runs on the appsink streaming thread.
             let viewers_cb = viewers.clone();
+            let enc_cb = enc.clone();
+            // How many viewers were ready on the previous sample, so a newly-ready
+            // one can be detected and handed a fresh keyframe.
+            let prev_ready = Arc::new(AtomicUsize::new(0));
             let callbacks = gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
 
                     let guard = viewers_cb.lock().unwrap();
-                    for (appsrc, ready) in guard.values() {
+                    let mut ready_now = 0usize;
+                    for v in guard.values() {
                         // Feed only viewers whose webrtcbin is connected; pushing
                         // into a not-yet-negotiated peer wedges its rtph265pay.
-                        if !ready.load(Ordering::Relaxed) {
+                        if !v.ready.load(Ordering::Relaxed) {
                             continue;
                         }
+                        ready_now += 1;
 
                         // copy() is a shallow refcount-sharing copy; each appsrc
                         // needs its own ref so they can release independently.
-                        let _ = appsrc.push_buffer(buffer.copy());
+                        let _ = v.appsrc.push_buffer(buffer.copy());
                     }
                     drop(guard);
+
+                    // A viewer that just connected joined mid-GOP and cannot decode
+                    // until the next IDR; force one now instead of making it wait up
+                    // to a full keyframe interval (~2s).
+                    if ready_now > prev_ready.swap(ready_now, Ordering::Relaxed) {
+                        force_keyframe(&enc_cb);
+                    }
 
                     Ok(gst::FlowSuccess::Ok)
                 })
                 .build();
             appsink.set_callbacks(callbacks);
+        }
+
+        // Surface pipeline errors and warnings; otherwise a stalled or
+        // mis-negotiated capture/encode fails silently. Best-effort: the watch
+        // needs a running glib main context, which the desktop app provides.
+        if let Some(bus) = pipeline.bus() {
+            if let Ok(watch) = bus.add_watch(|_, msg| {
+                use gst::MessageView;
+                match msg.view() {
+                    MessageView::Error(e) => eprintln!(
+                        "screen pipeline error from {:?}: {} ({:?})",
+                        e.src().map(|s| s.path_string()),
+                        e.error(),
+                        e.debug()
+                    ),
+                    MessageView::Warning(w) => eprintln!(
+                        "screen pipeline warning from {:?}: {} ({:?})",
+                        w.src().map(|s| s.path_string()),
+                        w.error(),
+                        w.debug()
+                    ),
+                    _ => {}
+                }
+                glib::ControlFlow::Continue
+            }) {
+                std::mem::forget(watch);
+            }
         }
 
         pipeline.set_state(gst::State::Playing).ok()?;
@@ -170,7 +213,7 @@ impl ScreenSource {
     /// the fan-out: the encoder pushes to this appsrc only once the flag is set
     /// (the viewer's `webrtcbin` is connected). See [`Viewer`].
     pub fn register_viewer(&self, id: Uuid, src: gst_app::AppSrc, ready: Arc<AtomicBool>) {
-        self.viewers.lock().unwrap().insert(id, (src, ready));
+        self.viewers.lock().unwrap().insert(id, Viewer { appsrc: src, ready });
     }
 
     /// Remove a viewer appsrc. No-op when the id is not registered.
@@ -198,6 +241,18 @@ impl Drop for ScreenSource {
     }
 }
 
+/// Ask the encoder to emit a keyframe (IDR with parameter sets) on its next
+/// frame via an upstream force-key-unit event. Lets a freshly-connected viewer
+/// start decoding immediately instead of waiting for the next periodic keyframe.
+fn force_keyframe(encoder: &gst::Element) {
+    let event = gst::event::CustomUpstream::new(
+        gst::Structure::builder("GstForceKeyUnit")
+            .field("all-headers", true)
+            .build(),
+    );
+    let _ = encoder.send_event(event);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,7 +270,7 @@ mod tests {
         let appsrc = gst_app::AppSrc::builder().build();
         let ready = Arc::new(AtomicBool::new(true));
 
-        viewers.lock().unwrap().insert(id, (appsrc, ready));
+        viewers.lock().unwrap().insert(id, Viewer { appsrc, ready });
         assert_eq!(viewers.lock().unwrap().len(), 1);
 
         viewers.lock().unwrap().remove(&id);
