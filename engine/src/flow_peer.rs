@@ -415,14 +415,43 @@ pub(crate) fn build_voice_send_branch(
     Ok(appsrc)
 }
 
-/// Apply encoder settings for screenshare. `bitrate_kbps` is the configured
-/// target; `HEARTH_BITRATE_KBPS` env var overrides it when set.
+/// Apply bitrate and low-latency settings to the screenshare encoder.
+///
+/// `bitrate_kbps` is the configured target; `HEARTH_BITRATE_KBPS` env var
+/// overrides it when set. All properties are applied via `set_if_present` so
+/// missing props on any encoder (x265enc, vah265lpenc, etc.) are silently skipped.
 fn tune_encoder(enc: &gst::Element, bitrate_kbps: u32) {
     let bitrate = std::env::var("HEARTH_BITRATE_KBPS")
         .unwrap_or_else(|_| bitrate_kbps.to_string());
 
     set_if_present(enc, "bitrate", &bitrate);
+
+    // Short GOP keeps seeks and recovery fast; 60 frames at 30 fps = 2 s.
     set_if_present(enc, "key-int-max", "60");
+
+    // CBR gives predictable throughput and avoids bitrate spikes that cause
+    // receiver buffer bloat and added latency.
+    set_if_present(enc, "rate-control", "cbr");
+
+    // target-usage 7 = maximum encode speed; trades quality for lower latency
+    // on VA-API (vah265enc) encoders (range 1 = best quality, 7 = fastest).
+    set_if_present(enc, "target-usage", "7");
+
+    // B-frames require the decoder to reorder frames, adding latency. Zero
+    // means only I and P frames (no reorder delay).
+    set_if_present(enc, "b-frames", "0");
+
+    // Fewer reference frames reduces the DPB (decoded picture buffer) depth,
+    // cutting end-to-end pipeline delay on both encoder and decoder.
+    set_if_present(enc, "ref-frames", "1");
+
+    // Macroblock-level bitrate control conflicts with strict CBR latency goals.
+    set_if_present(enc, "mbbrc", "disabled");
+
+    // x265enc equivalents: zerolatency removes all algorithmic buffering;
+    // ultrafast minimises per-frame CPU work.
+    set_if_present(enc, "tune", "zerolatency");
+    set_if_present(enc, "speed-preset", "ultrafast");
 }
 
 fn set_if_present(el: &gst::Element, prop: &str, val: &str) {
