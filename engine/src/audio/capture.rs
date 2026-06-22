@@ -211,7 +211,7 @@ fn build_mic_pipeline(
 
     // The `cap` streaming thread owns these; nothing else touches them.
     let mut render_buf = vec![0.0f32; FRAME_SAMPLES];
-    let mut pcm_out = vec![0i16; FRAME_SAMPLES];
+    let silence = vec![0.0f32; FRAME_SAMPLES];
 
     // Monotonic frame counter for deriving PTS. Advances by exactly 10 ms per
     // processed frame so Opus/RTP timing is frame-derived, not arrival-derived.
@@ -255,18 +255,13 @@ fn build_mic_pipeline(
 
                 let _ = evt.send(SessionEvent::InputLevel(rms_db));
 
-                // Closed gate => push silence so each Opus/RTP stream keeps stable
-                // timing. Never skip the push.
-                if open {
-                    f32_to_i16(&mic, &mut pcm_out);
-                } else {
-                    pcm_out.iter_mut().for_each(|s| *s = 0);
-                }
-
                 let pts = frame_duration * frame_count;
                 frame_count += 1;
 
-                push_to_peers(&peers, &pcm_out, pts, frame_duration);
+                // Closed gate => push silence so each Opus/RTP stream keeps stable
+                // timing. Never skip the push.
+                let frame = if open { &mic[..] } else { &silence[..] };
+                push_to_peers(&peers, frame, pts, frame_duration);
 
                 Ok(gst::FlowSuccess::Ok)
             })
@@ -310,16 +305,16 @@ pub(super) fn sample_to_f32(sample: &gst::Sample) -> Option<Vec<f32>> {
     Some(frame)
 }
 
-/// Copy one processed S16 frame into a fresh `gst::Buffer` with an explicit PTS
-/// and duration, then push it into every registered peer appsrc. PTS is
-/// frame-derived so Opus/RTP timing stays stable regardless of callback jitter.
+/// Encode a f32 frame as S16LE bytes into a fresh `gst::Buffer`, stamp it with
+/// an explicit PTS and duration, then push it into every registered peer appsrc.
+/// PTS is frame-derived so Opus/RTP timing stays stable regardless of callback jitter.
 fn push_to_peers(
     peers: &Arc<Mutex<Vec<gst_app::AppSrc>>>,
-    pcm: &[i16],
+    frame: &[f32],
     pts: gst::ClockTime,
     duration: gst::ClockTime,
 ) {
-    let byte_len = std::mem::size_of_val(pcm);
+    let byte_len = frame.len() * 2;
 
     let Some(mut buffer) = gst::Buffer::with_size(byte_len).ok() else {
         eprintln!("audio/capture: failed to allocate pcm buffer – skipping frame");
@@ -338,13 +333,7 @@ fn push_to_peers(
                 return;
             };
 
-            // Convert each i16 sample to two S16LE bytes – no pointer cast needed.
-            let bytes = map.as_mut_slice();
-            for (chunk, s) in bytes.chunks_exact_mut(2).zip(pcm.iter()) {
-                let b = s.to_le_bytes();
-                chunk[0] = b[0];
-                chunk[1] = b[1];
-            }
+            f32_to_bytes(frame, map.as_mut_slice());
         }
 
         buffer_mut.set_pts(pts);

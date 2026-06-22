@@ -1,4 +1,4 @@
-use crate::audio::capture::{f32_to_i16, pcm_caps, rms_dbfs, sample_to_f32};
+use crate::audio::capture::{f32_to_bytes, pcm_caps, rms_dbfs, sample_to_f32};
 use crate::audio::dsp::{Dsp, DspConfig, FRAME_SAMPLES};
 use crate::session::SessionEvent;
 use anyhow::Result;
@@ -96,7 +96,6 @@ fn build_in_pipeline(
     let mut dsp = Dsp::new()?;
     dsp.set_config(&cfg);
 
-    let mut pcm_out = vec![0i16; FRAME_SAMPLES];
     let mut frame_count: u64 = 0;
     let frame_duration = gst::ClockTime::from_mseconds(10);
 
@@ -123,12 +122,10 @@ fn build_in_pipeline(
                 let rms_db = rms_dbfs(&mic);
                 let _ = evt.send(SessionEvent::InputLevel(rms_db));
 
-                f32_to_i16(&mic, &mut pcm_out);
-
                 let pts = frame_duration * frame_count;
                 frame_count += 1;
 
-                push_frame(&push_appsrc, &pcm_out, pts, frame_duration);
+                push_frame(&push_appsrc, &mic, pts, frame_duration);
 
                 Ok(gst::FlowSuccess::Ok)
             })
@@ -163,10 +160,10 @@ fn build_out_pipeline(output: Option<String>, appsrc: gst_app::AppSrc) -> Result
     Ok(pipeline)
 }
 
-/// Write one S16LE frame into a GStreamer buffer with an explicit PTS/duration
-/// and push it into the output `appsrc`. Errors are logged, never panicked.
-fn push_frame(appsrc: &gst_app::AppSrc, pcm: &[i16], pts: gst::ClockTime, duration: gst::ClockTime) {
-    let byte_len = std::mem::size_of_val(pcm);
+/// Encode a f32 frame as S16LE bytes into a GStreamer buffer with an explicit
+/// PTS/duration and push it into the output `appsrc`. Errors are logged, never panicked.
+fn push_frame(appsrc: &gst_app::AppSrc, frame: &[f32], pts: gst::ClockTime, duration: gst::ClockTime) {
+    let byte_len = frame.len() * 2;
 
     let Some(mut buffer) = gst::Buffer::with_size(byte_len).ok() else {
         eprintln!("audio/monitor: failed to allocate pcm buffer – skipping frame");
@@ -185,13 +182,7 @@ fn push_frame(appsrc: &gst_app::AppSrc, pcm: &[i16], pts: gst::ClockTime, durati
                 return;
             };
 
-            // Convert each i16 sample to two S16LE bytes – no pointer cast needed.
-            let bytes = map.as_mut_slice();
-            for (chunk, s) in bytes.chunks_exact_mut(2).zip(pcm.iter()) {
-                let b = s.to_le_bytes();
-                chunk[0] = b[0];
-                chunk[1] = b[1];
-            }
+            f32_to_bytes(frame, map.as_mut_slice());
         }
 
         buffer_mut.set_pts(pts);
