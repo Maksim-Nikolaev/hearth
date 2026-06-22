@@ -8,6 +8,7 @@ use engine::audio::dsp::{DspConfig, NsLevel as EngineNsLevel};
 use engine::audio::gate::ActivationMode;
 use engine::flow::VideoSink;
 use engine::screen::audio::ShareAudio;
+use engine::screen::audio::list_app_nodes;
 use engine::screen::sources::{list_windows, ContentType, ShareConfig, ShareSource};
 use engine::session::{Connection, Presence, Session, SessionEvent};
 use gtk::prelude::*;
@@ -189,9 +190,13 @@ impl Component for AppModel {
                         self.settings_window.widget().present();
                     }
                     WorkspaceOutput::OpenSharePicker => {
-                        // Refresh the window list so newly-opened windows appear.
+                        // Refresh the window and audio-node lists so anything
+                        // that started after the last open appears immediately.
                         let windows = list_windows();
                         let _ = self.share_picker.sender().send(PickerInput::SetWindows(windows));
+
+                        let audio_nodes = list_app_nodes();
+                        let _ = self.share_picker.sender().send(PickerInput::SetAudioNodes(audio_nodes));
 
                         // Load persisted share settings and pre-fill picker controls.
                         // ApplySettings also sets the model fields directly so that

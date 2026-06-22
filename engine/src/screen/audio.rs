@@ -248,6 +248,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_nodes_returns_app_output_stream_with_friendly_label() {
+        // Represents a real pw-dump entry for an application playing audio.
+        // application.name is preferred over node.name as the human label.
+        let json: serde_json::Value = serde_json::json!([
+            {
+                "type": "PipeWire:Interface:Node",
+                "id": 77,
+                "info": {
+                    "props": {
+                        "media.class": "Stream/Output/Audio",
+                        "node.name": "chromium",
+                        "application.name": "Chromium",
+                        "media.name": "AudioStream",
+                        "application.process.id": 1234
+                    }
+                }
+            }
+        ]);
+
+        let filt = NodeFilter::default();
+        // own_pid differs so the node is not self-excluded.
+        let nodes = parse_nodes(&json, 9999, &filt);
+
+        assert_eq!(nodes.len(), 1, "one app output stream must be returned");
+        assert_eq!(nodes[0].node, "chromium", "node field carries the node.name");
+        assert_eq!(nodes[0].label, "Chromium", "label prefers application.name");
+    }
+
+    #[test]
     fn parse_nodes_skips_non_node_entries() {
         // A realistic pw-dump array mixing a valid audio stream node with a
         // non-node entry (a Link interface). The non-node must not cause the

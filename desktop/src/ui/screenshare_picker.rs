@@ -78,6 +78,8 @@ pub enum PickerInput {
     SelectAudio(u32),
     /// Rebuild the window list in the source grid (called on each picker open).
     SetWindows(Vec<ShareWindow>),
+    /// Refresh the per-app audio node list (called on each picker open).
+    SetAudioNodes(Vec<engine::screen::audio::AudioNode>),
     /// Apply persisted settings: update model fields + button state atomically.
     ApplySettings { width: u32, height: u32, fps: u32, content: ContentType, audio: ShareAudio },
     GoLive,
@@ -432,6 +434,9 @@ impl SimpleComponent for ScreenSharePicker {
             PickerInput::SetWindows(windows) => {
                 self.rebuild_window_buttons(&windows, &sender);
             }
+            PickerInput::SetAudioNodes(nodes) => {
+                self.rebuild_audio_rows(nodes);
+            }
             PickerInput::ApplySettings { width, height, fps, content, audio } => {
                 self.apply_settings(width, height, fps, content, &audio);
             }
@@ -513,6 +518,26 @@ impl ScreenSharePicker {
             .unwrap_or(0);
         self.audio_idx = idx;
         self.audio_dropdown.set_selected(idx);
+    }
+
+    /// Rebuild the audio dropdown from a freshly queried node list.
+    ///
+    /// Always keeps "None" and "Entire System" as the first two entries, then
+    /// appends the current per-app nodes. The selected index is reset to 0
+    /// (None) so stale app references are never silently carried over.
+    fn rebuild_audio_rows(&mut self, nodes: Vec<engine::screen::audio::AudioNode>) {
+        self.audio_rows = vec![AudioRow::None, AudioRow::System];
+
+        for n in &nodes {
+            self.audio_rows.push(AudioRow::App { node: n.node.clone(), label: n.label.clone() });
+        }
+
+        let labels: Vec<String> = self.audio_rows.iter().map(|r| r.label()).collect();
+        let string_list = gtk::StringList::new(&labels.iter().map(String::as_str).collect::<Vec<_>>());
+
+        self.audio_dropdown.set_model(Some(&string_list));
+        self.audio_idx = 0;
+        self.audio_dropdown.set_selected(0);
     }
 
     /// Remove all window buttons from the source grid and rebuild them from the
