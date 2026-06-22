@@ -31,9 +31,13 @@ fn default_chain(cfg: &ShareConfig) -> String {
 
     let fps = effective_fps(cfg);
 
+    // `videorate` adapts the live capture to the target fps, and the trailing
+    // `queue` decouples the live `ximagesrc` thread from the downstream sink /
+    // encoder (a live source feeding `gtk4paintablesink` directly stalls without
+    // it – the cause of the black preview/share with a real screen).
     format!(
-        "{src} ! videoconvert ! videoscale \
-         ! video/x-raw,width={w},height={h},framerate={fps}/1",
+        "{src} ! videoconvert ! videorate ! videoscale \
+         ! video/x-raw,width={w},height={h},framerate={fps}/1 ! queue",
         w = cfg.width,
         h = cfg.height,
     )
