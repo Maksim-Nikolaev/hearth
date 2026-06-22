@@ -185,11 +185,13 @@ fn push_frame(appsrc: &gst_app::AppSrc, pcm: &[i16], pts: gst::ClockTime, durati
                 return;
             };
 
-            // SAFETY: caps pin the format to S16LE interleaved on little-endian targets.
-            let dst: &mut [i16] = unsafe {
-                std::slice::from_raw_parts_mut(map.as_mut_slice().as_mut_ptr() as *mut i16, pcm.len())
-            };
-            dst.copy_from_slice(pcm);
+            // Convert each i16 sample to two S16LE bytes – no pointer cast needed.
+            let bytes = map.as_mut_slice();
+            for (chunk, s) in bytes.chunks_exact_mut(2).zip(pcm.iter()) {
+                let b = s.to_le_bytes();
+                chunk[0] = b[0];
+                chunk[1] = b[1];
+            }
         }
 
         buffer_mut.set_pts(pts);

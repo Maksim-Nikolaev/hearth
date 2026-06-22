@@ -276,25 +276,38 @@ fn build_mic_pipeline(
     Ok(pipeline)
 }
 
-/// Pull an interleaved S16 buffer out of a sample as an f32 frame.
+/// Decode a S16LE byte slice into f32 samples in `[-1, 1]`.
+///
+/// Works on any byte alignment – reads two bytes at a time via `from_le_bytes`,
+/// which is the safe, endian-explicit equivalent of the former pointer cast.
+pub(crate) fn bytes_to_f32(bytes: &[u8], dst: &mut Vec<f32>) {
+    dst.clear();
+    dst.extend(bytes.chunks_exact(2).map(|b| {
+        i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0
+    }));
+}
+
+/// Encode f32 samples in `[-1, 1]` into S16LE bytes.
+///
+/// Each sample is clamped, scaled, and written as two little-endian bytes via
+/// `to_le_bytes`, matching the capsfilter's S16LE format without any pointer cast.
+pub(crate) fn f32_to_bytes(src: &[f32], dst: &mut [u8]) {
+    for (chunk, s) in dst.chunks_exact_mut(2).zip(src.iter()) {
+        let bytes = ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes();
+        chunk[0] = bytes[0];
+        chunk[1] = bytes[1];
+    }
+}
+
+/// Pull an interleaved S16LE buffer out of a sample as an f32 frame.
 pub(super) fn sample_to_f32(sample: &gst::Sample) -> Option<Vec<f32>> {
     let buffer = sample.buffer()?;
     let map = buffer.map_readable().ok()?;
 
-    let pcm: &[i16] = bytemuck_cast(map.as_slice());
-    let mut frame = vec![0.0f32; pcm.len()];
-    i16_to_f32(pcm, &mut frame);
+    let mut frame = Vec::with_capacity(map.len() / 2);
+    bytes_to_f32(map.as_slice(), &mut frame);
 
     Some(frame)
-}
-
-/// Reinterpret a little-endian byte slice as `i16` samples. The capsfilter
-/// guarantees S16LE, so length is always a multiple of two.
-pub(super) fn bytemuck_cast(bytes: &[u8]) -> &[i16] {
-    let len = bytes.len() / 2;
-    // SAFETY: caps pin the format to S16LE interleaved, so the bytes are a valid
-    // run of native-endian i16 on the little-endian targets this app supports.
-    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i16, len) }
 }
 
 /// Copy one processed S16 frame into a fresh `gst::Buffer` with an explicit PTS
@@ -325,11 +338,13 @@ fn push_to_peers(
                 return;
             };
 
-            // SAFETY: same S16LE little-endian invariant as `bytemuck_cast`.
-            let dst: &mut [i16] = unsafe {
-                std::slice::from_raw_parts_mut(map.as_mut_slice().as_mut_ptr() as *mut i16, pcm.len())
-            };
-            dst.copy_from_slice(pcm);
+            // Convert each i16 sample to two S16LE bytes – no pointer cast needed.
+            let bytes = map.as_mut_slice();
+            for (chunk, s) in bytes.chunks_exact_mut(2).zip(pcm.iter()) {
+                let b = s.to_le_bytes();
+                chunk[0] = b[0];
+                chunk[1] = b[1];
+            }
         }
 
         buffer_mut.set_pts(pts);
@@ -353,8 +368,38 @@ mod tests {
         i16_to_f32(&src, &mut f);
         let mut back = vec![0i16; src.len()];
         f32_to_i16(&f, &mut back);
+
         for (a, b) in src.iter().zip(back.iter()) {
             assert!((a - b).abs() <= 1, "{a} vs {b}");
+        }
+    }
+
+    /// Verify `bytes_to_f32` / `f32_to_bytes` round-trip on a slice that starts
+    /// at an odd byte offset, which would have been UB with the former pointer cast.
+    #[test]
+    fn bytes_to_f32_round_trip_non_aligned() {
+        // Encode two known i16 samples into bytes, prepend a padding byte to
+        // force an odd starting address, then decode from the offset slice.
+        let samples: [i16; 4] = [0, 16384, -16384, 32767];
+        let mut aligned_bytes: Vec<u8> = vec![0xAB]; // padding byte at index 0
+        for s in &samples {
+            aligned_bytes.extend_from_slice(&s.to_le_bytes());
+        }
+
+        // Slice starting at byte 1 – not 2-byte aligned in general.
+        let unaligned = &aligned_bytes[1..];
+
+        let mut decoded = Vec::new();
+        bytes_to_f32(unaligned, &mut decoded);
+
+        assert_eq!(decoded.len(), samples.len());
+
+        let mut re_encoded = vec![0u8; samples.len() * 2];
+        f32_to_bytes(&decoded, &mut re_encoded);
+
+        for (i, s) in samples.iter().enumerate() {
+            let got = i16::from_le_bytes([re_encoded[i * 2], re_encoded[i * 2 + 1]]);
+            assert!((s - got).abs() <= 1, "sample {i}: {s} vs {got}");
         }
     }
 
