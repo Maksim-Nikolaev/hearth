@@ -14,6 +14,9 @@ struct Peer {
 pub struct SignalingHub {
     peers: Arc<Mutex<HashMap<Uuid, Peer>>>,
     rooms: Arc<Mutex<HashMap<String, HashSet<Uuid>>>>,
+    /// Members currently in the single Voice channel. Parallel to rooms; the
+    /// backend only tracks membership and relays signaling – media is P2P.
+    voice: Arc<Mutex<HashSet<Uuid>>>,
 }
 
 impl SignalingHub {
@@ -105,7 +108,66 @@ impl SignalingHub {
         }
     }
 
+    /// Join the Voice channel: notify current members, hand the joiner the
+    /// roster of who is already in, then record membership.
+    pub fn voice_join(&self, user: Uuid) {
+        let peers = self.peers.lock().unwrap();
+        let mut voice = self.voice.lock().unwrap();
+
+        let username = peers.get(&user).map(|p| p.username.clone()).unwrap_or_default();
+        let members: Vec<PeerInfo> = voice.iter()
+            .filter_map(|id| peers.get(id).map(|p| PeerInfo { user: *id, username: p.username.clone() }))
+            .collect();
+
+        for id in voice.iter() {
+            if let Some(p) = peers.get(id) {
+                let _ = p.tx.send(ServerMessage::VoiceJoined { user, username: username.clone() });
+            }
+        }
+
+        if let Some(p) = peers.get(&user) {
+            let _ = p.tx.send(ServerMessage::VoiceState { members });
+        }
+
+        voice.insert(user);
+    }
+
+    pub fn voice_leave(&self, user: Uuid) {
+        let peers = self.peers.lock().unwrap();
+        let mut voice = self.voice.lock().unwrap();
+
+        if !voice.remove(&user) {
+            return;
+        }
+
+        for id in voice.iter() {
+            if let Some(p) = peers.get(id) {
+                let _ = p.tx.send(ServerMessage::VoiceLeft { user });
+            }
+        }
+    }
+
+    fn voice_broadcast(&self, msg: ServerMessage) {
+        let peers = self.peers.lock().unwrap();
+        let voice = self.voice.lock().unwrap();
+
+        for id in voice.iter() {
+            if let Some(p) = peers.get(id) {
+                let _ = p.tx.send(msg.clone());
+            }
+        }
+    }
+
+    pub fn share_start(&self, user: Uuid) {
+        self.voice_broadcast(ServerMessage::ShareStarted { user });
+    }
+
+    pub fn share_stop(&self, user: Uuid) {
+        self.voice_broadcast(ServerMessage::ShareStopped { user });
+    }
+
     pub fn disconnect(&self, user: Uuid) {
+        self.voice_leave(user);
         self.leave_room(user);
 
         self.peers.lock().unwrap().remove(&user);
