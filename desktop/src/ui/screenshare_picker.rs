@@ -862,18 +862,20 @@ impl ScreenSharePicker {
         let sender = sender.clone();
 
         std::thread::spawn(move || {
-            while flag.load(Ordering::Relaxed) {
-                for (index, src) in &sources {
-                    if !flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    if let Some(png) = thumbnail(src, 240, 135) {
-                        let _ = sender.input(PickerInput::ThumbnailReady { index: *index, png });
-                    }
+            // Single pass: capture each source's thumbnail ONCE, spacing the grabs
+            // apart so the picker never floods the X server with back-to-back
+            // full-screen XShm captures (which can freeze the desktop). No
+            // perpetual refresh loop – the live preview covers the selected source.
+            for (index, src) in &sources {
+                if !flag.load(Ordering::Relaxed) {
+                    break;
                 }
 
-                std::thread::sleep(Duration::from_secs(4));
+                if let Some(png) = thumbnail(src, 240, 135) {
+                    let _ = sender.input(PickerInput::ThumbnailReady { index: *index, png });
+                }
+
+                std::thread::sleep(Duration::from_millis(150));
             }
         });
     }

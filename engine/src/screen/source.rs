@@ -12,6 +12,10 @@ use crate::flow_peer::tune_encoder;
 use crate::screen::backend::detect_capture_backend;
 use crate::screen::sources::ShareConfig;
 
+/// Frame-rate ceiling for the local preview capture. Keeps the picker's preview
+/// cheap (few full-screen XShm grabs per second) regardless of the share rate.
+const PREVIEW_FPS_CAP: u32 = 10;
+
 /// One capture+encode+preview pipeline. Encoded H265 is fanned out to every
 /// registered viewer `AppSrc` from the single appsink callback; the same raw
 /// frames are tee'd to a `gtk4paintablesink` for local preview.
@@ -34,7 +38,17 @@ impl ScreenSource {
         gst::init().ok()?;
 
         let backend = detect_capture_backend();
-        let chain_str = backend.capture_chain(cfg);
+
+        // The preview pane is small and only needs to look live; capturing it at
+        // the share's full frame rate means dozens of full-screen XShm grabs per
+        // second (~14 MB each at 2K) just for a thumbnail-sized view, which floods
+        // the X server. Cap preview capture to a low frame rate. The live share
+        // (encode == true) keeps the configured rate.
+        let mut effective = cfg.clone();
+        if !encode {
+            effective.fps = effective.fps.min(PREVIEW_FPS_CAP);
+        }
+        let chain_str = backend.capture_chain(&effective);
 
         let src = gst::parse::bin_from_description(&chain_str, true).ok()?;
 
