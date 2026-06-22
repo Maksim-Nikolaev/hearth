@@ -172,13 +172,36 @@ pub(crate) fn parse_nodes(json: &serde_json::Value, own_pid: u32, filt: &NodeFil
             continue;
         }
 
-        let label = props
+        let app_name = props
             .get("application.name")
-            .or_else(|| props.get("node.description"))
-            .or_else(|| props.get("node.name"))
             .and_then(|v| v.as_str())
-            .unwrap_or(&node_name)
-            .to_string();
+            .unwrap_or("");
+
+        // Prefer application.name as the base. When absent fall back to
+        // node.description then node.name so something always shows.
+        let base = if !app_name.is_empty() {
+            app_name
+        } else {
+            props
+                .get("node.description")
+                .or_else(|| props.get("node.name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(&node_name)
+        };
+
+        // Append a detail suffix when media.name carries stream-level context
+        // (e.g. a tab title) that differs from the base, so two streams from
+        // the same app render as distinct labels.
+        let media_name = props
+            .get("media.name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let label = if !media_name.is_empty() && media_name != base {
+            format!("{base} \u{2013} {media_name}")
+        } else {
+            base.to_string()
+        };
 
         nodes.push(AudioNode { node: node_name, label });
     }
@@ -249,8 +272,8 @@ mod tests {
 
     #[test]
     fn parse_nodes_returns_app_output_stream_with_friendly_label() {
-        // Represents a real pw-dump entry for an application playing audio.
-        // application.name is preferred over node.name as the human label.
+        // application.name is the base; a distinct media.name is appended so
+        // streams from the same app can be told apart in the UI.
         let json: serde_json::Value = serde_json::json!([
             {
                 "type": "PipeWire:Interface:Node",
@@ -273,7 +296,58 @@ mod tests {
 
         assert_eq!(nodes.len(), 1, "one app output stream must be returned");
         assert_eq!(nodes[0].node, "chromium", "node field carries the node.name");
-        assert_eq!(nodes[0].label, "Chromium", "label prefers application.name");
+        assert_eq!(nodes[0].label, "Chromium \u{2013} AudioStream", "label appends distinct media.name");
+    }
+
+    #[test]
+    fn parse_nodes_labels_same_app_streams_distinctly() {
+        // Two Firefox streams with the same application.name but different
+        // media.name values (e.g. two tabs playing audio simultaneously).
+        // Labels must be distinct; node identifiers must be preserved for capture.
+        let json: serde_json::Value = serde_json::json!([
+            {
+                "type": "PipeWire:Interface:Node",
+                "id": 101,
+                "info": {
+                    "props": {
+                        "media.class": "Stream/Output/Audio",
+                        "node.name": "Firefox-101",
+                        "application.name": "Firefox",
+                        "media.name": "How We Built Smart Enemies – YouTube",
+                        "application.process.id": 5001,
+                        "object.serial": 101
+                    }
+                }
+            },
+            {
+                "type": "PipeWire:Interface:Node",
+                "id": 102,
+                "info": {
+                    "props": {
+                        "media.class": "Stream/Output/Audio",
+                        "node.name": "Firefox-102",
+                        "application.name": "Firefox",
+                        "media.name": "Rust in 100 Seconds – YouTube",
+                        "application.process.id": 5001,
+                        "object.serial": 102
+                    }
+                }
+            }
+        ]);
+
+        let filt = NodeFilter::default();
+        let nodes = parse_nodes(&json, 9999, &filt);
+
+        assert_eq!(nodes.len(), 2, "both Firefox streams must be returned");
+
+        // Node identifiers are preserved (used for target-object= in capture).
+        assert_eq!(nodes[0].node, "Firefox-101");
+        assert_eq!(nodes[1].node, "Firefox-102");
+
+        // Labels must be distinct despite the same application.name.
+        assert_ne!(nodes[0].label, nodes[1].label, "same-app streams need distinct labels");
+        assert!(nodes[0].label.starts_with("Firefox \u{2013}"), "label includes app name");
+        assert!(nodes[1].label.starts_with("Firefox \u{2013}"), "label includes app name");
     }
 
     #[test]
