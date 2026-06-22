@@ -47,7 +47,7 @@ build) are present.
   of an in-pipeline element we bridge capture PCM through the crate before Opus.
   Per-toggle control is **live** (set the processor config in place), and the same
   crate **ports to the future Windows build**. Builds via the already-installed
-  cmake/clang.
+  autotools toolchain (libtool/automake/autoconf).
 - **Apply changes live**: changing a device or DSP toggle during a call rebuilds
   the voice send branch / hot-swaps the source (sub-second, no reconnect).
 - **Screenshare sources (X11): whole screen + specific window.** Region-select is
@@ -219,8 +219,9 @@ Already satisfied on the dev box (verified 2026-06-22):
   `gstreamer1.0-pulseaudio` installed; `level`, `pulsesrc`, `pipewiresrc`,
   `ximagesrc` all present.
 - **Voice DSP build deps** – the `webrtc-audio-processing` Rust crate builds a
-  vendored libwebrtc copy via **cmake 3.28 + clang 18 + pkg-config** (all
-  present); the system also has `libwebrtc-audio-processing 0.3.1`.
+  vendored libwebrtc copy via **autotools (libtool / automake / autoconf) +
+  pkg-config** (all present); the system also has
+  `libwebrtc-audio-processing 0.3.1`.
 
 Note: the GStreamer `webrtcdsp`/`webrtcechoprobe` elements are **not provided** by
 Ubuntu Noble (`gst-inspect-1.0 webrtcdsp` → not found), which is why DSP runs
@@ -242,10 +243,10 @@ and global PTT (`XGrabKey` via XCB) are pure-Rust cargo deps – no system packa
 
 ## Risks / prerequisites
 
-- **DSP via the `webrtc-audio-processing` crate** adds a C++ build step (cmake +
-  clang, both present) and a PCM bridge (`appsink`→process→`appsrc`) that must
-  hold strict 10 ms / 48 kHz framing; mis-framing degrades AEC. Isolated in
-  `audio::dsp` with a round-trip unit test.
+- **DSP via the `webrtc-audio-processing` crate** adds a C++ build step (autotools:
+  libtool/automake/autoconf, all present) and a PCM bridge
+  (`appsink`→process→`appsrc`) that must hold strict 10 ms / 48 kHz framing;
+  mis-framing degrades AEC. Isolated in `audio::dsp` with a round-trip unit test.
 - **Live source hot-swap** is the trickiest engine bit – isolated behind a
   pad-block helper, run-and-observe tested.
 - **Global PTT on X11** via `XGrabKey` can conflict if another app grabs the same

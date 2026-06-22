@@ -1,6 +1,6 @@
 # Hearth – Status
 
-_Living status doc. Last updated: 2026-06-22._
+_Living status doc. Last updated: 2026-06-23._
 
 Self-hosted, low-latency voice + high-fidelity screenshare + webcam for 2–3 close
 friends over a P2P mesh with a small Rust control server. Stack: **pure-Rust
@@ -25,6 +25,7 @@ congests independently (revised from the earlier single-bundle "Approach A").
 | M4 Task 5 (cross-machine) | ⏸ blocked – user-run on Windows | the Approach-A go/no-go; needs the Windows 11 box |
 | M5 Rust GTK4 desktop shell | ✅ done, verified | relm4 app: login + presence + chat + voice (engine) + screenshare share/view **in-window**; per-flow framework. 9 tasks, all committed on `main` |
 | M6 Discord group experience | ✅ done, verified | 3-pane shell (channels+self-panel \| stage+chat \| members); group **voice mesh** (smaller-UUID offerer); multi-sharer screenshare + Watching switcher behind a `ScreenTransport` seam. 7 tasks on `main`. Two-instance live run: voice mesh + bob renders alice's screenshare on the stage. |
+| M7 voice processing + advanced screenshare | ✅ implemented; voice live-verified, UI verification pending | Audio device enumeration; in-process voice DSP (`webrtc-audio-processing` crate, bundled build); activation gate (mute > ptt > vad > always); single mic-capture → DSP → fan-out pipeline with speaker-monitor AEC reference; standalone mic-test monitor; X11 global PTT (`XGrabKey`); screenshare source/quality/preview + app/system audio via PipeWire; desktop Settings model + Voice settings page + Screen Share picker. 12 tasks on `main`. Group voice live-verified two-instance both directions (see verification log). Settings UI + share picker built and unit-tested but **live-verification pending (human)**. |
 
 ## Component state
 
@@ -102,6 +103,41 @@ only `(peer, flow)` and the engine keys flows by `(peer, Flow)`, so two peers
 direction connects. The designed multi-sharer case (several share, others watch –
 distinct peer pairs) is unaffected. A per-stream id in the protocol fixes it;
 deferred alongside the screenshare SFU.
+
+## M7 done (2026-06-23)
+
+Voice processing, device selection, and advanced screenshare. All 12 tasks committed on `main`; engine tasks TDD, desktop tasks run-and-observe. No backend or protocol changes.
+
+**Engine additions:**
+
+- `engine::audio::devices` – `DeviceMonitor`-based enumeration of audio sources and sinks; `pulsesrc`/`pulsesink` replacing `autoaudiosrc`/`autoaudiosink` with a selectable `device=` (falls back to default).
+- `engine::audio::dsp` – wraps the `webrtc-audio-processing` Rust crate (bundled build via autotools): AEC / NS-level / AGC / VAD / high-pass, processing 10 ms interleaved i16 frames at 48 kHz; config applied live.
+- `engine::audio::capture` – single mic-capture → DSP bridge → fan-out send branch (`appsink` PCM → `dsp.process_capture_frame()` → `appsrc`); speaker-monitor `appsink` tap feeds `dsp.process_render_frame()` as the AEC reference; `level` element drives the sensitivity meter.
+- `engine::audio::monitor` – standalone mic-test pipeline (capture → DSP → level → playback) for testing the mic without being in a call.
+- `engine::hotkey` – X11 global push-to-talk via `XGrabKey` (x11rb/XCB); in-app GTK handler as fallback.
+- `engine::screen::sources` – X11 `_NET_CLIENT_LIST` window enumeration (id, title, thumbnail) + per-monitor entries; `ximagesrc` for whole screen or `ximagesrc xid=<win>` for a window.
+- `engine::screen::capture` – resolution / fps / content-type quality controls; `tee` for local preview via `gtk4paintablesink`.
+- `engine::screen::audio` – PipeWire node listing with venmic-style filters (exclude own pid, virtual/loopback nodes); builds a stereo 48 kHz DSP-off Opus audio track for the Screen flow from `pipewiresrc` (specific app) or `pulsesrc <sink>.monitor` (entire system).
+- Activation gate: precedence mute > push-to-talk > VAD > always-on; all drive the existing `mic_valve`.
+
+**Desktop additions:**
+
+- `config.rs Settings` model – device pickers, NS/AEC/AGC/VAD flags, sensitivity, activation mode, PTT key, share resolution/fps/content-type/audio-source; persisted to local TOML/JSON config.
+- `ui/settings.rs` – Settings window with Voice page: device dropdowns, Mic Test + level meter, NS/AEC/AGC/VAD toggles, sensitivity slider, activation mode selector, PTT keybind capture.
+- `ui/screenshare_picker.rs` – source grid (screens + windows, thumbnails), full-res live preview, resolution/fps/content-type rows, audio-source dropdown (None / Entire System / per-app list), Go Live button.
+- `ui/meter.rs` – reusable `gtk::DrawingArea` level meter.
+
+**Verified live (2026-06-23):** group voice connects both directions and is audible through the new single-capture DSP path (two instances, Opus 64 kbps fullband confirmed in encoder log). Perceived lower quality is the expected effect of DSP defaults (NS/AGC/AEC all on); the AEC monitor-reference cancels your own replayed voice when both instances run on the same machine (a single-machine test artifact, not a regression in normal use).
+
+**Live-verification pending (human):** Voice settings UI (device switch, Mic Test meter, DSP toggles, PTT key) and Screen Share picker (source/quality/audio-source/preview, screenshare app/system audio).
+
+**Known limitations / follow-ups:**
+
+- Mic/speaker volume sliders persist to config but are not applied to the live session (no engine volume setter yet).
+- `ShareAudio::App` choice is not persisted across sessions.
+- `webrtcdsp` GStreamer element unavailable on Ubuntu Noble – hence the in-process crate approach.
+- DSP defaults (NS/AGC/AEC on) can sound heavily processed; per-user tuning is the intended path.
+- The M6 mutual same-pair screenshare limitation still stands (deferred with the screenshare SFU).
 
 ## Next candidates
 

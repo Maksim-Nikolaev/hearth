@@ -115,3 +115,43 @@ watching two sharers) is unaffected and shows multiple Watching tabs. Supporting
 mutual same-pair screenshare needs a per-stream id in the protocol, deferred
 alongside the screenshare SFU.
 
+## M7 – Voice processing + advanced screenshare
+
+### M7 voice pipeline – live verify PASS (2026-06-23)
+
+**Test:** two instances (alice + bob), both join Voice, both speak. Procedure: see
+`docs/dev/voice-test.md`.
+
+**Result:** group voice mesh connects both directions and is audible through the
+new single-capture → DSP → fan-out pipeline. Encoder confirmed **Opus 64 kbps
+fullband** in the engine log. Both instances receive each other's audio.
+
+**DSP note:** perceived voice quality is lower than raw Opus. This is the expected
+effect of the DSP defaults (NS / AGC / AEC all enabled). On a single machine both
+instances share the same mic and speaker, so the AEC monitor reference cancels
+your own replayed voice – a single-machine test artifact. In normal use (separate
+machines, headsets) these effects are absent or beneficial.
+
+**Conclusion:** the new voice pipeline is a transparent replacement of M6's
+zero-processing chain. Voice mesh behaviour is unchanged.
+
+### M7 Voice Settings UI + Screen Share picker – live-verification PENDING (human)
+
+The following items are built, unit-tested, and code-reviewed but have **not yet
+been live-verified** by a human run:
+
+- **Voice Settings page** – microphone / speaker device switch mid-call, Mic Test
+  level meter, NS / AEC / AGC / VAD toggles, input sensitivity slider, activation
+  mode selector (VAD / PTT / always-on), PTT key capture.
+- **Screen Share picker** – source grid (screens + windows, thumbnails), live
+  preview, resolution / fps / content-type rows, audio-source dropdown (None /
+  Entire System / per-app), Go Live.
+- **Screenshare audio** – app-audio and system-audio tracks in the Screen
+  `webrtcbin` via PipeWire.
+
+Known gaps that will surface during verification:
+
+- Mic/speaker volume sliders persist to config but are not applied to the live
+  session (no engine volume setter yet).
+- `ShareAudio::App` selection is not persisted across sessions.
+
