@@ -86,7 +86,14 @@ app prepends it to `GST_PLUGIN_PATH` automatically.
   already shows everyone.
 - **Polish** – theming, scroll-to-bottom chat, token-restore UX. (The startup
   GtkStack warning is fixed; presence verified race-free on simultaneous join.)
-- **M6 deployment** – Traefik proxy + coturn relay; packaging/auto-update.
+- **M6 – Discord-style group experience (planned & approved, not started)** –
+  group voice mesh + multi-sharer screenshare + 3-pane Discord UI; spec + 7-task
+  plan in `docs/superpowers/{specs,plans}/2026-06-22-hearth-m6-*`. Execute inline.
+  Media: voice P2P mesh always; screenshare P2P now behind a `ScreenTransport`
+  seam, backend SFU later (target 5–8 gamers).
+- **Deployment (later)** – Traefik proxy + coturn relay; packaging/auto-update.
+- **Post-M5 fixes landed:** re-share after Stop (replace-on-offer), GtkStack
+  startup warning, presence verified race-free.
 
 ## How to resume / run
 
