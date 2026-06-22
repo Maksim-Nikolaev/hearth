@@ -28,6 +28,8 @@ pub struct ShareConfig {
     pub content: ContentType,
     /// Optional audio source to capture alongside the video track.
     pub audio: crate::screen::audio::ShareAudio,
+    /// Target encoder bitrate in kbps. Overridden by `HEARTH_BITRATE_KBPS` env var.
+    pub bitrate_kbps: u32,
 }
 
 impl Default for ShareConfig {
@@ -39,6 +41,7 @@ impl Default for ShareConfig {
             fps: 30,
             content: ContentType::Smoothness,
             audio: crate::screen::audio::ShareAudio::None,
+            bitrate_kbps: 6000,
         }
     }
 }
@@ -100,6 +103,16 @@ fn list_windows_inner() -> Option<Vec<ShareWindow>> {
     }
 
     Some(windows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_bitrate_is_6000() {
+        assert_eq!(ShareConfig::default().bitrate_kbps, 6000);
+    }
 }
 
 /// Try `_NET_WM_NAME` (UTF-8) first, fall back to `WM_NAME` (Latin-1).

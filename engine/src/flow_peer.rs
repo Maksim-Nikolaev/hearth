@@ -96,7 +96,7 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
             Flow::Screen => {
                 let encoder = encoders::detect().0.unwrap_or("x265enc");
                 let chain = capture::capture_chain();
-                build_screen_send_branch(&pipeline, &webrtc, encoder, &chain, None)?;
+                build_screen_send_branch(&pipeline, &webrtc, encoder, &chain, None, 6000)?;
             }
             Flow::Voice => {
                 build_voice_send_branch(&pipeline, &webrtc)?;
@@ -226,11 +226,12 @@ pub(crate) fn build_screen_send_branch(
     encoder: &str,
     chain: &str,
     audio_chain: Option<&str>,
+    bitrate_kbps: u32,
 ) -> Result<()> {
     let cap = gst::parse::bin_from_description(chain, true)?;
 
     let enc = gst::ElementFactory::make(encoder).build()?;
-    tune_encoder(&enc);
+    tune_encoder(&enc, bitrate_kbps);
 
     let parse = gst::ElementFactory::make("h265parse").build()?;
     let pay = gst::ElementFactory::make("rtph265pay")
@@ -414,8 +415,11 @@ pub(crate) fn build_voice_send_branch(
     Ok(appsrc)
 }
 
-fn tune_encoder(enc: &gst::Element) {
-    let bitrate = std::env::var("HEARTH_BITRATE_KBPS").unwrap_or_else(|_| "8000".into());
+/// Apply encoder settings for screenshare. `bitrate_kbps` is the configured
+/// target; `HEARTH_BITRATE_KBPS` env var overrides it when set.
+fn tune_encoder(enc: &gst::Element, bitrate_kbps: u32) {
+    let bitrate = std::env::var("HEARTH_BITRATE_KBPS")
+        .unwrap_or_else(|_| bitrate_kbps.to_string());
 
     set_if_present(enc, "bitrate", &bitrate);
     set_if_present(enc, "key-int-max", "60");

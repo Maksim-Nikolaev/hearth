@@ -131,6 +131,8 @@ impl FlowPeer {
         // Optional audio source chain for the screen flow (payload 98). `None`
         // means no audio track is added (video-only share, M6 default).
         screen_audio: Option<String>,
+        // Encoder bitrate in kbps; overridden by HEARTH_BITRATE_KBPS env var.
+        bitrate_kbps: u32,
     ) -> Result<Self> {
         gst::init()?;
 
@@ -174,6 +176,7 @@ impl FlowPeer {
                         encoder,
                         &chain,
                         screen_audio.as_deref(),
+                        bitrate_kbps,
                     )?;
                 }
                 Flow::Voice => voice_appsrc = Some(build_voice_send_branch(&pipeline, &webrtc)?),
@@ -635,6 +638,7 @@ impl Session {
             self.evt_tx.clone(),
             screen_chain,
             screen_audio,
+            self.share_config.bitrate_kbps,
         )?;
         self.peers.insert(key, p);
 
@@ -889,7 +893,7 @@ impl Session {
                     old.stop();
                 }
 
-                match FlowPeer::new(flow, Role::Answerer, from, self.sink, self.out_tx.clone(), self.evt_tx.clone(), None, None) {
+                match FlowPeer::new(flow, Role::Answerer, from, self.sink, self.out_tx.clone(), self.evt_tx.clone(), None, None, 0) {
                     Ok(p) => {
                         p.handle_offer(&sdp);
                         self.peers.insert(key, p);
