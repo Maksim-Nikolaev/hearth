@@ -280,6 +280,9 @@ pub struct Session {
     /// The logged-in user, decoded from the JWT `sub` claim. Drives the voice
     /// offerer rule (smaller `Uuid` offers).
     self_id: Uuid,
+    /// The logged-in username, decoded from the JWT `username` claim. Shown in
+    /// the self-panel and used to mark "(you)" in member lists.
+    self_name: String,
     /// Current Voice channel members (excluding self), kept in sync from voice
     /// events. The screenshare fan-out targets exactly this set.
     voice_members: Vec<Uuid>,
@@ -288,16 +291,25 @@ pub struct Session {
     _client: Option<SignalingClient>,
 }
 
-/// Read the user id from a JWT's `sub` claim without verifying the signature:
-/// the server already authenticated us, this only needs our own identity.
-fn self_id_from_token(token: &str) -> Option<Uuid> {
+/// Read our identity (`sub`, `username`) from a JWT without verifying the
+/// signature: the server already authenticated us, this only needs our own id.
+fn self_from_token(token: &str) -> (Uuid, String) {
     use base64::Engine;
 
-    let payload = token.split('.').nth(1)?;
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let claims: Option<serde_json::Value> = token
+        .split('.')
+        .nth(1)
+        .and_then(|p| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(p).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok());
 
-    claims.get("sub")?.as_str()?.parse().ok()
+    let Some(claims) = claims else {
+        return (Uuid::nil(), String::new());
+    };
+
+    let id = claims.get("sub").and_then(|v| v.as_str()).and_then(|s| s.parse().ok()).unwrap_or_default();
+    let name = claims.get("username").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+
+    (id, name)
 }
 
 /// The `Send` result of opening a connection: handed back from an async task,
@@ -343,13 +355,14 @@ impl Session {
 
         let out_tx = conn.client.sender();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();
-        let self_id = self_id_from_token(&conn.token).unwrap_or_default();
+        let (self_id, self_name) = self_from_token(&conn.token);
 
         let session = Session {
             out_tx,
             evt_tx,
             sink,
             self_id,
+            self_name,
             voice_members: Vec::new(),
             screen_transport: Box::new(P2pTransport),
             peers: HashMap::new(),
@@ -357,6 +370,16 @@ impl Session {
         };
 
         (session, conn.inbound, evt_rx)
+    }
+
+    /// The logged-in user's id (from the JWT).
+    pub fn self_id(&self) -> Uuid {
+        self.self_id
+    }
+
+    /// The logged-in user's display name (from the JWT).
+    pub fn self_name(&self) -> &str {
+        &self.self_name
     }
 
     pub fn join(&self, room: &str) {
@@ -562,6 +585,7 @@ mod tests {
                 evt_tx,
                 sink: VideoSink::Auto,
                 self_id: Uuid::nil(),
+                self_name: String::new(),
                 voice_members: Vec::new(),
                 screen_transport: Box::new(P2pTransport),
                 peers: HashMap::new(),

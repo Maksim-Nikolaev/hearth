@@ -68,3 +68,17 @@ history through the new root→`Workspace` event fan-out. Login is now its own
 relm4 component (`ui/login.rs`); the root routes Login → Connecting → Workspace
 through a `Stack`. No startup `GtkStack` warning.
 
+### M6 T6 – members, channels, self-panel; join group voice (2026-06-22)
+
+Two instances (`HEARTH_TITLE=alice|bob`). Both start under the right-rail
+**ONLINE** group (each sees the other plus `… (you)`); the left rail shows the
+`# general` text channel and a `🔊 Voice (join)` button with the self-panel
+(name + **Mute / Deafen / Share screen**) pinned to the bottom. **Each clicks
+Voice → both move to the IN VOICE group** (members rail + channel sub-list), the
+button flips to `Voice (leave)`, and the **voice mesh connects** – bob's log
+prints `incoming voice linked -> playing`. The smaller-UUID offerer rule yields
+exactly one offer per pair, so no glare. New relm4 components:
+`ui/{members,channels,self_panel}.rs` (members via `FactoryVecDeque`); engine
+gained `Session::self_id`/`self_name` (decoded from the JWT) for the panel + the
+`(you)` marker.
+

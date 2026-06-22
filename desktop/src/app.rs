@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::ui::login::{LoginForm, LoginInput, LoginOutput};
-use crate::ui::workspace::{Workspace, WorkspaceInput};
+use crate::ui::workspace::{Workspace, WorkspaceInput, WorkspaceOutput};
 use engine::flow::VideoSink;
 use engine::session::{Connection, Presence, Session, SessionEvent};
 use gtk::prelude::*;
@@ -26,6 +26,7 @@ pub struct AppModel {
 #[derive(Debug)]
 pub enum AppMsg {
     Login { username: String, password: String },
+    Workspace(WorkspaceOutput),
 }
 
 /// Async/command results. Manual `Debug` because `Connection` is opaque.
@@ -103,7 +104,9 @@ impl Component for AppModel {
                 LoginOutput::Submit { username, password } => AppMsg::Login { username, password },
             });
 
-        let workspace = Workspace::builder().launch(()).detach();
+        let workspace = Workspace::builder()
+            .launch(())
+            .forward(sender.input_sender(), AppMsg::Workspace);
 
         let model = AppModel {
             config,
@@ -137,6 +140,18 @@ impl Component for AppModel {
                     }
                 });
             }
+            AppMsg::Workspace(out) => {
+                if let Some(s) = self.session.as_mut() {
+                    match out {
+                        WorkspaceOutput::JoinVoice => s.join_voice(),
+                        WorkspaceOutput::LeaveVoice => s.leave_voice(),
+                        WorkspaceOutput::Mute(b) => s.mute(b),
+                        WorkspaceOutput::Deafen(b) => s.deafen(b),
+                        WorkspaceOutput::StartShare => s.start_share(),
+                        WorkspaceOutput::StopShare => s.stop_share(),
+                    }
+                }
+            }
         }
     }
 
@@ -147,6 +162,12 @@ impl Component for AppModel {
 
                 let (session, mut inbound, mut events) = Session::start(conn, VideoSink::Paintable);
                 session.join("main");
+
+                let _ = self.workspace.sender().send(WorkspaceInput::SetSelf {
+                    id: session.self_id(),
+                    username: session.self_name().to_string(),
+                });
+
                 self.session = Some(session);
                 self.screen = Screen::Workspace;
 
