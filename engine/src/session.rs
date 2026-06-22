@@ -47,6 +47,43 @@ pub(crate) fn should_offer(me: Uuid, peer: Uuid) -> bool {
     me < peer
 }
 
+/// How a local screenshare reaches viewers. P2P now (one offerer flow per
+/// viewer); a future SFU impl negotiates once with the backend instead, without
+/// changing the UI or `Session::start_share`.
+pub trait ScreenTransport {
+    /// Begin sharing to the given current voice members.
+    fn start(&mut self, session: &mut Session, viewers: &[Uuid]);
+
+    /// Stop all local screenshare flows.
+    fn stop(&mut self, session: &mut Session);
+}
+
+/// P2P fan-out: the sharer opens one offerer Screen flow per viewer.
+pub struct P2pTransport;
+
+impl ScreenTransport for P2pTransport {
+    fn start(&mut self, session: &mut Session, viewers: &[Uuid]) {
+        for &v in viewers {
+            if let Err(e) = session.start_offerer(v, Flow::Screen) {
+                session.emit(SessionEvent::Error(format!("screen offer: {e}")));
+            }
+        }
+    }
+
+    fn stop(&mut self, session: &mut Session) {
+        let screens: Vec<Uuid> = session
+            .peers
+            .keys()
+            .filter(|(_, f)| *f == Flow::Screen)
+            .map(|(p, _)| *p)
+            .collect();
+
+        for p in screens {
+            session.stop_flow(p, Flow::Screen);
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     Offerer,
@@ -55,7 +92,7 @@ enum Role {
 
 /// One media flow to one peer, carried by a single `webrtcbin`. Non-blocking:
 /// it attaches to the ambient GLib main context (GTK's loop), never its own.
-struct FlowPeer {
+pub(crate) struct FlowPeer {
     pipeline: gst::Pipeline,
     webrtc: gst::Element,
     flow: Flow,
@@ -243,7 +280,11 @@ pub struct Session {
     /// The logged-in user, decoded from the JWT `sub` claim. Drives the voice
     /// offerer rule (smaller `Uuid` offers).
     self_id: Uuid,
-    peers: HashMap<(Uuid, Flow), FlowPeer>,
+    /// Current Voice channel members (excluding self), kept in sync from voice
+    /// events. The screenshare fan-out targets exactly this set.
+    voice_members: Vec<Uuid>,
+    screen_transport: Box<dyn ScreenTransport>,
+    pub(crate) peers: HashMap<(Uuid, Flow), FlowPeer>,
     _client: Option<SignalingClient>,
 }
 
@@ -309,6 +350,8 @@ impl Session {
             evt_tx,
             sink,
             self_id,
+            voice_members: Vec::new(),
+            screen_transport: Box::new(P2pTransport),
             peers: HashMap::new(),
             _client: Some(conn.client),
         };
@@ -343,13 +386,23 @@ impl Session {
             self.stop_flow(p, Flow::Voice);
         }
 
+        self.voice_members.clear();
+
         let _ = self.out_tx.send(ClientMessage::VoiceLeave);
     }
 
     /// Open a Voice flow to one mesh member, offering only if our `Uuid` is the
     /// smaller one; otherwise we wait for their offer (answered in `handle`).
     fn connect_voice(&mut self, peer: Uuid) {
-        if peer == self.self_id || self.peers.contains_key(&(peer, Flow::Voice)) {
+        if peer == self.self_id {
+            return;
+        }
+
+        if !self.voice_members.contains(&peer) {
+            self.voice_members.push(peer);
+        }
+
+        if self.peers.contains_key(&(peer, Flow::Voice)) {
             return;
         }
 
@@ -360,15 +413,31 @@ impl Session {
         }
     }
 
-    pub fn start_share(&mut self, peer: Uuid) -> Result<()> {
-        self.start_offerer(peer, Flow::Screen)
+    /// Start sharing your screen to every current voice member, via the active
+    /// `ScreenTransport` (P2P now). Also tells the server so others list you.
+    pub fn start_share(&mut self) {
+        let _ = self.out_tx.send(ClientMessage::ShareStart);
+
+        let viewers = self.voice_members.clone();
+        let mut t = std::mem::replace(&mut self.screen_transport, Box::new(P2pTransport));
+        t.start(self, &viewers);
+        self.screen_transport = t;
+    }
+
+    /// Stop sharing: tear down the local screenshare flows and notify the server.
+    pub fn stop_share(&mut self) {
+        let _ = self.out_tx.send(ClientMessage::ShareStop);
+
+        let mut t = std::mem::replace(&mut self.screen_transport, Box::new(P2pTransport));
+        t.stop(self);
+        self.screen_transport = t;
     }
 
     pub fn start_call(&mut self, peer: Uuid) -> Result<()> {
         self.start_offerer(peer, Flow::Voice)
     }
 
-    fn start_offerer(&mut self, peer: Uuid, flow: Flow) -> Result<()> {
+    pub(crate) fn start_offerer(&mut self, peer: Uuid, flow: Flow) -> Result<()> {
         let key = (peer, flow);
         if self.peers.contains_key(&key) {
             return Ok(());
@@ -466,6 +535,7 @@ impl Session {
                 self.emit(SessionEvent::VoiceJoined { user, username });
             }
             ServerMessage::VoiceLeft { user } => {
+                self.voice_members.retain(|m| *m != user);
                 self.stop_flow(user, Flow::Voice);
                 self.emit(SessionEvent::VoiceLeft { user });
             }
@@ -474,7 +544,7 @@ impl Session {
         }
     }
 
-    fn emit(&self, evt: SessionEvent) {
+    pub(crate) fn emit(&self, evt: SessionEvent) {
         let _ = self.evt_tx.send(evt);
     }
 }
@@ -492,6 +562,8 @@ mod tests {
                 evt_tx,
                 sink: VideoSink::Auto,
                 self_id: Uuid::nil(),
+                voice_members: Vec::new(),
+                screen_transport: Box::new(P2pTransport),
                 peers: HashMap::new(),
                 _client: None,
             };

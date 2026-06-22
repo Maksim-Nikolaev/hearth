@@ -272,11 +272,11 @@ impl Component for AppModel {
                     s.send_chat(&body);
                 }
             }
-            AppMsg::ShareScreen => self.with_first_peer(|s, peer| {
-                if let Err(e) = s.start_share(peer) {
-                    eprintln!("start_share: {e}");
+            AppMsg::ShareScreen => {
+                if let Some(s) = self.session.as_mut() {
+                    s.start_share();
                 }
-            }),
+            }
             AppMsg::Call => self.with_first_peer(|s, peer| {
                 if let Err(e) = s.start_call(peer) {
                     eprintln!("start_call: {e}");
