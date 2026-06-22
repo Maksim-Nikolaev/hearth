@@ -219,4 +219,58 @@ mod tests {
 
         drop(source);
     }
+
+    /// Tight stop→start cycle must not crash, hang, or trigger a GStreamer
+    /// abort. Validates that synchronous teardown fully releases pipeline
+    /// resources before the next pipeline is built on the same source.
+    ///
+    /// Gated behind `HEARTH_CAPTURE` (synthetic source) so headless CI skips
+    /// the live-pipeline path. Run with:
+    ///
+    /// ```text
+    /// HEARTH_CAPTURE="videotestsrc is-live=true num-buffers=10 pattern=ball \
+    ///   ! videoconvert" cargo test -p engine screen::source -- --nocapture
+    /// ```
+    #[test]
+    fn stop_start_cycle_no_crash() {
+        let capture = std::env::var("HEARTH_CAPTURE").unwrap_or_default();
+        if capture.is_empty() {
+            return;
+        }
+
+        gst::init().unwrap();
+
+        let cfg = ShareConfig::default();
+
+        // Five rapid preview-only cycles.
+        for _ in 0..5 {
+            if let Some(source) = ScreenSource::new(&cfg, false) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                source.stop();
+            }
+        }
+    }
+
+    /// Same cycle test alternating preview-only ↔ encode modes, mirroring the
+    /// real start_preview → start_share → start_preview transition sequence.
+    #[test]
+    fn stop_start_cycle_alternating_encode_no_crash() {
+        let capture = std::env::var("HEARTH_CAPTURE").unwrap_or_default();
+        if capture.is_empty() {
+            return;
+        }
+
+        gst::init().unwrap();
+
+        let cfg = ShareConfig::default();
+
+        for i in 0..5 {
+            let encode = i % 2 == 1;
+
+            if let Some(source) = ScreenSource::new(&cfg, encode) {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                source.stop();
+            }
+        }
+    }
 }
