@@ -2,6 +2,10 @@ use hearth_backend::{app, config::AppConfig, db, presence::registry::PresenceReg
 
 #[tokio::main]
 async fn main() {
+    // Load a local `.env` (dev convenience) before reading config. Real
+    // environment variables always win, and a missing file is fine in prod.
+    let _ = dotenvy::dotenv();
+
     let config = AppConfig::from_env();
     let pool = db::connect(&config.database_url).await;
     let state = AppState { pool, config, presence: PresenceRegistry::new(), signaling: SignalingHub::default() };
