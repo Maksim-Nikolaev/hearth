@@ -167,6 +167,9 @@ impl SignalingHub {
     }
 
     pub fn disconnect(&self, user: Uuid) {
+        // Broadcast ShareStopped before removing from voice so remaining members
+        // can tear down any viewer-side screen flows for this peer.
+        self.share_stop(user);
         self.voice_leave(user);
         self.leave_room(user);
 

@@ -249,12 +249,22 @@ impl FlowPeer {
             });
         }
 
-        // Connection state -> events.
+        // Connection state -> events. For Screen answerer flows, a terminal
+        // state (Failed/Disconnected/Closed) also signals ShareStopped so the
+        // viewer stage clears even when signaling lags behind media-level drop.
         {
             let evt = evt_tx.clone();
+            let is_screen_viewer = flow == Flow::Screen && matches!(role, Role::Answerer);
             webrtc.connect_notify(Some("connection-state"), move |w, _| {
                 let s = w.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
                 let _ = evt.send(SessionEvent::FlowState { peer: target, flow, state: format!("{s:?}") });
+
+                if is_screen_viewer {
+                    use gst_webrtc::WebRTCPeerConnectionState as St;
+                    if matches!(s, St::Failed | St::Disconnected | St::Closed) {
+                        let _ = evt.send(SessionEvent::ShareStopped { user: target });
+                    }
+                }
             });
         }
 
@@ -878,7 +888,17 @@ impl Session {
             ServerMessage::PeerJoined { user, username } => {
                 self.emit(SessionEvent::Presence(Presence::Joined { user, username }))
             }
-            ServerMessage::PeerLeft { user } => self.emit(SessionEvent::Presence(Presence::Left { user })),
+            ServerMessage::PeerLeft { user } => {
+                // Tear down any screen-view flow we hold for this peer. The
+                // sharer's process may have crashed without sending ShareStopped,
+                // so we treat PeerLeft as an implicit share-stop for the viewer.
+                if self.peers.contains_key(&(user, Flow::Screen)) {
+                    self.stop_flow(user, Flow::Screen);
+                    self.emit(SessionEvent::ShareStopped { user });
+                }
+
+                self.emit(SessionEvent::Presence(Presence::Left { user }));
+            }
             ServerMessage::Chat { from, username, body, at } => {
                 self.emit(SessionEvent::Chat(ChatEntry { from, username, body, at }))
             }

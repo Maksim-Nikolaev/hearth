@@ -218,6 +218,11 @@ impl SimpleComponent for Workspace {
             WorkspaceInput::PeerLeft { user } => {
                 self.online.retain(|p| p.user != user);
                 self.voice.retain(|p| p.user != user);
+
+                // A crashed sharer may never send ShareStopped; remove their
+                // entry from the sharer list and screen map so the stage clears.
+                self.sharers.retain(|u| *u != user);
+                self.screens.borrow_mut().remove(&user);
             }
             WorkspaceInput::VoiceRoster(list) => self.voice = list,
             WorkspaceInput::VoiceJoined { user, username } => {
