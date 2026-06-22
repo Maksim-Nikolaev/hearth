@@ -251,8 +251,15 @@ pub(crate) fn build_screen_send_branch(
     gst::Element::link_many([cap.upcast_ref(), &enc, &parse, &pay, &caps])?;
     caps.link(webrtc)?;
 
+    // The audio branch is best-effort: a missing PipeWire node, or a source that
+    // stopped producing between listing and Go Live, must NOT take down the whole
+    // share. Degrade to video-only and record why.
     if let Some(achain) = audio_chain {
-        build_screen_audio_send_branch(pipeline, webrtc, achain)?;
+        eprintln!("screen audio branch: {achain}");
+        match build_screen_audio_send_branch(pipeline, webrtc, achain) {
+            Ok(()) => eprintln!("screen audio branch linked"),
+            Err(e) => eprintln!("screen audio branch failed, continuing video-only: {e}"),
+        }
     }
 
     Ok(())
@@ -293,27 +300,39 @@ fn build_screen_audio_send_branch(
 /// Used by the screen answerer to play the sharer's captured system/app audio.
 /// Distinct from the voice recv chain: no DSP, no valve, direct to `autoaudiosink`.
 pub(crate) fn link_screen_audio_recv(pipeline: &gst::Pipeline, pad: &gst::Pad) {
-    let depay = gst::ElementFactory::make("rtpopusdepay").build().unwrap();
-    let dec = gst::ElementFactory::make("opusdec").build().unwrap();
-    let conv = gst::ElementFactory::make("audioconvert").build().unwrap();
-    let resample = gst::ElementFactory::make("audioresample").build().unwrap();
-    let sink = gst::ElementFactory::make("autoaudiosink").property("sync", false).build().unwrap();
-
-    pipeline.add_many([&depay, &dec, &conv, &resample, &sink]).unwrap();
-    gst::Element::link_many([&depay, &dec, &conv, &resample, &sink]).unwrap();
-
-    for e in [&depay, &dec, &conv, &resample, &sink] {
-        e.sync_state_with_parent().unwrap();
-    }
-
-    let sink_pad = depay.static_pad("sink").unwrap();
-
-    if let Err(e) = pad.link(&sink_pad) {
-        eprintln!("screen audio pad link failed: {e}");
+    // Runs on a streaming thread: a failure here must log and bail, never panic
+    // the whole process (a panic on this thread aborts the app).
+    if let Err(e) = try_link_screen_audio_recv(pipeline, pad) {
+        eprintln!("screen audio recv link failed, dropping audio track: {e}");
         return;
     }
 
     eprintln!("incoming screen audio linked -> playing");
+}
+
+fn try_link_screen_audio_recv(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Result<()> {
+    let depay = gst::ElementFactory::make("rtpopusdepay").build()?;
+    let dec = gst::ElementFactory::make("opusdec").build()?;
+    let conv = gst::ElementFactory::make("audioconvert").build()?;
+    let resample = gst::ElementFactory::make("audioresample").build()?;
+    let sink = gst::ElementFactory::make("autoaudiosink")
+        .property("sync", false)
+        .build()?;
+
+    pipeline.add_many([&depay, &dec, &conv, &resample, &sink])?;
+    gst::Element::link_many([&depay, &dec, &conv, &resample, &sink])?;
+
+    for e in [&depay, &dec, &conv, &resample, &sink] {
+        e.sync_state_with_parent()?;
+    }
+
+    let sink_pad = depay
+        .static_pad("sink")
+        .ok_or_else(|| anyhow::anyhow!("rtpopusdepay has no sink pad"))?;
+
+    pad.link(&sink_pad)?;
+
+    Ok(())
 }
 
 pub(crate) fn link_video_recv(pipeline: &gst::Pipeline, pad: &gst::Pad, vsink: &gst::Element) {
