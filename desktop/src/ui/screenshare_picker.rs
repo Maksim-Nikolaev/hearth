@@ -296,9 +296,44 @@ impl SimpleComponent for ScreenSharePicker {
             (2560, 1440, "1440p"),
             (3840, 2160, "4K"),
         ];
+
+        // Determine the native display resolution so we can hide presets that
+        // exceed it. Physical pixels = logical geometry × scale factor.
+        let (native_w, native_h) = gtk::gdk::Display::default()
+            .and_then(|d| d.monitors().item(0))
+            .and_then(|obj| obj.downcast::<gtk::gdk::Monitor>().ok())
+            .map(|m| {
+                let geo = m.geometry();
+                let scale = m.scale_factor();
+                (geo.width() as u32 * scale as u32, geo.height() as u32 * scale as u32)
+            })
+            .unwrap_or((u32::MAX, u32::MAX));
+
+        // Keep only presets that fit within the native resolution. Always
+        // preserve at least the smallest preset so the list is never empty.
+        let visible_presets: Vec<(u32, u32, &str)> = {
+            let filtered: Vec<_> =
+                res_presets.iter().copied().filter(|&(w, h, _)| w <= native_w && h <= native_h).collect();
+
+            if filtered.is_empty() {
+                // All presets exceed native – keep just the smallest one.
+                vec![*res_presets.first().expect("res_presets is non-empty")]
+            } else {
+                filtered
+            }
+        };
+
         let mut res_btns: Vec<(u32, u32, gtk::ToggleButton)> = Vec::new();
         let mut first_res: Option<gtk::ToggleButton> = None;
-        for &(w, h, label) in res_presets {
+
+        // Default selection: 1080p if visible, otherwise the largest visible preset.
+        let default_res_w = if visible_presets.iter().any(|&(w, _, _)| w == 1920) {
+            1920u32
+        } else {
+            visible_presets.last().map(|&(w, _, _)| w).unwrap_or(1920)
+        };
+
+        for &(w, h, label) in &visible_presets {
             let btn = gtk::ToggleButton::with_label(label);
 
             if let Some(first) = &first_res {
@@ -307,7 +342,7 @@ impl SimpleComponent for ScreenSharePicker {
                 first_res = Some(btn.clone());
             }
 
-            if w == 1920 {
+            if w == default_res_w {
                 btn.set_active(true);
             }
 
@@ -386,10 +421,16 @@ impl SimpleComponent for ScreenSharePicker {
             });
         }
 
+        let default_res_h = visible_presets
+            .iter()
+            .find(|&&(w, _, _)| w == default_res_w)
+            .map(|&(_, h, _)| h)
+            .unwrap_or(1080);
+
         let model = ScreenSharePicker {
             source: ShareSource::Screen { monitor: 0 },
-            width: 1920,
-            height: 1080,
+            width: default_res_w,
+            height: default_res_h,
             fps: 30,
             content: ContentType::Smoothness,
             audio_rows,
@@ -486,13 +527,24 @@ impl ScreenSharePicker {
         // Always reset to "Whole screen" so the source is deterministic.
         self.source = ShareSource::Screen { monitor: 0 };
 
-        self.width = width;
-        self.height = height;
+        // If the saved resolution preset is hidden (not in res_btns), fall back
+        // to the largest visible preset so the model and UI stay in sync.
+        let (eff_w, eff_h) = if self.res_btns.iter().any(|(bw, bh, _)| *bw == width && *bh == height) {
+            (width, height)
+        } else {
+            self.res_btns
+                .last()
+                .map(|&(bw, bh, _)| (bw, bh))
+                .unwrap_or((width, height))
+        };
+
+        self.width = eff_w;
+        self.height = eff_h;
         self.fps = fps;
         self.content = content;
 
         for (w, h, btn) in &self.res_btns {
-            if *w == width && *h == height {
+            if *w == eff_w && *h == eff_h {
                 btn.set_active(true);
             }
         }
