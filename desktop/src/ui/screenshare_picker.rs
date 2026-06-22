@@ -55,10 +55,13 @@ pub struct ScreenSharePicker {
     pipewire_available: bool,
     /// Widgets for res/fps/content radio groups – held so `apply_settings` can
     /// activate the correct button without going through a message round-trip.
-    res_btns: Vec<(u32, u32, gtk::ToggleButton)>,
-    fps_btns: Vec<(u32, gtk::ToggleButton)>,
-    content_btns: Vec<(ContentType, gtk::ToggleButton)>,
+    /// The `SignalHandlerId` per entry lets us block the toggled handler during
+    /// programmatic activation so no spurious `ConfigChanged` is emitted.
+    res_btns: Vec<(u32, u32, gtk::ToggleButton, gtk::glib::SignalHandlerId)>,
+    fps_btns: Vec<(u32, gtk::ToggleButton, gtk::glib::SignalHandlerId)>,
+    content_btns: Vec<(ContentType, gtk::ToggleButton, gtk::glib::SignalHandlerId)>,
     audio_dropdown: gtk::DropDown,
+    audio_handler: gtk::glib::SignalHandlerId,
     /// The FlowBox holding the source cards.
     source_flow: gtk::FlowBox,
     /// Parallel list of card widgets for highlighting; index 0 = "Whole screen".
@@ -328,7 +331,7 @@ impl SimpleComponent for ScreenSharePicker {
             }
         };
 
-        let mut res_btns: Vec<(u32, u32, gtk::ToggleButton)> = Vec::new();
+        let mut res_btns: Vec<(u32, u32, gtk::ToggleButton, gtk::glib::SignalHandlerId)> = Vec::new();
         let mut first_res: Option<gtk::ToggleButton> = None;
 
         let default_res_w = if visible_presets.iter().any(|&(w, _, _)| w == 1920) {
@@ -351,19 +354,19 @@ impl SimpleComponent for ScreenSharePicker {
             }
 
             let sender = sender.clone();
-            btn.connect_toggled(move |b| {
+            let handler = btn.connect_toggled(move |b| {
                 if b.is_active() {
                     let _ = sender.input(PickerInput::SelectResolution(w, h));
                 }
             });
             res_box.append(&btn);
-            res_btns.push((w, h, btn));
+            res_btns.push((w, h, btn, handler));
         }
 
         // ── FPS buttons ──────────────────────────────────────────────────────
         let fps_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let fps_presets: &[(u32, &str)] = &[(15, "15"), (30, "30"), (60, "60")];
-        let mut fps_btns: Vec<(u32, gtk::ToggleButton)> = Vec::new();
+        let mut fps_btns: Vec<(u32, gtk::ToggleButton, gtk::glib::SignalHandlerId)> = Vec::new();
         let mut first_fps: Option<gtk::ToggleButton> = None;
         for &(fps, label) in fps_presets {
             let btn = gtk::ToggleButton::with_label(label);
@@ -379,20 +382,20 @@ impl SimpleComponent for ScreenSharePicker {
             }
 
             let sender = sender.clone();
-            btn.connect_toggled(move |b| {
+            let handler = btn.connect_toggled(move |b| {
                 if b.is_active() {
                     let _ = sender.input(PickerInput::SelectFps(fps));
                 }
             });
             fps_box.append(&btn);
-            fps_btns.push((fps, btn));
+            fps_btns.push((fps, btn, handler));
         }
 
         // ── Content-type buttons ─────────────────────────────────────────────
         let content_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         let content_presets: &[(ContentType, &str)] =
             &[(ContentType::Smoothness, "Smoothness"), (ContentType::Clarity, "Clarity")];
-        let mut content_btns: Vec<(ContentType, gtk::ToggleButton)> = Vec::new();
+        let mut content_btns: Vec<(ContentType, gtk::ToggleButton, gtk::glib::SignalHandlerId)> = Vec::new();
         let mut first_ct: Option<gtk::ToggleButton> = None;
         for &(ct, label) in content_presets {
             let btn = gtk::ToggleButton::with_label(label);
@@ -408,22 +411,22 @@ impl SimpleComponent for ScreenSharePicker {
             }
 
             let sender = sender.clone();
-            btn.connect_toggled(move |b| {
+            let handler = btn.connect_toggled(move |b| {
                 if b.is_active() {
                     let _ = sender.input(PickerInput::SelectContent(ct));
                 }
             });
             content_box.append(&btn);
-            content_btns.push((ct, btn));
+            content_btns.push((ct, btn, handler));
         }
 
         // ── Audio selection change ────────────────────────────────────────────
-        {
+        let audio_handler = {
             let sender = sender.clone();
             audio_dropdown.connect_selected_notify(move |dd| {
                 let _ = sender.input(PickerInput::SelectAudio(dd.selected()));
-            });
-        }
+            })
+        };
 
         let default_res_h = visible_presets
             .iter()
@@ -444,6 +447,7 @@ impl SimpleComponent for ScreenSharePicker {
             fps_btns,
             content_btns,
             audio_dropdown: audio_dropdown.clone(),
+            audio_handler,
             source_flow: source_flow.clone(),
             source_cards,
             selected_idx: 0,
@@ -596,12 +600,12 @@ impl ScreenSharePicker {
         self.source = ShareSource::Screen { monitor: 0 };
         self.highlight_card(0);
 
-        let (eff_w, eff_h) = if self.res_btns.iter().any(|(bw, bh, _)| *bw == width && *bh == height) {
+        let (eff_w, eff_h) = if self.res_btns.iter().any(|(bw, bh, _, _)| *bw == width && *bh == height) {
             (width, height)
         } else {
             self.res_btns
                 .last()
-                .map(|&(bw, bh, _)| (bw, bh))
+                .map(|&(bw, bh, _, _)| (bw, bh))
                 .unwrap_or((width, height))
         };
 
@@ -610,21 +614,27 @@ impl ScreenSharePicker {
         self.fps = fps;
         self.content = content;
 
-        for (w, h, btn) in &self.res_btns {
+        for (w, h, btn, handler) in &self.res_btns {
             if *w == eff_w && *h == eff_h {
+                btn.block_signal(handler);
                 btn.set_active(true);
+                btn.unblock_signal(handler);
             }
         }
 
-        for (f, btn) in &self.fps_btns {
+        for (f, btn, handler) in &self.fps_btns {
             if *f == fps {
+                btn.block_signal(handler);
                 btn.set_active(true);
+                btn.unblock_signal(handler);
             }
         }
 
-        for (ct, btn) in &self.content_btns {
+        for (ct, btn, handler) in &self.content_btns {
             if *ct == content {
+                btn.block_signal(handler);
                 btn.set_active(true);
+                btn.unblock_signal(handler);
             }
         }
 
@@ -636,7 +646,9 @@ impl ScreenSharePicker {
             .map(|(i, _)| i as u32)
             .unwrap_or(0);
         self.audio_idx = idx;
+        self.audio_dropdown.block_signal(&self.audio_handler);
         self.audio_dropdown.set_selected(idx);
+        self.audio_dropdown.unblock_signal(&self.audio_handler);
     }
 
     /// Rebuild the audio dropdown from a freshly queried node list.
