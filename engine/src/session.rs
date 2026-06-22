@@ -19,6 +19,7 @@ use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use hearth_protocol::{ChatEntry, ClientMessage, PeerInfo, ServerMessage};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
@@ -116,6 +117,12 @@ pub(crate) struct FlowPeer {
     /// For Screen offerer flows: the `appsrc` that `ScreenSource` fans encoded
     /// H265 buffers into. `None` for answerer / non-screen flows.
     screen_appsrc: Option<gst_app::AppSrc>,
+    /// Gates the shared `ScreenSource` fan-out into this peer's screen send
+    /// branch. Set true once `webrtcbin` reaches `Connected`; the encoder feeds
+    /// the branch only then, because pushing encoded H265 into a not-yet-negotiated
+    /// `webrtcbin` wedges `rtph265pay` (its first caps push blocks) and no video
+    /// RTP ever flows – the connection comes up but the viewer stays black.
+    screen_ready: Arc<AtomicBool>,
 }
 
 impl FlowPeer {
@@ -247,45 +254,66 @@ impl FlowPeer {
             });
         }
 
+        // Gates the shared encoder's fan-out into this peer's screen send branch;
+        // flipped true by the connection-state handler once the peer is connected.
+        let screen_ready = Arc::new(AtomicBool::new(false));
+
         // Connection state -> events. For Screen answerer flows, a terminal
         // state (Failed/Disconnected/Closed) also signals ShareStopped so the
         // viewer stage clears even when signaling lags behind media-level drop.
+        // For Screen offerer flows, reaching Connected opens the fan-out gate.
         {
             let evt = evt_tx.clone();
             let is_screen_viewer = flow == Flow::Screen && matches!(role, Role::Answerer);
+            let is_screen_sharer = flow == Flow::Screen && matches!(role, Role::Offerer);
+            let ready = screen_ready.clone();
             webrtc.connect_notify(Some("connection-state"), move |w, _| {
                 let s = w.property::<gst_webrtc::WebRTCPeerConnectionState>("connection-state");
                 let _ = evt.send(SessionEvent::FlowState { peer: target, flow, state: format!("{s:?}") });
 
-                if is_screen_viewer {
-                    use gst_webrtc::WebRTCPeerConnectionState as St;
-                    if matches!(s, St::Failed | St::Disconnected | St::Closed) {
-                        let _ = evt.send(SessionEvent::ShareStopped { user: target });
-                    }
+                use gst_webrtc::WebRTCPeerConnectionState as St;
+
+                // Open the gate only once the connection is up: feeding encoded
+                // H265 into a not-yet-negotiated webrtcbin wedges rtph265pay.
+                if is_screen_sharer && matches!(s, St::Connected) {
+                    ready.store(true, Ordering::Relaxed);
+                }
+
+                if is_screen_viewer && matches!(s, St::Failed | St::Disconnected | St::Closed) {
+                    let _ = evt.send(SessionEvent::ShareStopped { user: target });
                 }
             });
         }
 
         pipeline.set_state(gst::State::Playing)?;
 
-        // Offerer kicks off negotiation immediately (target is known).
-        if matches!(role, Role::Offerer) {
-            let w = webrtc.clone();
-            let out = out_tx.clone();
-            let promise = gst::Promise::with_change_func(move |reply| {
-                let Ok(Some(reply)) = reply else { return };
-                let offer = reply.value("offer").unwrap().get::<gst_webrtc::WebRTCSessionDescription>().unwrap();
-                w.emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
-                let _ = out.send(ClientMessage::Offer { to: target, flow, sdp: offer.sdp().as_text().unwrap().to_string() });
-            });
-            webrtc.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
-        }
+        // Negotiation is kicked off by the caller via `start_negotiation()` once
+        // the send branch is wired. The offer's codec caps come from each branch's
+        // capsfilter, so it is complete regardless of whether media is flowing yet.
 
         if paintable.is_some() {
             let _ = evt_tx.send(SessionEvent::VideoReady { peer: target, flow });
         }
 
-        Ok(Self { pipeline, webrtc, flow, target, out_tx, paintable, voice_appsrc, screen_appsrc })
+        Ok(Self { pipeline, webrtc, flow, target, out_tx, paintable, voice_appsrc, screen_appsrc, screen_ready })
+    }
+
+    /// Create and send the SDP offer. Call on offerer flows only. The offer's
+    /// codec caps come from each send branch's capsfilter, so it is complete even
+    /// before any media has flowed.
+    pub(crate) fn start_negotiation(&self) {
+        let w = self.webrtc.clone();
+        let out = self.out_tx.clone();
+        let target = self.target;
+        let flow = self.flow;
+        let promise = gst::Promise::with_change_func(move |reply| {
+            let Ok(Some(reply)) = reply else { return };
+            let offer = reply.value("offer").unwrap().get::<gst_webrtc::WebRTCSessionDescription>().unwrap();
+            let sdp = offer.sdp().as_text().unwrap_or_default();
+            w.emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
+            let _ = out.send(ClientMessage::Offer { to: target, flow, sdp });
+        });
+        self.webrtc.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
     }
 
     /// The voice send `appsrc` for this flow, if it is a Voice send branch.
@@ -296,6 +324,12 @@ impl FlowPeer {
     /// The screen send `appsrc` for this flow, if it is a Screen offerer branch.
     pub(crate) fn screen_appsrc(&self) -> Option<gst_app::AppSrc> {
         self.screen_appsrc.clone()
+    }
+
+    /// The fan-out readiness gate for this peer's screen send branch; passed to
+    /// `ScreenSource::register_viewer` so the encoder waits for `Connected`.
+    pub(crate) fn screen_ready(&self) -> Arc<AtomicBool> {
+        self.screen_ready.clone()
     }
 
     fn handle_offer(&self, sdp: &str) {
@@ -310,8 +344,9 @@ impl FlowPeer {
         let promise = gst::Promise::with_change_func(move |reply| {
             let Ok(Some(reply)) = reply else { return };
             let answer = reply.value("answer").unwrap().get::<gst_webrtc::WebRTCSessionDescription>().unwrap();
+            let asdp = answer.sdp().as_text().unwrap_or_default();
             w.emit_by_name::<()>("set-local-description", &[&answer, &None::<gst::Promise>]);
-            let _ = out.send(ClientMessage::Answer { to, flow, sdp: answer.sdp().as_text().unwrap().to_string() });
+            let _ = out.send(ClientMessage::Answer { to, flow, sdp: asdp });
         });
         self.webrtc.emit_by_name::<()>("create-answer", &[&None::<gst::Structure>, &promise]);
     }
@@ -640,9 +675,16 @@ impl Session {
 
         if flow == Flow::Screen {
             if let (Some(appsrc), Some(ss)) = (p.screen_appsrc(), self.screen_source.as_ref()) {
-                ss.register_viewer(peer, appsrc);
+                // Register the appsrc with its readiness gate closed: the encoder
+                // starts feeding it only once this peer reaches Connected.
+                ss.register_viewer(peer, appsrc, p.screen_ready());
             }
         }
+
+        // The offer's video m-line caps come from the send-branch capsfilter, so
+        // it is complete even though no encoded frame has flowed yet (the fan-out
+        // stays gated until the connection is established).
+        p.start_negotiation();
 
         self.peers.insert(key, p);
 

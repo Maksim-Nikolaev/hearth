@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gstreamer as gst;
@@ -16,6 +17,12 @@ use crate::screen::sources::ShareConfig;
 /// cheap (few full-screen XShm grabs per second) regardless of the share rate.
 const PREVIEW_FPS_CAP: u32 = 10;
 
+/// One fan-out slot: a viewer's `appsrc` plus a readiness gate. The encoder
+/// pushes encoded H265 into the appsrc only once the flag is set (the viewer's
+/// `webrtcbin` is connected). Feeding a not-yet-negotiated peer wedges its
+/// `rtph265pay` and no video RTP ever flows, so the share stays black.
+type Viewer = (gst_app::AppSrc, Arc<AtomicBool>);
+
 /// One capture+encode+preview pipeline. Encoded H265 is fanned out to every
 /// registered viewer `AppSrc` from the single appsink callback; the same raw
 /// frames are tee'd to a `gtk4paintablesink` for local preview.
@@ -25,7 +32,7 @@ const PREVIEW_FPS_CAP: u32 = 10;
 pub struct ScreenSource {
     pipeline: gst::Pipeline,
     paintable: glib::Object,
-    viewers: Arc<Mutex<HashMap<Uuid, gst_app::AppSrc>>>,
+    viewers: Arc<Mutex<HashMap<Uuid, Viewer>>>,
 }
 
 impl ScreenSource {
@@ -62,22 +69,28 @@ impl ScreenSource {
             .property("max-size-time", 0u64)
             .build()
             .ok()?;
+        // A `tee` hands IDENTICAL buffers (one negotiated format) to every branch,
+        // but the preview sink and the encoder want different raw formats. Give
+        // each branch its own `videoconvert` so they negotiate independently;
+        // without it the two branches' format requirements conflict and one
+        // branch silently stalls (no frames) instead of erroring.
+        let prev_conv = gst::ElementFactory::make("videoconvert").build().ok()?;
         let preview_sink = gst::ElementFactory::make("gtk4paintablesink").build().ok()?;
         let paintable: glib::Object = preview_sink.property("paintable");
 
-        let viewers: Arc<Mutex<HashMap<Uuid, gst_app::AppSrc>>> =
+        let viewers: Arc<Mutex<HashMap<Uuid, Viewer>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         let pipeline = gst::Pipeline::new();
         pipeline
-            .add_many([src.upcast_ref::<gst::Element>(), &tee, &prev_q, &preview_sink])
+            .add_many([src.upcast_ref::<gst::Element>(), &tee, &prev_q, &prev_conv, &preview_sink])
             .ok()?;
 
         gst::Element::link_many([src.upcast_ref::<gst::Element>(), &tee]).ok()?;
 
-        // tee → preview queue → gtk4paintablesink
+        // tee → preview queue → videoconvert → gtk4paintablesink
         tee.link(&prev_q).ok()?;
-        prev_q.link(&preview_sink).ok()?;
+        gst::Element::link_many([&prev_q, &prev_conv, &preview_sink]).ok()?;
 
         if encode {
             // Encode branch: tee → queue → encoder → h265parse → appsink
@@ -110,12 +123,16 @@ impl ScreenSource {
                 .max_buffers(3)
                 .build();
 
+            // Own videoconvert (see preview branch): converts the tee's format to
+            // the encoder's input format. Without it the encoder never negotiates.
+            let enc_conv = gst::ElementFactory::make("videoconvert").build().ok()?;
+
             pipeline
-                .add_many([&enc_q, &enc, &parse, appsink.upcast_ref()])
+                .add_many([&enc_q, &enc_conv, &enc, &parse, appsink.upcast_ref()])
                 .ok()?;
 
             tee.link(&enc_q).ok()?;
-            gst::Element::link_many([&enc_q, &enc, &parse, appsink.upcast_ref()]).ok()?;
+            gst::Element::link_many([&enc_q, &enc_conv, &enc, &parse, appsink.upcast_ref()]).ok()?;
 
             // Fan-out callback: runs on the appsink streaming thread.
             let viewers_cb = viewers.clone();
@@ -125,11 +142,18 @@ impl ScreenSource {
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
 
                     let guard = viewers_cb.lock().unwrap();
-                    for appsrc in guard.values() {
+                    for (appsrc, ready) in guard.values() {
+                        // Feed only viewers whose webrtcbin is connected; pushing
+                        // into a not-yet-negotiated peer wedges its rtph265pay.
+                        if !ready.load(Ordering::Relaxed) {
+                            continue;
+                        }
+
                         // copy() is a shallow refcount-sharing copy; each appsrc
                         // needs its own ref so they can release independently.
                         let _ = appsrc.push_buffer(buffer.copy());
                     }
+                    drop(guard);
 
                     Ok(gst::FlowSuccess::Ok)
                 })
@@ -142,9 +166,11 @@ impl ScreenSource {
         Some(Self { pipeline, paintable, viewers })
     }
 
-    /// Register a viewer appsrc to receive encoded H265 buffers.
-    pub fn register_viewer(&self, id: Uuid, src: gst_app::AppSrc) {
-        self.viewers.lock().unwrap().insert(id, src);
+    /// Register a viewer appsrc to receive encoded H265 buffers. `ready` gates
+    /// the fan-out: the encoder pushes to this appsrc only once the flag is set
+    /// (the viewer's `webrtcbin` is connected). See [`Viewer`].
+    pub fn register_viewer(&self, id: Uuid, src: gst_app::AppSrc, ready: Arc<AtomicBool>) {
+        self.viewers.lock().unwrap().insert(id, (src, ready));
     }
 
     /// Remove a viewer appsrc. No-op when the id is not registered.
@@ -179,7 +205,7 @@ mod tests {
     /// Registry operations work correctly without any GStreamer pipeline.
     #[test]
     fn register_unregister_no_pipeline() {
-        let viewers: Arc<Mutex<HashMap<Uuid, gst_app::AppSrc>>> =
+        let viewers: Arc<Mutex<HashMap<Uuid, Viewer>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         let id = Uuid::from_u128(1);
@@ -187,8 +213,9 @@ mod tests {
         // Build a minimal appsrc for insertion (no pipeline needed for the type).
         gst::init().unwrap();
         let appsrc = gst_app::AppSrc::builder().build();
+        let ready = Arc::new(AtomicBool::new(true));
 
-        viewers.lock().unwrap().insert(id, appsrc);
+        viewers.lock().unwrap().insert(id, (appsrc, ready));
         assert_eq!(viewers.lock().unwrap().len(), 1);
 
         viewers.lock().unwrap().remove(&id);

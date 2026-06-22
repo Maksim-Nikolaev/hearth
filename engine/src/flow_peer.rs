@@ -283,23 +283,77 @@ pub(crate) fn build_screen_send_appsrc_branch(
         .field("alignment", "au")
         .build();
 
-    // `do-timestamp=true`: stamp each access unit against THIS viewer pipeline's
-    // clock as it arrives, so video stays coherent with the per-pipeline audio
-    // branch (the shared `ScreenSource` encodes against a different clock, so its
-    // PTS would not align here). Bounded + `leaky-type=downstream` so a slow
-    // viewer drops the oldest queued frames instead of growing memory unbounded
-    // or blocking the shared fan-out (the appsink callback pushes here while
-    // holding the viewer-registry lock, so `block` must stay false).
+    // Bounded + `leaky-type=downstream` so a slow viewer drops the oldest queued
+    // frames instead of growing memory unbounded or blocking the shared fan-out
+    // (the appsink callback pushes here while holding the viewer-registry lock,
+    // so `block` must stay false).
     let appsrc = gst_app::AppSrc::builder()
         .name("screen_in")
         .caps(&h265_caps)
         .is_live(true)
         .format(gst::Format::Time)
-        .do_timestamp(true)
         .build();
     appsrc.set_property("block", false);
     appsrc.set_property("max-bytes", 2_000_000u64);
     appsrc.set_property_from_str("leaky-type", "downstream");
+
+    // Re-base every access unit to this viewer's first frame (PTS/DTS origin 0).
+    // The shared `ScreenSource` stamps frames against its own pipeline's clock,
+    // whose running-time is far ahead of this freshly-started viewer pipeline;
+    // forwarded unchanged, webrtcbin's transport sink would clock-sync each RTP
+    // buffer to that far-future time and wait ~forever to send it, so video RTP
+    // never reaches the peer (connection is up, but the stage stays black). A
+    // 0-origin keeps timestamps at/behind this pipeline's running-time, so the
+    // payloaded RTP is sent immediately. Per-viewer (each appsrc has its own
+    // base) so a peer that joins an ongoing share still starts at 0.
+    if let Some(src_pad) = appsrc.static_pad("src") {
+        let base = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+        src_pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            use std::sync::atomic::Ordering;
+            if let Some(gst::PadProbeData::Buffer(buffer)) = &mut info.data {
+                if let Some(pts) = buffer.pts() {
+                    let base = match base.compare_exchange(
+                        u64::MAX,
+                        pts.nseconds(),
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => pts.nseconds(),
+                        Err(existing) => existing,
+                    };
+                    let buf = buffer.make_mut();
+                    buf.set_pts(gst::ClockTime::from_nseconds(pts.nseconds().saturating_sub(base)));
+                    let dts = buf.dts();
+                    buf.set_dts(dts.map(|d| gst::ClockTime::from_nseconds(d.nseconds().saturating_sub(base))));
+                }
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
+
+    // The appsrc carries raw byte-stream H265 with no codec_data, so an
+    // `h265parse` must rebuild the parameter sets / caps before payloading.
+    let parse = gst::ElementFactory::make("h265parse")
+        .property("config-interval", -1i32)
+        .build()?;
+
+    // Force byte-stream into the payloader. A viewer fanned an ongoing share
+    // starts mid-GOP, so `h265parse` has not yet seen VPS/SPS/PPS and cannot
+    // build `hvc1` codec_data; left to negotiate it advertises `hvc1` anyway
+    // (its preferred format) but emits length-prefixed NALs with no codec_data,
+    // which `rtph265pay` then misparses as a byte-stream ("NAL of size 0") and
+    // produces zero RTP. Byte-stream needs no codec_data – the parameter sets
+    // arrive in-band before each IDR (config-interval=-1) – so the payloader
+    // works regardless of where in the GOP the viewer joins.
+    let bytestream = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gst::Caps::builder("video/x-h265")
+                .field("stream-format", "byte-stream")
+                .field("alignment", "au")
+                .build(),
+        )
+        .build()?;
 
     let pay = gst::ElementFactory::make("rtph265pay")
         .property("config-interval", -1i32)
@@ -310,13 +364,14 @@ pub(crate) fn build_screen_send_appsrc_branch(
             gst::Caps::builder("application/x-rtp")
                 .field("media", "video")
                 .field("encoding-name", "H265")
+                .field("clock-rate", 90000i32)
                 .field("payload", 96i32)
                 .build(),
         )
         .build()?;
 
-    pipeline.add_many([appsrc.upcast_ref(), &pay, &caps])?;
-    gst::Element::link_many([appsrc.upcast_ref(), &pay, &caps])?;
+    pipeline.add_many([appsrc.upcast_ref(), &parse, &bytestream, &pay, &caps])?;
+    gst::Element::link_many([appsrc.upcast_ref(), &parse, &bytestream, &pay, &caps])?;
     caps.link(webrtc)?;
 
     if let Some(achain) = audio_chain {
