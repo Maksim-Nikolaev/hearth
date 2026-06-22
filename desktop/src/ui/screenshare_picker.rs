@@ -88,6 +88,8 @@ pub struct ScreenSharePicker {
     audio_handler: gtk::glib::SignalHandlerId,
     bitrate_dropdown: gtk::DropDown,
     bitrate_handler: gtk::glib::SignalHandlerId,
+    bitrate_spin: gtk::SpinButton,
+    bitrate_spin_handler: gtk::glib::SignalHandlerId,
     /// The FlowBox holding the source cards.
     source_flow: gtk::FlowBox,
     /// Parallel list of card widgets for highlighting; index 0 = "Whole screen".
@@ -114,6 +116,8 @@ pub enum PickerInput {
     SelectAudio(u32),
     /// Bitrate drop-down selection changed (carries the preset index).
     SelectBitrate(u32),
+    /// Bitrate spin-button changed (carries the raw kbps value).
+    SelectBitrateCustom(u32),
     /// Rebuild the window list in the source grid (called on each picker open).
     SetWindows(Vec<ShareWindow>),
     /// Refresh the per-app audio node list (called on each picker open).
@@ -257,6 +261,11 @@ impl SimpleComponent for ScreenSharePicker {
 
                     #[local_ref]
                     bitrate_dropdown -> gtk::DropDown {},
+
+                    #[local_ref]
+                    bitrate_spin -> gtk::SpinButton {},
+
+                    gtk::Label { set_label: "kbps" },
                 },
 
                 // ── Action row ────────────────────────────────────────────────
@@ -489,6 +498,19 @@ impl SimpleComponent for ScreenSharePicker {
             })
         };
 
+        // ── Bitrate spin-button ───────────────────────────────────────────────
+        // min 500 kbps, max 50 000 kbps, step 250, page 1000.
+        let bitrate_adj =
+            gtk::Adjustment::new(6000.0, 500.0, 50_000.0, 250.0, 1000.0, 0.0);
+        let bitrate_spin = gtk::SpinButton::new(Some(&bitrate_adj), 250.0, 0);
+
+        let bitrate_spin_handler = {
+            let sender = sender.clone();
+            bitrate_spin.connect_value_changed(move |spin| {
+                let _ = sender.input(PickerInput::SelectBitrateCustom(spin.value() as u32));
+            })
+        };
+
         let default_res_h = visible_presets
             .iter()
             .find(|&&(w, _, _)| w == default_res_w)
@@ -515,6 +537,8 @@ impl SimpleComponent for ScreenSharePicker {
             audio_handler,
             bitrate_dropdown: bitrate_dropdown.clone(),
             bitrate_handler,
+            bitrate_spin: bitrate_spin.clone(),
+            bitrate_spin_handler,
             source_flow: source_flow.clone(),
             source_cards,
             thumb_pics,
@@ -556,8 +580,29 @@ impl SimpleComponent for ScreenSharePicker {
             PickerInput::SelectBitrate(idx) => {
                 if let Some(&(kbps, _)) = BITRATE_PRESETS.get(idx as usize) {
                     self.bitrate_kbps = kbps;
+
+                    // Mirror the preset value into the spin-button without re-firing its handler.
+                    self.bitrate_spin.block_signal(&self.bitrate_spin_handler);
+                    self.bitrate_spin.set_value(kbps as f64);
+                    self.bitrate_spin.unblock_signal(&self.bitrate_spin_handler);
+
                     let _ = sender.output(PickerOutput::ConfigChanged(self.current_config()));
                 }
+            }
+            PickerInput::SelectBitrateCustom(kbps) => {
+                self.bitrate_kbps = kbps;
+
+                // If the typed value matches a preset, reflect it in the dropdown.
+                // Otherwise leave the dropdown where it is – no crash on non-matching value.
+                if let Some(preset_idx) =
+                    BITRATE_PRESETS.iter().position(|&(p, _)| p == kbps)
+                {
+                    self.bitrate_dropdown.block_signal(&self.bitrate_handler);
+                    self.bitrate_dropdown.set_selected(preset_idx as u32);
+                    self.bitrate_dropdown.unblock_signal(&self.bitrate_handler);
+                }
+
+                let _ = sender.output(PickerOutput::ConfigChanged(self.current_config()));
             }
             PickerInput::SetWindows(windows) => {
                 self.rebuild_source_cards(&windows, &sender);
@@ -733,10 +778,15 @@ impl ScreenSharePicker {
         self.audio_dropdown.unblock_signal(&self.audio_handler);
 
         self.bitrate_kbps = bitrate_kbps;
+
         let bitrate_idx = bitrate_preset_index(bitrate_kbps);
         self.bitrate_dropdown.block_signal(&self.bitrate_handler);
         self.bitrate_dropdown.set_selected(bitrate_idx);
         self.bitrate_dropdown.unblock_signal(&self.bitrate_handler);
+
+        self.bitrate_spin.block_signal(&self.bitrate_spin_handler);
+        self.bitrate_spin.set_value(bitrate_kbps as f64);
+        self.bitrate_spin.unblock_signal(&self.bitrate_spin_handler);
     }
 
     /// Rebuild the audio dropdown from a freshly queried node list.
