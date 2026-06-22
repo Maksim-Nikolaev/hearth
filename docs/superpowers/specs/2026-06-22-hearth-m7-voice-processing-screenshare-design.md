@@ -55,6 +55,12 @@ if missing.
   `XGrabKey`), and always-on. All drive the existing `mic_valve`.
 - **Settings model**: flat "Custom" toggle set (skip Discord's named profiles).
   **Local config file** only; no backend/protocol/server-sync.
+- **Primary target is Linux (Ubuntu/Mint, X11).** A **Windows** build for less
+  technical friends is a planned **later** milestone: the device/capture/DSP
+  backends sit behind the engine API, so Windows swaps the platform layer
+  (`wasapisrc`/`wasapisink`, `d3d11screencapturesrc` + WASAPI loopback for app
+  audio, `RegisterHotKey` for PTT) without touching the UI or signalling. Out of
+  scope for M7.
 
 ## Insights adopted from Vesktop (reference reading)
 
@@ -194,6 +200,26 @@ share_resolution, share_fps, share_content_type, share_audio_source
 ```
 
 Local file only. No backend, protocol, or DB changes.
+
+## Prerequisites (Linux dev box, install once)
+
+```bash
+sudo apt update
+# webrtcdsp (AEC/NS/AGC/VAD) lives in plugins-bad's webrtc-audio-processing;
+# pipewire + pulse GStreamer plugins for device + app/system audio capture.
+sudo apt install -y \
+  gstreamer1.0-plugins-bad \
+  gstreamer1.0-pipewire \
+  gstreamer1.0-pulseaudio
+# verify the DSP element is present (no error = good):
+gst-inspect-1.0 webrtcdsp
+```
+
+If `gst-inspect-1.0 webrtcdsp` still errors after install, this distro built
+`plugins-bad` without `webrtc-audio-processing`; the fallback is PipeWire's
+`module-echo-cancel`. X11 window enumeration (`x11rb`) and global PTT (`XGrabKey`
+via XCB) are pure-Rust cargo deps – no system package. `ximagesrc` is already in
+`gstreamer1.0-plugins-good`.
 
 ## Testing
 
