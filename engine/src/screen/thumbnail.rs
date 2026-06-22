@@ -54,17 +54,22 @@ pub fn thumbnail(source: &ShareSource, max_w: u32, max_h: u32) -> Option<Vec<u8>
 
     pipeline.set_state(gstreamer::State::Playing).ok()?;
 
-    // Pull one sample with a short timeout (3 s is generous for a static frame).
-    let timeout = gstreamer::ClockTime::from_seconds(3);
-    let sample = appsink.try_pull_sample(timeout)?;
+    // All fallible work runs inside a closure so we can unconditionally tear
+    // down the pipeline on every exit path, including timeout/EOS returning None.
+    let result = (|| {
+        // Pull one sample with a short timeout (3 s is generous for a static frame).
+        let timeout = gstreamer::ClockTime::from_seconds(3);
+        let sample = appsink.try_pull_sample(timeout)?;
 
-    let buffer = sample.buffer()?;
-    let map = buffer.map_readable().ok()?;
-    let bytes = map.as_slice().to_vec();
+        let buffer = sample.buffer()?;
+        let map = buffer.map_readable().ok()?;
+
+        Some(map.as_slice().to_vec())
+    })();
 
     let _ = pipeline.set_state(gstreamer::State::Null);
 
-    Some(bytes)
+    result
 }
 
 #[cfg(test)]
