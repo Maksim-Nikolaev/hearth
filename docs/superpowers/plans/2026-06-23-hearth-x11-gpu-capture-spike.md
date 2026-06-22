@@ -1,5 +1,11 @@
 # X11 GPU Capture (DMABUF → VA-API) Spike — Implementation Plan
 
+> **STATUS (2026-06-23): COMPLETE — Approach A NO-GO.** Tasks 1–4 ran; direct DMABuf→VA
+> capture fails on this DRI3-1.0 Xorg (pixmap tiling modifier unobtainable → garbage). See
+> `docs/superpowers/spikes/x11-gpu-capture-findings.md`. **Decision:** X11 stays CPU
+> `ximagesrc` (≤60fps; >60 dismissed); GPU capture moves to Wayland (`pipewiresrc`) + native.
+> Approach B (GstGL bridge) not pursued. Spike example kept for re-discovery.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
 >
 > **This is a research spike.** Steps are "build a small increment → run → verify an observable milestone," not red-green TDD. The EGL→DMABUF→VA hop (Task 3) is the core unknown; its steps give real API entry points + the empirical resolution approach. The deliverable of the whole plan is a GO/NO-GO decision + report, not shippable product code.

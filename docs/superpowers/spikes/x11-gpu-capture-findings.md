@@ -34,7 +34,15 @@
 - **What worked (plumbing is fine):** xcomposite redirect + NameWindowPixmap;
   `eglCreateImage(EGL_NATIVE_PIXMAP_KHR)`; DRI3 1.0 fd; the whole
   appsrc(DMABuf)→vapostproc→vah265enc→file→decode chain. Only the de-tiling is wrong.
-- **DECISION: pivot to Approach B (EGLImage → GL texture).** The GL driver de-tiles correctly
-  when sampling an EGLImage created from the pixmap (no modifier guessing), exactly as OBS does.
-  Cost: `gstreamer-gl` + a shared GL context + a GL→VA encode bridge.
-- CPU comparison (M1c) deferred until a correct path produces frames.
+- **Approach B (EGLImage → GL texture → GstGL→VA bridge)** would de-tile correctly via the
+  driver (no modifier guessing, OBS-style), but it's the plan's highest-risk piece (thin Rust
+  bindings, manual EGL/GL + shared GstGLContext) with poor ROI for the narrow "X11 + >60fps" case.
+
+- **FINAL DECISION (user, 2026-06-23):**
+  - X11 ships **CPU `ximagesrc`** capture; **>60fps on X11 is dismissed** (not a target). The
+    picker already caps X11 at 60; M8 Phase 1 made it stable.
+  - GPU capture is pursued on **Wayland** (xdg-desktop-portal ScreenCast + `pipewiresrc` →
+    DMABuf *with* modifier → direct VA import) and native Windows/macOS, behind the
+    `CaptureBackend` seam. This is the active next task.
+  - Approach B on X11 is **not pursued.** This throwaway spike example is **kept** for
+    re-discovery.
