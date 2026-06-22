@@ -33,6 +33,8 @@ pub enum SettingsInput {
     SetSettings(Settings),
     /// Forward a live input level reading to the embedded meter.
     SetLevel(f32),
+    /// Programmatically set the Mic Test toggle without re-emitting its handler.
+    SetMicTestActive(bool),
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -62,7 +64,9 @@ pub struct SettingsWindowWidgets {
     vad_switch: gtk::Switch,
     activation_dropdown: gtk::DropDown,
     ptt_entry: gtk::Entry,
+    mic_test_btn: gtk::ToggleButton,
     // Signal handler IDs – stored so programmatic updates can be blocked.
+    mic_test_toggled_id: SignalHandlerId,
     mic_selected_id: SignalHandlerId,
     spk_selected_id: SignalHandlerId,
     input_vol_id: SignalHandlerId,
@@ -252,12 +256,12 @@ impl Component for SettingsWindow {
             })
         };
 
-        {
+        let mic_test_toggled_id = {
             let s = sender.clone();
             mic_test_btn.connect_toggled(move |b| {
                 let _ = s.output(SettingsOutput::MicTest(b.is_active()));
-            });
-        }
+            })
+        };
 
         let sensitivity_id = {
             let s = sender.clone();
@@ -342,6 +346,8 @@ impl Component for SettingsWindow {
             vad_switch,
             activation_dropdown,
             ptt_entry,
+            mic_test_btn,
+            mic_test_toggled_id,
             mic_selected_id,
             spk_selected_id,
             input_vol_id,
@@ -386,6 +392,12 @@ impl Component for SettingsWindow {
 
             SettingsInput::SetLevel(db) => {
                 let _ = self.meter.sender().send(MeterInput::SetLevel(db));
+            }
+
+            SettingsInput::SetMicTestActive(active) => {
+                widgets.mic_test_btn.block_signal(&widgets.mic_test_toggled_id);
+                widgets.mic_test_btn.set_active(active);
+                widgets.mic_test_btn.unblock_signal(&widgets.mic_test_toggled_id);
             }
         }
     }

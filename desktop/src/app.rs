@@ -439,7 +439,17 @@ impl AppModel {
             SettingsOutput::PttKey(k) => settings.ptt_key = k,
             SettingsOutput::MicTest(on) => {
                 if let Some(s) = self.session.as_mut() {
-                    if on { s.start_mic_test() } else { s.stop_mic_test() }
+                    if on {
+                        if s.in_voice() {
+                            // Reset the toggle without triggering its handler.
+                            let _ = self.settings_window.sender()
+                                .send(SettingsInput::SetMicTestActive(false));
+                        } else {
+                            s.start_mic_test();
+                        }
+                    } else {
+                        s.stop_mic_test();
+                    }
                 }
                 return; // mic-test is not persisted
             }

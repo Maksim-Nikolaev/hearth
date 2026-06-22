@@ -788,13 +788,27 @@ impl Session {
         self.restart_voice_capture();
     }
 
+    /// True when at least one Voice-flow peer is connected. Used to gate the
+    /// mic test so it cannot open a second concurrent capture during a call.
+    pub fn in_voice(&self) -> bool {
+        self.peers.keys().any(|(_, f)| *f == Flow::Voice)
+    }
+
     /// Start the standalone mic loopback for the Settings mic-test panel.
     ///
     /// Captures the mic, runs DSP, plays it back on the output device, and
-    /// emits `SessionEvent::InputLevel`. Should only be called when not in a
-    /// voice call (the UI enforces this in Task 10). Calling while already
-    /// running replaces the previous monitor.
+    /// emits `SessionEvent::InputLevel`. Refuses silently (with an error
+    /// event) when a voice call is active – the engine itself enforces this
+    /// to prevent a second concurrent capture + AEC-reference corruption.
+    /// Calling while the monitor is already running replaces the previous one.
     pub fn start_mic_test(&mut self) {
+        if self.in_voice() {
+            self.emit(SessionEvent::Error(
+                "mic test unavailable during a call".into(),
+            ));
+            return;
+        }
+
         self.mic_monitor = None;
 
         match Monitor::start(
