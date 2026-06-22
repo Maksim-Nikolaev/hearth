@@ -1,11 +1,21 @@
 use crate::ui::channels::{Channels, ChannelsInput, ChannelsOutput};
+use crate::ui::chat::{Chat, ChatInput, ChatOutput};
 use crate::ui::members::{Members, MembersInput, MemberRowData};
 use crate::ui::self_panel::{SelfPanel, SelfPanelInput, SelfPanelOutput};
+use crate::ui::stage::{Stage, StageInput, StageOutput};
 use gtk::prelude::*;
 use hearth_protocol::{ChatEntry, PeerInfo};
 use relm4::prelude::*;
-use std::collections::HashSet;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use uuid::Uuid;
+
+/// Received screen paintables per sharer, shared between the root (which fills it
+/// from `SessionEvent::VideoReady`) and the workspace (which shows the selected
+/// one). Shared by `Rc` rather than sent in a message, since a `Paintable` is not
+/// `Send` and all relm4 messages here must be.
+pub type Screens = Rc<RefCell<HashMap<Uuid, gtk::gdk::Paintable>>>;
 
 /// The 3-pane Discord-style container shown after login. Owns the workspace UI
 /// state and the per-pane child components; the root feeds it `SessionEvent`-
@@ -17,10 +27,14 @@ pub struct Workspace {
     online: Vec<PeerInfo>,
     voice: Vec<PeerInfo>,
     sharers: Vec<Uuid>,
-    messages: Vec<ChatEntry>,
+    selected: Option<Uuid>,
+    screens: Screens,
+    picture: gtk::Picture,
     channels: Controller<Channels>,
     self_panel: Controller<SelfPanel>,
     members: Controller<Members>,
+    stage: Controller<Stage>,
+    chat: Controller<Chat>,
 }
 
 #[derive(Debug)]
@@ -36,11 +50,15 @@ pub enum WorkspaceInput {
     ShareStopped { user: Uuid },
     ChatHistory(Vec<ChatEntry>),
     Chat(ChatEntry),
+    /// A screen paintable arrived in the shared map; re-sync the stage.
+    VideoReady,
     // Bubbled up from child panes:
     ToggleVoice,
     Mute(bool),
     Deafen(bool),
     Share(bool),
+    SelectSharer(Uuid),
+    SendChat(String),
 }
 
 #[derive(Debug)]
@@ -51,11 +69,12 @@ pub enum WorkspaceOutput {
     Deafen(bool),
     StartShare,
     StopShare,
+    SendChat(String),
 }
 
 #[relm4::component(pub)]
 impl SimpleComponent for Workspace {
-    type Init = ();
+    type Init = Screens;
     type Input = WorkspaceInput;
     type Output = WorkspaceOutput;
 
@@ -80,17 +99,16 @@ impl SimpleComponent for Workspace {
                 self_panel_widget -> gtk::Box {},
             },
 
-            // Center: stage + chat (placeholder until Task 7).
+            // Center: stage (top) + chat (below).
             gtk::Box {
                 set_orientation: gtk::Orientation::Vertical,
                 set_hexpand: true,
 
-                gtk::Label {
-                    #[watch]
-                    set_label: &format!(
-                        "Stage – {} sharing, {} messages",
-                        model.sharers.len(), model.messages.len(),
-                    ),
+                #[local_ref]
+                stage_widget -> gtk::Box {},
+
+                #[local_ref]
+                chat_widget -> gtk::Box {
                     set_vexpand: true,
                 },
             },
@@ -111,7 +129,7 @@ impl SimpleComponent for Workspace {
     }
 
     fn init(
-        _init: Self::Init,
+        screens: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
@@ -131,6 +149,20 @@ impl SimpleComponent for Workspace {
 
         let members = Members::builder().launch(()).detach();
 
+        let picture = gtk::Picture::new();
+
+        let stage = Stage::builder()
+            .launch(picture.clone())
+            .forward(sender.input_sender(), |out| match out {
+                StageOutput::Select(id) => WorkspaceInput::SelectSharer(id),
+            });
+
+        let chat = Chat::builder()
+            .launch(())
+            .forward(sender.input_sender(), |out| match out {
+                ChatOutput::Send(body) => WorkspaceInput::SendChat(body),
+            });
+
         let model = Workspace {
             self_id: Uuid::nil(),
             self_name: String::new(),
@@ -138,15 +170,21 @@ impl SimpleComponent for Workspace {
             online: Vec::new(),
             voice: Vec::new(),
             sharers: Vec::new(),
-            messages: Vec::new(),
+            selected: None,
+            screens,
+            picture,
             channels,
             self_panel,
             members,
+            stage,
+            chat,
         };
 
         let channels_widget = model.channels.widget();
         let self_panel_widget = model.self_panel.widget();
         let members_widget = model.members.widget();
+        let stage_widget = model.stage.widget();
+        let chat_widget = model.chat.widget();
 
         let widgets = view_output!();
 
@@ -182,9 +220,21 @@ impl SimpleComponent for Workspace {
                     self.sharers.push(user);
                 }
             }
-            WorkspaceInput::ShareStopped { user } => self.sharers.retain(|u| *u != user),
-            WorkspaceInput::ChatHistory(list) => self.messages = list,
-            WorkspaceInput::Chat(entry) => self.messages.push(entry),
+            WorkspaceInput::ShareStopped { user } => {
+                self.sharers.retain(|u| *u != user);
+                self.screens.borrow_mut().remove(&user);
+            }
+            WorkspaceInput::ChatHistory(list) => {
+                let _ = self.chat.sender().send(ChatInput::Reset(list));
+            }
+            WorkspaceInput::Chat(entry) => {
+                let _ = self.chat.sender().send(ChatInput::Append(entry));
+            }
+            WorkspaceInput::VideoReady => {}
+            WorkspaceInput::SelectSharer(id) => self.selected = Some(id),
+            WorkspaceInput::SendChat(body) => {
+                let _ = sender.output(WorkspaceOutput::SendChat(body));
+            }
             WorkspaceInput::ToggleVoice => {
                 self.in_voice = !self.in_voice;
                 if self.in_voice {
@@ -210,6 +260,7 @@ impl SimpleComponent for Workspace {
         }
 
         self.refresh();
+        self.sync_stage();
     }
 }
 
@@ -228,6 +279,44 @@ impl Workspace {
             in_voice: self.in_voice,
             members: voice_names,
         });
+    }
+
+    /// Push the active sharer set and the selected stream to the stage. Excludes
+    /// our own share (we don't watch ourselves) and hides the stage when nobody
+    /// is sharing, so chat fills the center.
+    fn sync_stage(&mut self) {
+        let watchable: Vec<Uuid> =
+            self.sharers.iter().copied().filter(|id| *id != self.self_id).collect();
+
+        if let Some(sel) = self.selected {
+            if !watchable.contains(&sel) {
+                self.selected = None;
+            }
+        }
+        if self.selected.is_none() {
+            self.selected = watchable.first().copied();
+        }
+
+        let tabs: Vec<(Uuid, String)> =
+            watchable.iter().map(|id| (*id, self.name_of(*id))).collect();
+        let _ = self.stage.sender().send(StageInput::SetSharers(tabs));
+
+        let paintable = self.selected.and_then(|id| self.screens.borrow().get(&id).cloned());
+        self.picture.set_paintable(paintable.as_ref());
+
+        self.stage.widget().set_visible(!watchable.is_empty());
+    }
+
+    fn name_of(&self, id: Uuid) -> String {
+        if id == self.self_id {
+            return self.self_name.clone();
+        }
+        self.voice
+            .iter()
+            .chain(self.online.iter())
+            .find(|p| p.user == id)
+            .map(|p| p.username.clone())
+            .unwrap_or_else(|| id.to_string())
     }
 
     fn member_rows(&self) -> Vec<MemberRowData> {

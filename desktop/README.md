@@ -82,3 +82,36 @@ exactly one offer per pair, so no glare. New relm4 components:
 gained `Session::self_id`/`self_name` (decoded from the JWT) for the panel + the
 `(you)` marker.
 
+### M6 T7 – stage + chat + multi-sharer switcher (2026-06-22)
+
+New `ui/stage.rs` (a `gtk::Picture` + a **Watching** switcher, one button per
+remote sharer) and `ui/chat.rs` (`FactoryVecDeque` messages + entry). The root
+owns the received-paintable map (`Rc<RefCell<…>>`, shared with the workspace) so
+the non-`Send` `Paintable` never rides a relm4 message; selecting a tab swaps the
+shown paintable instantly. Chat history + live messages render in the centre
+panel below the stage; the stage hides (chat fills the centre) when nobody
+shares. You never watch your own share (self is excluded from the switcher).
+
+**Observed** (two instances, voice joined, both **Share screen**): **bob's stage
+renders alice's live screenshare** – a frame with a ticking `timeoverlay`
+timestamp (`0:01:57.314`), proving capture → HEVC → WebRTC → decode →
+`gtk4paintablesink` → stage `gtk::Picture`, with the **Watching: alice** tab,
+chat, and the voice mesh all concurrent.
+
+**Testing note (do NOT grab the real screen):** run the desktop with
+`HEARTH_CAPTURE="videotestsrc is-live=true pattern=ball ! timeoverlay !
+videoconvert"` so screenshare streams a synthetic pattern instead of
+`ximagesrc`. Grabbing the live X display (`:0`) plus HW-encoding it is heavy and
+was observed to destabilise other apps on the same display (e.g. VS Code); the
+synthetic source avoids that entirely and makes the stream visibly verifiable.
+
+**Known limitation:** signaling `Offer/Answer/Ice` carry only `(peer, flow)`, and
+the engine keys flows by `(peer, Flow)`. Two peers who **share to each other at
+the same time** therefore collide on `(other, Screen)` (the outgoing offerer vs.
+the incoming answerer), so only one direction connects – seen above as bob
+receiving alice while alice does not receive bob. The designed multi-sharer case
+(several members share, others watch – distinct peer pairs, e.g. a third viewer
+watching two sharers) is unaffected and shows multiple Watching tabs. Supporting
+mutual same-pair screenshare needs a per-stream id in the protocol, deferred
+alongside the screenshare SFU.
+

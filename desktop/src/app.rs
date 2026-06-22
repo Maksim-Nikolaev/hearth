@@ -1,11 +1,14 @@
 use crate::config::Config;
 use crate::ui::login::{LoginForm, LoginInput, LoginOutput};
-use crate::ui::workspace::{Workspace, WorkspaceInput, WorkspaceOutput};
+use crate::ui::workspace::{Screens, Workspace, WorkspaceInput, WorkspaceOutput};
 use engine::flow::VideoSink;
 use engine::session::{Connection, Presence, Session, SessionEvent};
 use gtk::prelude::*;
 use hearth_protocol::ServerMessage;
 use relm4::prelude::*;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Screen {
@@ -19,6 +22,7 @@ pub struct AppModel {
     title: String,
     screen: Screen,
     session: Option<Session>,
+    screens: Screens,
     login: Controller<LoginForm>,
     workspace: Controller<Workspace>,
 }
@@ -104,8 +108,10 @@ impl Component for AppModel {
                 LoginOutput::Submit { username, password } => AppMsg::Login { username, password },
             });
 
+        let screens: Screens = Rc::new(RefCell::new(HashMap::new()));
+
         let workspace = Workspace::builder()
-            .launch(())
+            .launch(screens.clone())
             .forward(sender.input_sender(), AppMsg::Workspace);
 
         let model = AppModel {
@@ -113,6 +119,7 @@ impl Component for AppModel {
             title,
             screen,
             session: None,
+            screens,
             login,
             workspace,
         };
@@ -149,6 +156,7 @@ impl Component for AppModel {
                         WorkspaceOutput::Deafen(b) => s.deafen(b),
                         WorkspaceOutput::StartShare => s.start_share(),
                         WorkspaceOutput::StopShare => s.stop_share(),
+                        WorkspaceOutput::SendChat(body) => s.send_chat(&body),
                     }
                 }
             }
@@ -244,9 +252,21 @@ impl AppModel {
             SessionEvent::ShareStopped { user } => {
                 let _ = w.send(WorkspaceInput::ShareStopped { user });
             }
-            SessionEvent::VideoReady { .. }
-            | SessionEvent::FlowState { .. }
-            | SessionEvent::Error(_) => {}
+            SessionEvent::VideoReady { peer, flow } => {
+                if flow == hearth_protocol::Flow::Screen {
+                    let paintable = self
+                        .session
+                        .as_ref()
+                        .and_then(|s| s.paintable_for(peer, flow))
+                        .and_then(|obj| obj.downcast::<gtk::gdk::Paintable>().ok());
+
+                    if let Some(p) = paintable {
+                        self.screens.borrow_mut().insert(peer, p);
+                        let _ = w.send(WorkspaceInput::VideoReady);
+                    }
+                }
+            }
+            SessionEvent::FlowState { .. } | SessionEvent::Error(_) => {}
         }
     }
 
