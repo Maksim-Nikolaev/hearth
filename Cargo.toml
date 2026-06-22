@@ -1,4 +1,3 @@
 [workspace]
 resolver = "2"
 members = ["protocol", "engine", "backend", "desktop"]
-exclude = ["engine-spike"]
