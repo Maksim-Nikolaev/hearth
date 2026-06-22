@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod capture;
 pub mod encoders;
 pub mod flow;
