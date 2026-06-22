@@ -57,6 +57,10 @@ mod tests {
     use super::*;
     use crate::screen::sources::{ContentType, ShareConfig, ShareSource};
 
+    // Serializes all tests that read or write HEARTH_CAPTURE so parallel `cargo
+    // test` runs can't observe each other's transient env state.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn screen_chain_uses_ximagesrc_and_caps() {
         let cfg = ShareConfig {
@@ -122,6 +126,8 @@ mod tests {
 
     #[test]
     fn env_override_bypasses_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
         std::env::set_var("HEARTH_CAPTURE", "videotestsrc is-live=true pattern=ball");
 
         let cfg = ShareConfig::default();
