@@ -95,7 +95,8 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
         match cfg.flow {
             Flow::Screen => {
                 let encoder = encoders::detect().0.unwrap_or("x265enc");
-                build_screen_send_branch(&pipeline, &webrtc, encoder)?;
+                let chain = capture::capture_chain();
+                build_screen_send_branch(&pipeline, &webrtc, encoder, &chain)?;
             }
             Flow::Voice => {
                 build_voice_send_branch(&pipeline, &webrtc)?;
@@ -192,14 +193,20 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
     Ok(())
 }
 
-pub(crate) fn build_screen_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element, encoder: &str) -> Result<()> {
-    let cap = gst::parse::bin_from_description(&capture::capture_chain(), true)?;
-
-    let rate = gst::ElementFactory::make("videorate").build()?;
-    let scale = gst::ElementFactory::make("videoscale").build()?;
-    let raw_caps = gst::ElementFactory::make("capsfilter")
-        .property("caps", capture::video_caps().parse::<gst::Caps>()?)
-        .build()?;
+/// Build the screenshare send branch and link it to `webrtc`.
+///
+/// `chain` is the full GStreamer source + caps string. Pass the result of
+/// `screen::capture_chain(&cfg)` for the product path, or
+/// `capture::capture_chain()` for the legacy/standalone path. The chain must
+/// already embed a `video/x-raw` capsfilter so the encoder receives a known
+/// format.
+pub(crate) fn build_screen_send_branch(
+    pipeline: &gst::Pipeline,
+    webrtc: &gst::Element,
+    encoder: &str,
+    chain: &str,
+) -> Result<()> {
+    let cap = gst::parse::bin_from_description(chain, true)?;
 
     let enc = gst::ElementFactory::make(encoder).build()?;
     tune_encoder(&enc);
@@ -219,8 +226,8 @@ pub(crate) fn build_screen_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::E
         )
         .build()?;
 
-    pipeline.add_many([cap.upcast_ref(), &rate, &scale, &raw_caps, &enc, &parse, &pay, &caps])?;
-    gst::Element::link_many([cap.upcast_ref(), &rate, &scale, &raw_caps, &enc, &parse, &pay, &caps])?;
+    pipeline.add_many([cap.upcast_ref(), &enc, &parse, &pay, &caps])?;
+    gst::Element::link_many([cap.upcast_ref(), &enc, &parse, &pay, &caps])?;
     caps.link(webrtc)?;
 
     Ok(())

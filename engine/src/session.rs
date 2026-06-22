@@ -8,6 +8,8 @@ use crate::flow::{Flow, VideoSink};
 use crate::flow_peer::{
     build_screen_send_branch, build_voice_send_branch, link_video_recv, link_voice_recv,
 };
+use crate::capture;
+use crate::screen::{self, ShareConfig};
 use crate::signaling::{login, SignalingClient};
 use anyhow::Result;
 use gstreamer as gst;
@@ -122,6 +124,9 @@ impl FlowPeer {
         sink: VideoSink,
         out_tx: UnboundedSender<ClientMessage>,
         evt_tx: UnboundedSender<SessionEvent>,
+        // Pre-built capture+caps chain for Screen offerer flows. `None` falls
+        // back to the env-override / OS default from `capture::capture_chain`.
+        screen_chain: Option<String>,
     ) -> Result<Self> {
         gst::init()?;
 
@@ -158,7 +163,8 @@ impl FlowPeer {
             match flow {
                 Flow::Screen => {
                     let encoder = encoders::detect().0.unwrap_or("x265enc");
-                    build_screen_send_branch(&pipeline, &webrtc, encoder)?;
+                    let chain = screen_chain.unwrap_or_else(|| capture::capture_chain());
+                    build_screen_send_branch(&pipeline, &webrtc, encoder, &chain)?;
                 }
                 Flow::Voice => voice_appsrc = Some(build_voice_send_branch(&pipeline, &webrtc)?),
                 Flow::Webcam => anyhow::bail!("webcam flow is out of M5 scope"),
@@ -306,6 +312,9 @@ pub struct Session {
     /// events. The screenshare fan-out targets exactly this set.
     voice_members: Vec<Uuid>,
     screen_transport: Box<dyn ScreenTransport>,
+    /// Config supplied to the most recent `start_share`. Used to build the
+    /// capture+caps chain for each Screen offerer flow.
+    share_config: ShareConfig,
     pub(crate) peers: HashMap<(Uuid, Flow), FlowPeer>,
     /// The single mic capture + DSP, shared by every Voice flow. Lazily started
     /// when the first voice peer connects, dropped when the last leaves.
@@ -322,6 +331,9 @@ pub struct Session {
     /// join) whenever the PTT key is cleared or changed.
     ptt_grab: Option<PttGrab>,
     _client: Option<SignalingClient>,
+    /// Local preview pipeline (capture → gtk4paintablesink), active while
+    /// sharing. `None` when not sharing or when the sink element is unavailable.
+    preview_pipeline: Option<(gst::Pipeline, glib::Object)>,
 }
 
 /// Sensible defaults: AEC + high-pass + moderate NS + AGC + VAD on.
@@ -409,6 +421,7 @@ impl Session {
             self_name,
             voice_members: Vec::new(),
             screen_transport: Box::new(P2pTransport),
+            share_config: ShareConfig::default(),
             peers: HashMap::new(),
             voice_capture: None,
             mic_monitor: None,
@@ -418,6 +431,7 @@ impl Session {
             output_device: None,
             ptt_grab: None,
             _client: Some(conn.client),
+            preview_pipeline: None,
         };
 
         (session, conn.inbound, evt_rx)
@@ -489,8 +503,17 @@ impl Session {
 
     /// Start sharing your screen to every current voice member, via the active
     /// `ScreenTransport` (P2P now). Also tells the server so others list you.
-    pub fn start_share(&mut self) {
+    ///
+    /// `cfg` controls the capture source, resolution, frame rate, and quality
+    /// hint. The `HEARTH_CAPTURE` env var still overrides the capture element
+    /// entirely, regardless of `cfg`, for bench/dev testing.
+    pub fn start_share(&mut self, cfg: ShareConfig) {
+        self.share_config = cfg;
         let _ = self.out_tx.send(ClientMessage::ShareStart);
+
+        // Try to spin up a local preview pipeline (capture → gtk4paintablesink).
+        // Failure is non-fatal: the share still goes to peers without a preview.
+        self.preview_pipeline = self.build_preview_pipeline();
 
         let viewers = self.voice_members.clone();
         let mut t = std::mem::replace(&mut self.screen_transport, Box::new(P2pTransport));
@@ -498,13 +521,45 @@ impl Session {
         self.screen_transport = t;
     }
 
+    /// Build a local `(capture chain) → gtk4paintablesink` pipeline for the
+    /// local preview overlay. Returns `None` when the element is missing or
+    /// the pipeline fails to start (e.g. in headless test environments).
+    fn build_preview_pipeline(&self) -> Option<(gst::Pipeline, glib::Object)> {
+        let sink = gst::ElementFactory::make("gtk4paintablesink").build().ok()?;
+        let paintable: glib::Object = sink.property("paintable");
+
+        let chain_str = screen::capture_chain(&self.share_config);
+        let src_bin = gst::parse::bin_from_description(&chain_str, true).ok()?;
+
+        let pipeline = gst::Pipeline::new();
+        pipeline.add_many([src_bin.upcast_ref::<gst::Element>(), &sink]).ok()?;
+        gst::Element::link_many([src_bin.upcast_ref::<gst::Element>(), &sink]).ok()?;
+
+        pipeline.set_state(gst::State::Playing).ok()?;
+
+        Some((pipeline, paintable))
+    }
+
     /// Stop sharing: tear down the local screenshare flows and notify the server.
     pub fn stop_share(&mut self) {
         let _ = self.out_tx.send(ClientMessage::ShareStop);
 
+        if let Some((pipe, _)) = self.preview_pipeline.take() {
+            let _ = pipe.set_state(gst::State::Null);
+        }
+
         let mut t = std::mem::replace(&mut self.screen_transport, Box::new(P2pTransport));
         t.stop(self);
         self.screen_transport = t;
+    }
+
+    /// Return the local preview paintable for the current share session, or
+    /// `None` if not sharing or if `gtk4paintablesink` is unavailable.
+    ///
+    /// The returned `glib::Object` is a `gdk::Paintable` and can be cast by
+    /// the caller with `obj.dynamic_cast::<gtk4::gdk::Paintable>()`.
+    pub fn preview_paintable(&self) -> Option<glib::Object> {
+        self.preview_pipeline.as_ref().map(|(_, p)| p.clone())
     }
 
     pub fn start_call(&mut self, peer: Uuid) -> Result<()> {
@@ -516,7 +571,14 @@ impl Session {
         if self.peers.contains_key(&key) {
             return Ok(());
         }
-        let p = FlowPeer::new(flow, Role::Offerer, peer, self.sink, self.out_tx.clone(), self.evt_tx.clone())?;
+
+        let screen_chain = if flow == Flow::Screen {
+            Some(screen::capture_chain(&self.share_config))
+        } else {
+            None
+        };
+
+        let p = FlowPeer::new(flow, Role::Offerer, peer, self.sink, self.out_tx.clone(), self.evt_tx.clone(), screen_chain)?;
         self.peers.insert(key, p);
 
         if flow == Flow::Voice {
@@ -756,7 +818,7 @@ impl Session {
                     old.stop();
                 }
 
-                match FlowPeer::new(flow, Role::Answerer, from, self.sink, self.out_tx.clone(), self.evt_tx.clone()) {
+                match FlowPeer::new(flow, Role::Answerer, from, self.sink, self.out_tx.clone(), self.evt_tx.clone(), None) {
                     Ok(p) => {
                         p.handle_offer(&sdp);
                         self.peers.insert(key, p);
@@ -819,6 +881,7 @@ mod tests {
                 self_name: String::new(),
                 voice_members: Vec::new(),
                 screen_transport: Box::new(P2pTransport),
+                share_config: ShareConfig::default(),
                 peers: HashMap::new(),
                 voice_capture: None,
                 mic_monitor: None,
@@ -828,6 +891,7 @@ mod tests {
                 output_device: None,
                 ptt_grab: None,
                 _client: None,
+                preview_pipeline: None,
             };
             (s, evt_rx)
         }

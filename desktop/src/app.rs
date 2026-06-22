@@ -154,7 +154,7 @@ impl Component for AppModel {
                         WorkspaceOutput::LeaveVoice => s.leave_voice(),
                         WorkspaceOutput::Mute(b) => s.mute(b),
                         WorkspaceOutput::Deafen(b) => s.deafen(b),
-                        WorkspaceOutput::StartShare => s.start_share(),
+                        WorkspaceOutput::StartShare => s.start_share(engine::screen::ShareConfig::default()),
                         WorkspaceOutput::StopShare => s.stop_share(),
                         WorkspaceOutput::SendChat(body) => s.send_chat(&body),
                     }
