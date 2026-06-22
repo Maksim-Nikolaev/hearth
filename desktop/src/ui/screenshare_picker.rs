@@ -1,5 +1,6 @@
 use engine::screen::audio::{has_pipewire, list_app_nodes, ShareAudio};
 use engine::screen::sources::{list_windows, ContentType, ShareConfig, ShareSource, ShareWindow};
+use engine::screen::thumbnail::thumbnail;
 use gtk::prelude::*;
 use relm4::prelude::*;
 
@@ -58,16 +59,18 @@ pub struct ScreenSharePicker {
     fps_btns: Vec<(u32, gtk::ToggleButton)>,
     content_btns: Vec<(ContentType, gtk::ToggleButton)>,
     audio_dropdown: gtk::DropDown,
-    /// The source row – held so window buttons can be rebuilt on re-open.
-    source_box: gtk::Box,
-    /// The "Whole screen" anchor button, needed to set the group on new window buttons.
-    whole_btn: gtk::ToggleButton,
+    /// The FlowBox holding the source cards.
+    source_flow: gtk::FlowBox,
+    /// Parallel list of card widgets for highlighting; index 0 = "Whole screen".
+    source_cards: Vec<gtk::Box>,
+    /// Index into `source_cards` that is currently highlighted.
+    selected_idx: usize,
 }
 
 #[derive(Debug)]
 pub enum PickerInput {
-    /// Source button clicked.
-    SelectSource(ShareSource),
+    /// Source card clicked (carries the card's index in the grid).
+    SelectSourceAt { idx: usize, source: ShareSource },
     /// Resolution radio toggled (only fires when it becomes active).
     SelectResolution(u32, u32),
     /// FPS radio toggled.
@@ -99,7 +102,7 @@ impl SimpleComponent for ScreenSharePicker {
         gtk::Window {
             set_title: Some("Share your screen"),
             set_default_width: 820,
-            set_default_height: 560,
+            set_default_height: 600,
             set_modal: true,
             set_resizable: true,
 
@@ -117,13 +120,17 @@ impl SimpleComponent for ScreenSharePicker {
 
                 gtk::ScrolledWindow {
                     set_hexpand: true,
-                    set_height_request: 100,
-                    set_policy: (gtk::PolicyType::Automatic, gtk::PolicyType::Never),
+                    set_height_request: 160,
+                    set_policy: (gtk::PolicyType::Automatic, gtk::PolicyType::Automatic),
 
                     #[local_ref]
-                    source_box -> gtk::Box {
-                        set_orientation: gtk::Orientation::Horizontal,
-                        set_spacing: 8,
+                    source_flow -> gtk::FlowBox {
+                        set_homogeneous: true,
+                        set_row_spacing: 8,
+                        set_column_spacing: 8,
+                        set_max_children_per_line: 6,
+                        set_min_children_per_line: 2,
+                        set_selection_mode: gtk::SelectionMode::None,
                     },
                 },
 
@@ -254,37 +261,39 @@ impl SimpleComponent for ScreenSharePicker {
             audio_dropdown.set_tooltip_text(Some("PipeWire not available – audio capture disabled"));
         }
 
-        // ── Source box ──────────────────────────────────────────────────────
-        let source_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        // ── Source FlowBox + initial cards ──────────────────────────────────
+        let source_flow = gtk::FlowBox::new();
+        source_flow.set_homogeneous(true);
+        source_flow.set_row_spacing(8);
+        source_flow.set_column_spacing(8);
+        source_flow.set_max_children_per_line(6);
+        source_flow.set_min_children_per_line(2);
+        source_flow.set_selection_mode(gtk::SelectionMode::None);
 
-        let whole_btn = gtk::ToggleButton::with_label("Whole screen");
-        whole_btn.set_active(true);
-        {
-            let sender = sender.clone();
-            whole_btn.connect_toggled(move |b| {
-                if b.is_active() {
-                    let _ = sender.input(PickerInput::SelectSource(
-                        ShareSource::Screen { monitor: 0 },
-                    ));
-                }
-            });
-        }
-        source_box.append(&whole_btn);
+        let mut source_cards: Vec<gtk::Box> = Vec::new();
 
-        for w in &windows {
-            let btn = gtk::ToggleButton::with_label(&w.title);
-            btn.set_group(Some(&whole_btn));
+        // "Whole screen" card at index 0.
+        let whole_card = build_card(
+            "Whole screen",
+            thumbnail(&ShareSource::Screen { monitor: 0 }, 240, 135),
+            true,
+        );
+        attach_card_click(&whole_card, 0, ShareSource::Screen { monitor: 0 }, &sender);
+        source_flow.append(&whole_card);
+        source_cards.push(whole_card);
+
+        for (i, w) in windows.iter().enumerate() {
             let xid = w.xid;
-            let sender = sender.clone();
-            btn.connect_toggled(move |b| {
-                if b.is_active() {
-                    let _ = sender.input(PickerInput::SelectSource(ShareSource::Window { xid }));
-                }
-            });
-            source_box.append(&btn);
+            let card = build_card(
+                &w.title,
+                thumbnail(&ShareSource::Window { xid }, 240, 135),
+                false,
+            );
+            attach_card_click(&card, i + 1, ShareSource::Window { xid }, &sender);
+            source_flow.append(&card);
+            source_cards.push(card);
         }
 
-        // Drop `windows` – it is no longer needed after the buttons are built.
         drop(windows);
 
         // ── Resolution buttons ───────────────────────────────────────────────
@@ -297,8 +306,7 @@ impl SimpleComponent for ScreenSharePicker {
             (3840, 2160, "4K"),
         ];
 
-        // Determine the native display resolution so we can hide presets that
-        // exceed it. Physical pixels = logical geometry × scale factor.
+        // Physical pixels = logical geometry × scale factor.
         let (native_w, native_h) = gtk::gdk::Display::default()
             .and_then(|d| d.monitors().item(0))
             .and_then(|obj| obj.downcast::<gtk::gdk::Monitor>().ok())
@@ -309,14 +317,11 @@ impl SimpleComponent for ScreenSharePicker {
             })
             .unwrap_or((u32::MAX, u32::MAX));
 
-        // Keep only presets that fit within the native resolution. Always
-        // preserve at least the smallest preset so the list is never empty.
         let visible_presets: Vec<(u32, u32, &str)> = {
             let filtered: Vec<_> =
                 res_presets.iter().copied().filter(|&(w, h, _)| w <= native_w && h <= native_h).collect();
 
             if filtered.is_empty() {
-                // All presets exceed native – keep just the smallest one.
                 vec![*res_presets.first().expect("res_presets is non-empty")]
             } else {
                 filtered
@@ -326,7 +331,6 @@ impl SimpleComponent for ScreenSharePicker {
         let mut res_btns: Vec<(u32, u32, gtk::ToggleButton)> = Vec::new();
         let mut first_res: Option<gtk::ToggleButton> = None;
 
-        // Default selection: 1080p if visible, otherwise the largest visible preset.
         let default_res_w = if visible_presets.iter().any(|&(w, _, _)| w == 1920) {
             1920u32
         } else {
@@ -440,8 +444,9 @@ impl SimpleComponent for ScreenSharePicker {
             fps_btns,
             content_btns,
             audio_dropdown: audio_dropdown.clone(),
-            source_box: source_box.clone(),
-            whole_btn: whole_btn.clone(),
+            source_flow: source_flow.clone(),
+            source_cards,
+            selected_idx: 0,
         };
 
         let widgets = view_output!();
@@ -451,8 +456,9 @@ impl SimpleComponent for ScreenSharePicker {
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
-            PickerInput::SelectSource(src) => {
-                self.source = src;
+            PickerInput::SelectSourceAt { idx, source } => {
+                self.highlight_card(idx);
+                self.source = source;
                 let _ = sender.output(PickerOutput::ConfigChanged(self.current_config()));
             }
             PickerInput::SelectResolution(w, h) => {
@@ -473,7 +479,8 @@ impl SimpleComponent for ScreenSharePicker {
                 let _ = sender.output(PickerOutput::ConfigChanged(self.current_config()));
             }
             PickerInput::SetWindows(windows) => {
-                self.rebuild_window_buttons(&windows, &sender);
+                self.rebuild_source_cards(&windows, &sender);
+                let _ = sender.output(PickerOutput::ConfigChanged(self.current_config()));
             }
             PickerInput::SetAudioNodes(nodes) => {
                 self.rebuild_audio_rows(nodes);
@@ -489,6 +496,57 @@ impl SimpleComponent for ScreenSharePicker {
             }
         }
     }
+}
+
+/// Build a source card: optional thumbnail Picture above a title label, inside
+/// a styled rounded box. `selected` adds the `.selected` CSS class immediately.
+fn build_card(title: &str, png: Option<Vec<u8>>, selected: bool) -> gtk::Box {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    card.add_css_class("source-card");
+
+    if selected {
+        card.add_css_class("selected");
+    }
+
+    let picture = gtk::Picture::new();
+    picture.set_hexpand(true);
+    picture.set_size_request(120, 68);
+    picture.set_can_shrink(true);
+
+    if let Some(bytes) = png {
+        let glib_bytes = gtk::glib::Bytes::from_owned(bytes);
+        if let Ok(texture) = gtk::gdk::Texture::from_bytes(&glib_bytes) {
+            picture.set_paintable(Some(&texture));
+        }
+    }
+
+    let label = gtk::Label::new(Some(title));
+    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    label.set_max_width_chars(18);
+    label.add_css_class("source-card-title");
+
+    card.append(&picture);
+    card.append(&label);
+
+    card
+}
+
+/// Wire a click gesture on `card` that sends `SelectSourceAt { idx, source }`.
+fn attach_card_click(
+    card: &gtk::Box,
+    idx: usize,
+    source: ShareSource,
+    sender: &ComponentSender<ScreenSharePicker>,
+) {
+    let sender = sender.clone();
+    let gesture = gtk::GestureClick::new();
+    gesture.connect_released(move |_, _, _, _| {
+        let _ = sender.input(PickerInput::SelectSourceAt {
+            idx,
+            source: source.clone(),
+        });
+    });
+    card.add_controller(gesture);
 }
 
 impl ScreenSharePicker {
@@ -512,10 +570,20 @@ impl ScreenSharePicker {
         }
     }
 
+    /// Update the `.selected` CSS class to point at `idx`.
+    fn highlight_card(&mut self, idx: usize) {
+        if let Some(prev) = self.source_cards.get(self.selected_idx) {
+            prev.remove_css_class("selected");
+        }
+
+        self.selected_idx = idx;
+
+        if let Some(card) = self.source_cards.get(idx) {
+            card.add_css_class("selected");
+        }
+    }
+
     /// Apply persisted settings to both the model fields and the UI controls.
-    /// Setting model fields directly ensures `current_config()` is correct even
-    /// if the user clicks Go Live without touching any control (a button that is
-    /// already active does not re-emit `toggled`).
     fn apply_settings(
         &mut self,
         width: u32,
@@ -526,9 +594,8 @@ impl ScreenSharePicker {
     ) {
         // Always reset to "Whole screen" so the source is deterministic.
         self.source = ShareSource::Screen { monitor: 0 };
+        self.highlight_card(0);
 
-        // If the saved resolution preset is hidden (not in res_btns), fall back
-        // to the largest visible preset so the model and UI stay in sync.
         let (eff_w, eff_h) = if self.res_btns.iter().any(|(bw, bh, _)| *bw == width && *bh == height) {
             (width, height)
         } else {
@@ -573,10 +640,6 @@ impl ScreenSharePicker {
     }
 
     /// Rebuild the audio dropdown from a freshly queried node list.
-    ///
-    /// Always keeps "None" and "Entire System" as the first two entries, then
-    /// appends the current per-app nodes. The selected index is reset to 0
-    /// (None) so stale app references are never silently carried over.
     fn rebuild_audio_rows(&mut self, nodes: Vec<engine::screen::audio::AudioNode>) {
         self.audio_rows = vec![AudioRow::None, AudioRow::System];
 
@@ -592,29 +655,42 @@ impl ScreenSharePicker {
         self.audio_dropdown.set_selected(0);
     }
 
-    /// Remove all window buttons from the source grid and rebuild them from the
-    /// supplied list. The "Whole screen" button is always kept as the first entry.
-    fn rebuild_window_buttons(&self, windows: &[ShareWindow], sender: &ComponentSender<Self>) {
-        // Remove all children after `whole_btn`.
-        while let Some(child) = self.source_box.last_child() {
-            if child == self.whole_btn {
-                break;
-            }
-
-            self.source_box.remove(&child);
+    /// Remove all cards and rebuild from the window list.
+    /// "Whole screen" is always inserted first and highlighted.
+    fn rebuild_source_cards(
+        &mut self,
+        windows: &[ShareWindow],
+        sender: &ComponentSender<Self>,
+    ) {
+        while let Some(child) = self.source_flow.first_child() {
+            self.source_flow.remove(&child);
         }
+        self.source_cards.clear();
 
-        for w in windows {
-            let btn = gtk::ToggleButton::with_label(&w.title);
-            btn.set_group(Some(&self.whole_btn));
+        // "Whole screen" at index 0.
+        let whole_card = build_card(
+            "Whole screen",
+            thumbnail(&ShareSource::Screen { monitor: 0 }, 240, 135),
+            true,
+        );
+        attach_card_click(&whole_card, 0, ShareSource::Screen { monitor: 0 }, sender);
+        self.source_flow.append(&whole_card);
+        self.source_cards.push(whole_card);
+
+        for (i, w) in windows.iter().enumerate() {
             let xid = w.xid;
-            let sender = sender.clone();
-            btn.connect_toggled(move |b| {
-                if b.is_active() {
-                    let _ = sender.input(PickerInput::SelectSource(ShareSource::Window { xid }));
-                }
-            });
-            self.source_box.append(&btn);
+            let card = build_card(
+                &w.title,
+                thumbnail(&ShareSource::Window { xid }, 240, 135),
+                false,
+            );
+            attach_card_click(&card, i + 1, ShareSource::Window { xid }, sender);
+            self.source_flow.append(&card);
+            self.source_cards.push(card);
         }
+
+        // Reset selection to "Whole screen".
+        self.selected_idx = 0;
+        self.source = ShareSource::Screen { monitor: 0 };
     }
 }

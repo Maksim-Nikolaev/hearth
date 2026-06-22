@@ -59,4 +59,22 @@ entry {
     color: #dbdee1;
     border-radius: 6px;
 }
+
+/* Screen-share source cards in the picker grid. */
+.source-card {
+    background-color: #313338;
+    border-radius: 8px;
+    padding: 6px;
+    border: 2px solid transparent;
+}
+
+.source-card.selected {
+    border-color: #5865f2;
+    background-color: #3c3f45;
+}
+
+.source-card-title {
+    color: #dbdee1;
+    font-size: 12px;
+}
 ";
