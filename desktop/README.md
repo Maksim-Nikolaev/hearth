@@ -55,3 +55,16 @@ in-window** (via `gtk4paintablesink` → `gtk::Picture`), status shows
 `Screen: Connected`. Per-flow transports: stopping one flow leaves chat (and any
 voice) running. Voice itself was loopback-verified at the engine level (T5).
 
+## M6 – Discord-style group experience
+
+### M6 T5 – dark workspace shell + login extraction (2026-06-22)
+
+Auto-connect via `HEARTH_TOKEN` (minted alice token) against the running backend.
+**Result: a dark 3-pane window appears after auto-connect** – left **CHANNELS**
+rail and right **MEMBERS** rail on the darker `#1e1f22`, center stage placeholder
+on `#2b2d31`. The center label (`Stage – 0 sharing, 0 online, 0 in voice, 5
+messages`) confirms the session connected and the workspace received the chat
+history through the new root→`Workspace` event fan-out. Login is now its own
+relm4 component (`ui/login.rs`); the root routes Login → Connecting → Workspace
+through a `Stack`. No startup `GtkStack` warning.
+

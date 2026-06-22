@@ -1,37 +1,31 @@
 use crate::config::Config;
+use crate::ui::login::{LoginForm, LoginInput, LoginOutput};
+use crate::ui::workspace::{Workspace, WorkspaceInput};
 use engine::flow::VideoSink;
 use engine::session::{Connection, Presence, Session, SessionEvent};
 use gtk::prelude::*;
-use hearth_protocol::{ChatEntry, PeerInfo, ServerMessage};
+use hearth_protocol::ServerMessage;
 use relm4::prelude::*;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Screen {
     Login,
     Connecting,
-    Room,
+    Workspace,
 }
 
 pub struct AppModel {
     config: Config,
     title: String,
     screen: Screen,
-    status: String,
     session: Option<Session>,
-    peers: Vec<PeerInfo>,
-    messages: Vec<ChatEntry>,
-    video_paintable: Option<gtk::gdk::Paintable>,
+    login: Controller<LoginForm>,
+    workspace: Controller<Workspace>,
 }
 
 #[derive(Debug)]
 pub enum AppMsg {
     Login { username: String, password: String },
-    SendChat(String),
-    ShareScreen,
-    Call,
-    Stop,
-    Mute(bool),
-    Deafen(bool),
 }
 
 /// Async/command results. Manual `Debug` because `Connection` is opaque.
@@ -63,52 +57,11 @@ impl Component for AppModel {
     view! {
         gtk::Window {
             set_title: Some(model.title.as_str()),
-            set_default_width: 960,
-            set_default_height: 640,
+            set_default_width: 1100,
+            set_default_height: 720,
 
             gtk::Stack {
-                set_margin_all: 24,
-
-                add_named[Some("login")] = &gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
-                    set_spacing: 12,
-                    set_halign: gtk::Align::Center,
-                    set_valign: gtk::Align::Center,
-
-                    gtk::Label {
-                        set_label: "Hearth",
-                        add_css_class: "title-1",
-                    },
-
-                    #[name = "username_entry"]
-                    gtk::Entry {
-                        set_placeholder_text: Some("username"),
-                        set_width_request: 240,
-                    },
-
-                    #[name = "password_entry"]
-                    gtk::Entry {
-                        set_placeholder_text: Some("password"),
-                        set_visibility: false,
-                        set_width_request: 240,
-                    },
-
-                    gtk::Button {
-                        set_label: "Log in",
-                        add_css_class: "suggested-action",
-                        connect_clicked[sender, username_entry, password_entry] => move |_| {
-                            sender.input(AppMsg::Login {
-                                username: username_entry.text().to_string(),
-                                password: password_entry.text().to_string(),
-                            });
-                        },
-                    },
-
-                    gtk::Label {
-                        #[watch]
-                        set_label: &model.status,
-                    },
-                },
+                add_named[Some("login")]: login_widget,
 
                 add_named[Some("connecting")] = &gtk::Box {
                     set_halign: gtk::Align::Center,
@@ -116,103 +69,10 @@ impl Component for AppModel {
                     gtk::Label { set_label: "Connecting…" },
                 },
 
-                add_named[Some("room")] = &gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
-                    set_spacing: 8,
+                add_named[Some("workspace")]: workspace_widget,
 
-                    gtk::Box {
-                        set_orientation: gtk::Orientation::Horizontal,
-                        set_spacing: 6,
-
-                        gtk::Button {
-                            set_label: "Share screen",
-                            connect_clicked => AppMsg::ShareScreen,
-                        },
-                        gtk::Button {
-                            set_label: "Call",
-                            connect_clicked => AppMsg::Call,
-                        },
-                        gtk::ToggleButton {
-                            set_label: "Mute",
-                            connect_toggled[sender] => move |b| sender.input(AppMsg::Mute(b.is_active())),
-                        },
-                        gtk::ToggleButton {
-                            set_label: "Deafen",
-                            connect_toggled[sender] => move |b| sender.input(AppMsg::Deafen(b.is_active())),
-                        },
-                        gtk::Button {
-                            set_label: "Stop",
-                            connect_clicked => AppMsg::Stop,
-                        },
-                        gtk::Label {
-                            set_hexpand: true,
-                            set_xalign: 1.0,
-                            #[watch]
-                            set_label: &model.status,
-                        },
-                    },
-
-                    gtk::Box {
-                        set_orientation: gtk::Orientation::Horizontal,
-                        set_spacing: 12,
-                        set_vexpand: true,
-
-                        gtk::Box {
-                            set_orientation: gtk::Orientation::Vertical,
-                            set_spacing: 6,
-                            set_width_request: 180,
-
-                            gtk::Label { set_label: "Online", add_css_class: "heading", set_xalign: 0.0 },
-                            gtk::Label {
-                                #[watch]
-                                set_label: &model.peers_text(),
-                                set_xalign: 0.0,
-                                set_valign: gtk::Align::Start,
-                            },
-                        },
-
-                        gtk::Frame {
-                            set_hexpand: true,
-                            gtk::Picture {
-                                set_vexpand: true,
-                                set_hexpand: true,
-                                #[watch]
-                                set_paintable: model.video_paintable.as_ref(),
-                            },
-                        },
-
-                        gtk::Box {
-                            set_orientation: gtk::Orientation::Vertical,
-                            set_spacing: 6,
-                            set_width_request: 300,
-
-                            gtk::ScrolledWindow {
-                                set_vexpand: true,
-                                gtk::Label {
-                                    #[watch]
-                                    set_label: &model.chat_text(),
-                                    set_xalign: 0.0,
-                                    set_valign: gtk::Align::End,
-                                    set_wrap: true,
-                                },
-                            },
-
-                            gtk::Entry {
-                                set_placeholder_text: Some("Message…"),
-                                connect_activate[sender] => move |entry| {
-                                    let body = entry.text().to_string();
-                                    if !body.is_empty() {
-                                        sender.input(AppMsg::SendChat(body));
-                                        entry.set_text("");
-                                    }
-                                },
-                            },
-                        },
-                    },
-                },
-
-                // Set after the pages are added so the initial value always
-                // resolves to an existing child (no startup warning).
+                // Set after the pages exist so the initial value resolves to a
+                // real child (no startup warning).
                 #[watch]
                 set_visible_child_name: model.screen_name(),
             }
@@ -237,16 +97,26 @@ impl Component for AppModel {
             .map(|t| format!("Hearth - {t}"))
             .unwrap_or_else(|_| "Hearth".into());
 
+        let login = LoginForm::builder()
+            .launch(())
+            .forward(sender.input_sender(), |out| match out {
+                LoginOutput::Submit { username, password } => AppMsg::Login { username, password },
+            });
+
+        let workspace = Workspace::builder().launch(()).detach();
+
         let model = AppModel {
             config,
             title,
             screen,
-            status: String::new(),
             session: None,
-            peers: Vec::new(),
-            messages: Vec::new(),
-            video_paintable: None,
+            login,
+            workspace,
         };
+
+        let login_widget = model.login.widget();
+        let workspace_widget = model.workspace.widget();
+
         let widgets = view_output!();
 
         ComponentParts { model, widgets }
@@ -256,7 +126,7 @@ impl Component for AppModel {
         match msg {
             AppMsg::Login { username, password } => {
                 self.screen = Screen::Connecting;
-                self.status.clear();
+                let _ = self.login.sender().send(LoginInput::SetStatus(String::new()));
 
                 let http = self.config.http.clone();
                 let ws = self.config.ws.clone();
@@ -266,37 +136,6 @@ impl Component for AppModel {
                         Err(e) => Cmd::Failed(e.to_string()),
                     }
                 });
-            }
-            AppMsg::SendChat(body) => {
-                if let Some(s) = self.session.as_ref() {
-                    s.send_chat(&body);
-                }
-            }
-            AppMsg::ShareScreen => {
-                if let Some(s) = self.session.as_mut() {
-                    s.start_share();
-                }
-            }
-            AppMsg::Call => self.with_first_peer(|s, peer| {
-                if let Err(e) = s.start_call(peer) {
-                    eprintln!("start_call: {e}");
-                }
-            }),
-            AppMsg::Stop => {
-                if let Some(s) = self.session.as_mut() {
-                    s.stop_all();
-                }
-                self.video_paintable = None;
-            }
-            AppMsg::Mute(on) => {
-                if let Some(s) = self.session.as_ref() {
-                    s.mute(on);
-                }
-            }
-            AppMsg::Deafen(on) => {
-                if let Some(s) = self.session.as_ref() {
-                    s.deafen(on);
-                }
             }
         }
     }
@@ -309,8 +148,7 @@ impl Component for AppModel {
                 let (session, mut inbound, mut events) = Session::start(conn, VideoSink::Paintable);
                 session.join("main");
                 self.session = Some(session);
-                self.screen = Screen::Room;
-                self.status = "Connected".into();
+                self.screen = Screen::Workspace;
 
                 sender.command(move |out, shutdown| {
                     shutdown
@@ -338,7 +176,7 @@ impl Component for AppModel {
             }
             Cmd::Failed(e) => {
                 self.screen = Screen::Login;
-                self.status = format!("Login failed: {e}");
+                let _ = self.login.sender().send(LoginInput::SetStatus(format!("Login failed: {e}")));
             }
             Cmd::Server(m) => {
                 if let Some(s) = self.session.as_mut() {
@@ -351,41 +189,43 @@ impl Component for AppModel {
 }
 
 impl AppModel {
+    /// Translate each engine `SessionEvent` into a workspace input.
     fn on_event(&mut self, event: SessionEvent) {
+        let w = self.workspace.sender();
         match event {
-            SessionEvent::Presence(Presence::Roster(list)) => self.peers = list,
+            SessionEvent::Presence(Presence::Roster(list)) => {
+                let _ = w.send(WorkspaceInput::Roster(list));
+            }
             SessionEvent::Presence(Presence::Joined { user, username }) => {
-                if !self.peers.iter().any(|p| p.user == user) {
-                    self.peers.push(PeerInfo { user, username });
-                }
+                let _ = w.send(WorkspaceInput::PeerJoined { user, username });
             }
-            SessionEvent::Presence(Presence::Left { user }) => self.peers.retain(|p| p.user != user),
-            SessionEvent::Chat(entry) => self.messages.push(entry),
-            SessionEvent::ChatHistory(list) => self.messages = list,
-            SessionEvent::FlowState { flow, state, .. } => self.status = format!("{flow:?}: {state}"),
-            SessionEvent::VideoReady { peer, flow } => {
-                if let Some(obj) = self.session.as_ref().and_then(|s| s.paintable_for(peer, flow)) {
-                    self.video_paintable = obj.downcast::<gtk::gdk::Paintable>().ok();
-                }
+            SessionEvent::Presence(Presence::Left { user }) => {
+                let _ = w.send(WorkspaceInput::PeerLeft { user });
             }
-            SessionEvent::Error(e) => self.status = e,
-            // Group voice + share events are consumed by the workspace components
-            // introduced in M6 Tasks 5–7; ignored by this transitional shell.
-            SessionEvent::VoiceState(_)
-            | SessionEvent::VoiceJoined { .. }
-            | SessionEvent::VoiceLeft { .. }
-            | SessionEvent::ShareStarted { .. }
-            | SessionEvent::ShareStopped { .. } => {}
-        }
-    }
-
-    fn with_first_peer(&mut self, f: impl FnOnce(&mut Session, uuid::Uuid)) {
-        let Some(peer) = self.peers.first().map(|p| p.user) else {
-            self.status = "No peer in the room yet".into();
-            return;
-        };
-        if let Some(s) = self.session.as_mut() {
-            f(s, peer);
+            SessionEvent::Chat(entry) => {
+                let _ = w.send(WorkspaceInput::Chat(entry));
+            }
+            SessionEvent::ChatHistory(list) => {
+                let _ = w.send(WorkspaceInput::ChatHistory(list));
+            }
+            SessionEvent::VoiceState(members) => {
+                let _ = w.send(WorkspaceInput::VoiceRoster(members));
+            }
+            SessionEvent::VoiceJoined { user, username } => {
+                let _ = w.send(WorkspaceInput::VoiceJoined { user, username });
+            }
+            SessionEvent::VoiceLeft { user } => {
+                let _ = w.send(WorkspaceInput::VoiceLeft { user });
+            }
+            SessionEvent::ShareStarted { user } => {
+                let _ = w.send(WorkspaceInput::ShareStarted { user });
+            }
+            SessionEvent::ShareStopped { user } => {
+                let _ = w.send(WorkspaceInput::ShareStopped { user });
+            }
+            SessionEvent::VideoReady { .. }
+            | SessionEvent::FlowState { .. }
+            | SessionEvent::Error(_) => {}
         }
     }
 
@@ -393,18 +233,7 @@ impl AppModel {
         match self.screen {
             Screen::Login => "login",
             Screen::Connecting => "connecting",
-            Screen::Room => "room",
+            Screen::Workspace => "workspace",
         }
-    }
-
-    fn peers_text(&self) -> String {
-        if self.peers.is_empty() {
-            return "(no one else here)".into();
-        }
-        self.peers.iter().map(|p| format!("● {}", p.username)).collect::<Vec<_>>().join("\n")
-    }
-
-    fn chat_text(&self) -> String {
-        self.messages.iter().map(|m| format!("{}: {}", m.username, m.body)).collect::<Vec<_>>().join("\n")
     }
 }

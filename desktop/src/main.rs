@@ -1,5 +1,7 @@
 mod app;
 mod config;
+mod theme;
+mod ui;
 
 use relm4::RelmApp;
 
@@ -20,6 +22,7 @@ fn main() {
     };
 
     let app = RelmApp::new(&app_id);
+    theme::load();
     app.run::<app::AppModel>(config);
 }
 
