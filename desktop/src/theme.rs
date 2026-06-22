@@ -49,6 +49,11 @@ window { background-color: #2b2d31; color: #dbdee1; }
 
 button.suggested-action, .accent { background-color: #5865f2; color: #ffffff; }
 
+/* Active screen-share indicator: red background on the Share button and the
+   self row in the members rail. */
+button.sharing { background-color: #ed4245; color: #ffffff; }
+.member.sharing { color: #ed4245; font-weight: bold; }
+
 entry {
     background-color: #383a40;
     color: #dbdee1;

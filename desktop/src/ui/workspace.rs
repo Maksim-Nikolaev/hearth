@@ -24,6 +24,8 @@ pub struct Workspace {
     self_id: Uuid,
     self_name: String,
     in_voice: bool,
+    /// True when the local user is actively sharing their screen.
+    sharing: bool,
     online: Vec<PeerInfo>,
     voice: Vec<PeerInfo>,
     sharers: Vec<Uuid>,
@@ -61,9 +63,9 @@ pub enum WorkspaceInput {
     SelectSharer(Uuid),
     SendChat(String),
     OpenSettings,
-    /// Programmatically reset the Share toggle in the self-panel (true = active,
-    /// false = inactive) without triggering the toggled handler.
-    SetShareActive(bool),
+    /// Notify the workspace that the local share is now live (true) or stopped
+    /// (false). Updates the Share button style and the self members-row marker.
+    SetSharing(bool),
 }
 
 #[derive(Debug)]
@@ -175,6 +177,7 @@ impl SimpleComponent for Workspace {
             self_id: Uuid::nil(),
             self_name: String::new(),
             in_voice: false,
+            sharing: false,
             online: Vec::new(),
             voice: Vec::new(),
             sharers: Vec::new(),
@@ -249,6 +252,8 @@ impl SimpleComponent for Workspace {
                     let _ = sender.output(WorkspaceOutput::JoinVoice);
                 } else {
                     self.voice.clear();
+                    self.sharing = false;
+                    let _ = self.self_panel.sender().send(SelfPanelInput::SetShareActive(false));
                     let _ = sender.output(WorkspaceOutput::LeaveVoice);
                 }
             }
@@ -267,7 +272,8 @@ impl SimpleComponent for Workspace {
             WorkspaceInput::OpenSettings => {
                 let _ = sender.output(WorkspaceOutput::OpenSettings);
             }
-            WorkspaceInput::SetShareActive(active) => {
+            WorkspaceInput::SetSharing(active) => {
+                self.sharing = active;
                 let _ = self.self_panel.sender().send(SelfPanelInput::SetShareActive(active));
             }
         }
@@ -358,14 +364,20 @@ impl Workspace {
         if !in_voice.is_empty() {
             rows.push(header("IN VOICE"));
             for (id, name) in &in_voice {
-                rows.push(member(format!("🔊 {}{}", name, you(*id)), true));
+                let is_self = *id == self.self_id;
+                let label = if is_self && self.sharing {
+                    format!("🔴 {}{}", name, you(*id))
+                } else {
+                    format!("🔊 {}{}", name, you(*id))
+                };
+                rows.push(member(label, true, is_self && self.sharing));
             }
         }
 
         if !online.is_empty() {
             rows.push(header("ONLINE"));
             for (id, name) in &online {
-                rows.push(member(format!("● {}{}", name, you(*id)), false));
+                rows.push(member(format!("● {}{}", name, you(*id)), false, false));
             }
         }
 
@@ -374,9 +386,9 @@ impl Workspace {
 }
 
 fn header(label: &str) -> MemberRowData {
-    MemberRowData { label: label.to_string(), is_header: true, in_voice: false }
+    MemberRowData { label: label.to_string(), is_header: true, in_voice: false, sharing: false }
 }
 
-fn member(label: String, in_voice: bool) -> MemberRowData {
-    MemberRowData { label, is_header: false, in_voice }
+fn member(label: String, in_voice: bool, sharing: bool) -> MemberRowData {
+    MemberRowData { label, is_header: false, in_voice, sharing }
 }

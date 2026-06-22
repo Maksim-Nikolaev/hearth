@@ -8,6 +8,8 @@ pub struct MemberRowData {
     pub label: String,
     pub is_header: bool,
     pub in_voice: bool,
+    /// True only for the self row when the local user is actively sharing screen.
+    pub sharing: bool,
 }
 
 pub struct MemberRow {
@@ -39,6 +41,8 @@ impl MemberRow {
     fn classes(&self) -> Vec<&'static str> {
         if self.data.is_header {
             vec!["section-header"]
+        } else if self.data.in_voice && self.data.sharing {
+            vec!["member", "in-voice", "sharing"]
         } else if self.data.in_voice {
             vec!["member", "in-voice"]
         } else {

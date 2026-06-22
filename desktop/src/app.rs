@@ -232,7 +232,7 @@ impl Component for AppModel {
                                     s.stop_share();
                                     self.share_picker.widget().set_visible(false);
                                     let _ = self.workspace.sender().send(
-                                        WorkspaceInput::SetShareActive(false),
+                                        WorkspaceInput::SetSharing(false),
                                     );
                                 }
                                 WorkspaceOutput::SendChat(body) => s.send_chat(&body),
@@ -400,14 +400,16 @@ impl AppModel {
                     s.stop_preview();
                     s.start_share(cfg);
                 }
+
+                let _ = self.workspace.sender().send(WorkspaceInput::SetSharing(true));
             }
             PickerOutput::Cancel => {
                 self.share_picker.widget().set_visible(false);
                 if let Some(s) = self.session.as_mut() {
                     s.stop_preview();
                 }
-                // Reset the Share toggle so it doesn't lie that a share is active.
-                let _ = self.workspace.sender().send(WorkspaceInput::SetShareActive(false));
+                // Reset the Share toggle and sharing indicator – the user cancelled.
+                let _ = self.workspace.sender().send(WorkspaceInput::SetSharing(false));
             }
         }
     }

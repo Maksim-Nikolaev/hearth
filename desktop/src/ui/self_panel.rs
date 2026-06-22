@@ -130,6 +130,14 @@ impl SimpleComponent for SelfPanel {
                     self.share_toggle.set_active(active);
                     self.share_toggle.unblock_signal(id);
                 }
+
+                if active {
+                    self.share_toggle.set_label("● Sharing (click to stop)");
+                    self.share_toggle.add_css_class("sharing");
+                } else {
+                    self.share_toggle.set_label("Share screen");
+                    self.share_toggle.remove_css_class("sharing");
+                }
             }
         }
     }
