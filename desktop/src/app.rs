@@ -209,6 +209,7 @@ impl Component for AppModel {
                             fps: saved.share_fps,
                             content,
                             audio,
+                            bitrate_kbps: saved.share_bitrate_kbps,
                         });
 
                         // Start the preview, then set the paintable on the picture directly.
@@ -394,6 +395,7 @@ impl AppModel {
                     ContentType::Smoothness => ContentKind::Smoothness,
                     ContentType::Clarity => ContentKind::Clarity,
                 };
+                settings.share_bitrate_kbps = cfg.bitrate_kbps;
                 self.config.save_settings(&settings);
 
                 if let Some(s) = self.session.as_mut() {
@@ -534,5 +536,6 @@ fn settings_to_config(s: &Settings) -> ShareConfig {
         fps: s.share_fps,
         content,
         audio,
+        bitrate_kbps: s.share_bitrate_kbps,
     }
 }

@@ -65,6 +65,7 @@ pub struct Settings {
     pub share_fps: u32,
     pub share_content: ContentKind,
     pub share_audio: ShareAudioKind,
+    pub share_bitrate_kbps: u32,
 }
 
 impl Default for Settings {
@@ -86,6 +87,7 @@ impl Default for Settings {
             share_fps: 30,
             share_content: ContentKind::Smoothness,
             share_audio: ShareAudioKind::None,
+            share_bitrate_kbps: 6000,
         }
     }
 }
@@ -193,6 +195,7 @@ mod tests {
         let s = Settings::default();
 
         assert_eq!(s.share_fps, 30);
+        assert_eq!(s.share_bitrate_kbps, 6000);
         assert!(matches!(s.activation, ActivationKind::Voice));
     }
 }

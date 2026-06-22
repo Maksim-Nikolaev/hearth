@@ -43,6 +43,25 @@ impl AudioRow {
     }
 }
 
+/// Bitrate presets shown in the picker drop-down.
+const BITRATE_PRESETS: &[(u32, &str)] = &[
+    (2500, "2.5 Mbps"),
+    (5000, "5 Mbps"),
+    (6000, "6 Mbps"),
+    (8000, "8 Mbps"),
+    (12000, "12 Mbps"),
+];
+
+/// Return the index in `BITRATE_PRESETS` closest to `kbps` (by absolute distance).
+fn bitrate_preset_index(kbps: u32) -> u32 {
+    BITRATE_PRESETS
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, &(preset, _))| preset.abs_diff(kbps))
+        .map(|(i, _)| i as u32)
+        .unwrap_or(2) // default to 6 Mbps (index 2)
+}
+
 pub struct ScreenSharePicker {
     /// Currently selected source (Screen or Window).
     source: ShareSource,
@@ -50,6 +69,7 @@ pub struct ScreenSharePicker {
     height: u32,
     fps: u32,
     content: ContentType,
+    bitrate_kbps: u32,
     audio_rows: Vec<AudioRow>,
     audio_idx: u32,
     pipewire_available: bool,
@@ -62,6 +82,8 @@ pub struct ScreenSharePicker {
     content_btns: Vec<(ContentType, gtk::ToggleButton, gtk::glib::SignalHandlerId)>,
     audio_dropdown: gtk::DropDown,
     audio_handler: gtk::glib::SignalHandlerId,
+    bitrate_dropdown: gtk::DropDown,
+    bitrate_handler: gtk::glib::SignalHandlerId,
     /// The FlowBox holding the source cards.
     source_flow: gtk::FlowBox,
     /// Parallel list of card widgets for highlighting; index 0 = "Whole screen".
@@ -82,12 +104,14 @@ pub enum PickerInput {
     SelectContent(ContentType),
     /// Audio drop-down selection changed.
     SelectAudio(u32),
+    /// Bitrate drop-down selection changed (carries the preset index).
+    SelectBitrate(u32),
     /// Rebuild the window list in the source grid (called on each picker open).
     SetWindows(Vec<ShareWindow>),
     /// Refresh the per-app audio node list (called on each picker open).
     SetAudioNodes(Vec<engine::screen::audio::AudioNode>),
     /// Apply persisted settings: update model fields + button state atomically.
-    ApplySettings { width: u32, height: u32, fps: u32, content: ContentType, audio: ShareAudio },
+    ApplySettings { width: u32, height: u32, fps: u32, content: ContentType, audio: ShareAudio, bitrate_kbps: u32 },
     GoLive,
     Cancel,
 }
@@ -211,6 +235,18 @@ impl SimpleComponent for ScreenSharePicker {
 
                     #[local_ref]
                     audio_dropdown -> gtk::DropDown {},
+                },
+
+                // ── Bitrate row ───────────────────────────────────────────────
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_spacing: 8,
+                    set_valign: gtk::Align::Center,
+
+                    gtk::Label { set_label: "Bitrate:" },
+
+                    #[local_ref]
+                    bitrate_dropdown -> gtk::DropDown {},
                 },
 
                 // ── Action row ────────────────────────────────────────────────
@@ -428,6 +464,21 @@ impl SimpleComponent for ScreenSharePicker {
             })
         };
 
+        // ── Bitrate drop-down ─────────────────────────────────────────────────
+        let bitrate_labels: Vec<&str> = BITRATE_PRESETS.iter().map(|(_, l)| *l).collect();
+        let bitrate_string_list = gtk::StringList::new(&bitrate_labels);
+        let bitrate_dropdown = gtk::DropDown::new(Some(bitrate_string_list), gtk::Expression::NONE);
+
+        // Default to the 6 Mbps preset (index 2).
+        bitrate_dropdown.set_selected(2);
+
+        let bitrate_handler = {
+            let sender = sender.clone();
+            bitrate_dropdown.connect_selected_notify(move |dd| {
+                let _ = sender.input(PickerInput::SelectBitrate(dd.selected()));
+            })
+        };
+
         let default_res_h = visible_presets
             .iter()
             .find(|&&(w, _, _)| w == default_res_w)
@@ -440,6 +491,7 @@ impl SimpleComponent for ScreenSharePicker {
             height: default_res_h,
             fps: 30,
             content: ContentType::Smoothness,
+            bitrate_kbps: 6000,
             audio_rows,
             audio_idx: 0,
             pipewire_available,
@@ -448,6 +500,8 @@ impl SimpleComponent for ScreenSharePicker {
             content_btns,
             audio_dropdown: audio_dropdown.clone(),
             audio_handler,
+            bitrate_dropdown: bitrate_dropdown.clone(),
+            bitrate_handler,
             source_flow: source_flow.clone(),
             source_cards,
             selected_idx: 0,
@@ -482,6 +536,12 @@ impl SimpleComponent for ScreenSharePicker {
                 self.audio_idx = idx;
                 let _ = sender.output(PickerOutput::ConfigChanged(self.current_config()));
             }
+            PickerInput::SelectBitrate(idx) => {
+                if let Some(&(kbps, _)) = BITRATE_PRESETS.get(idx as usize) {
+                    self.bitrate_kbps = kbps;
+                    let _ = sender.output(PickerOutput::ConfigChanged(self.current_config()));
+                }
+            }
             PickerInput::SetWindows(windows) => {
                 self.rebuild_source_cards(&windows, &sender);
                 let _ = sender.output(PickerOutput::ConfigChanged(self.current_config()));
@@ -489,8 +549,8 @@ impl SimpleComponent for ScreenSharePicker {
             PickerInput::SetAudioNodes(nodes) => {
                 self.rebuild_audio_rows(nodes);
             }
-            PickerInput::ApplySettings { width, height, fps, content, audio } => {
-                self.apply_settings(width, height, fps, content, &audio);
+            PickerInput::ApplySettings { width, height, fps, content, audio, bitrate_kbps } => {
+                self.apply_settings(width, height, fps, content, &audio, bitrate_kbps);
             }
             PickerInput::GoLive => {
                 let _ = sender.output(PickerOutput::GoLive(self.current_config()));
@@ -571,6 +631,7 @@ impl ScreenSharePicker {
             fps: self.fps,
             content: self.content,
             audio,
+            bitrate_kbps: self.bitrate_kbps,
         }
     }
 
@@ -595,6 +656,7 @@ impl ScreenSharePicker {
         fps: u32,
         content: ContentType,
         audio: &ShareAudio,
+        bitrate_kbps: u32,
     ) {
         // Always reset to "Whole screen" so the source is deterministic.
         self.source = ShareSource::Screen { monitor: 0 };
@@ -649,6 +711,12 @@ impl ScreenSharePicker {
         self.audio_dropdown.block_signal(&self.audio_handler);
         self.audio_dropdown.set_selected(idx);
         self.audio_dropdown.unblock_signal(&self.audio_handler);
+
+        self.bitrate_kbps = bitrate_kbps;
+        let bitrate_idx = bitrate_preset_index(bitrate_kbps);
+        self.bitrate_dropdown.block_signal(&self.bitrate_handler);
+        self.bitrate_dropdown.set_selected(bitrate_idx);
+        self.bitrate_dropdown.unblock_signal(&self.bitrate_handler);
     }
 
     /// Rebuild the audio dropdown from a freshly queried node list.
