@@ -31,17 +31,23 @@ changes.
 X11 session (`DISPLAY=:0`), **PipeWire 1.0.5** running behind the PulseAudio
 shim. So: video capture via `ximagesrc` (with `xid=` for a window); audio device
 enumeration and **per-application audio capture** available through PipeWire.
-`webrtcdsp` (the GStreamer `webrtc-audio-processing` element) is **not currently
-installed** – it is a prerequisite for the DSP features and degrades gracefully
-if missing.
+The GStreamer `webrtcdsp`/`webrtcechoprobe` elements are **not shipped** by
+Ubuntu Noble's plugins-bad (confirmed via `gst-inspect-1.0`), so voice DSP runs
+**in-process via the `webrtc-audio-processing` Rust crate** instead. `level`,
+`pulsesrc`, and `pipewiresrc` are present; cmake/clang/pkg-config (for the crate
+build) are present.
 
 ## Locked decisions
 
 - **One combined milestone**, internally decomposed into five independently
   testable units; implementation staged in that order.
-- **Voice DSP = in-pipeline `webrtcdsp` + `webrtcechoprobe`** (libwebrtc
-  AudioProcessing). Per-stream toggles map 1:1 to the Discord panel. If the
-  plugin is absent, the toggles disable and voice still works.
+- **Voice DSP = the `webrtc-audio-processing` Rust crate, in-process** (libwebrtc
+  AudioProcessing 0.3: AEC / NS / AGC / VAD). The GStreamer `webrtcdsp` element is
+  **not available on Ubuntu Noble** (plugins-bad is built without it), so instead
+  of an in-pipeline element we bridge capture PCM through the crate before Opus.
+  Per-toggle control is **live** (set the processor config in place), and the same
+  crate **ports to the future Windows build**. Builds via the already-installed
+  cmake/clang.
 - **Apply changes live**: changing a device or DSP toggle during a call rebuilds
   the voice send branch / hot-swaps the source (sub-second, no reconnect).
 - **Screenshare sources (X11): whole screen + specific window.** Region-select is
@@ -88,7 +94,8 @@ voice DSP (that is Discord/Krisp). The useful parts:
 engine/src/
   audio/
     devices.rs      # DeviceMonitor enumeration (sources, sinks), hotplug
-    capture.rs      # voice capture+DSP+meter+valve branch (rebuilds live)
+    dsp.rs          # webrtc-audio-processing crate wrapper (AEC/NS/AGC/VAD)
+    capture.rs      # voice capture+DSP-bridge+meter+valve branch (rebuilds live)
     monitor.rs      # standalone mic-test/meter pipeline (no call needed)
   screen/
     sources.rs      # X11 screen + window enumeration (+ thumbnails)
@@ -113,23 +120,25 @@ desktop/src/
 - Replace `autoaudiosrc`/`autoaudiosink` with `pulsesrc`/`pulsesink` driven by a
   selected `device=` (falls back to default when unset).
 
-### Unit 2 – Voice DSP, meter & activation (`engine::audio::capture`, `monitor`)
+### Unit 2 – Voice DSP, meter & activation (`engine::audio::capture`, `monitor`, `dsp`)
 
-- Send branch becomes:
-  `pulsesrc device ! audioconvert ! audioresample ! webrtcdsp ! level ! mic_valve ! opusenc`,
-  with a `webrtcechoprobe` tapped off the playback (`pulsesink`) path so AEC sees
-  the far-end reference.
-- DSP toggles → live `webrtcdsp` properties: `echo-cancel`, `noise-suppression`
-  (+ level), `gain-control` (AGC), `voice-detection` (VAD). Capability-probed; if
-  `webrtcdsp` is missing the chain omits it and the UI disables the toggles.
+- **`engine::audio::dsp`** wraps the `webrtc-audio-processing` crate: a `Processor`
+  configured with AEC, NS (level), AGC, VAD + high-pass, processing 10 ms frames
+  of interleaved i16 at 48 kHz. Config setters apply **live** (no pipeline
+  rebuild), so toggles flip instantly.
+- Send branch bridges PCM through it:
+  `pulsesrc device ! audioconvert ! audioresample (48k,S16,frames) ! appsink`
+  → `dsp.process_capture_frame()` → `appsrc ! level ! mic_valve ! opusenc`.
+  A second `appsink` tap off the playback (`pulsesink`) path feeds
+  `dsp.process_render_frame()` so AEC has the far-end reference.
 - `level` posts RMS/peak → drives the **sensitivity meter** and the
-  voice-activity comparison.
-- **Activation** drives `mic_valve`: VAD-threshold (open above the chosen RMS),
-  push-to-talk (valve follows the key), always-on (valve open). Mute overrides
-  all.
-- **Monitor pipeline** (`monitor.rs`): `pulsesrc ! webrtcdsp ! level ! pulsesink`
-  for **Mic Test** + meter while *not* in a call (your voice looped to your
-  speaker), reusing the same DSP settings.
+  voice-activity comparison; the crate's VAD also reports speech probability.
+- **Activation** drives `mic_valve`: VAD-threshold (open above the chosen RMS /
+  VAD), push-to-talk (valve follows the key), always-on (valve open). Mute
+  overrides all.
+- **Monitor pipeline** (`monitor.rs`): the same capture→DSP→`level`→`pulsesink`
+  bridge for **Mic Test** + meter while *not* in a call (your voice looped to your
+  speaker), reusing the same `Processor` settings.
 
 ### Unit 3 – Screenshare sources, audio & quality (`engine::screen::*`)
 
@@ -149,8 +158,9 @@ desktop/src/
 
 ### Unit 4 – Live-apply & global push-to-talk (`engine::hotkey`, `session`)
 
-- DSP toggle change = set a `webrtcdsp` property in place. Device/source change =
-  pad-block the source, relink the new sub-branch, unblock (sub-second blip).
+- DSP toggle change = update the `Processor` config in place (no pipeline touch).
+  Device/source change = pad-block the source, relink the new sub-branch, unblock
+  (sub-second blip).
 - Screenshare audio-source change while live = swap the audio sub-branch the same
   way.
 - **Global PTT** (`hotkey.rs`): grab a chosen key on the X root window via
@@ -178,8 +188,8 @@ desktop/src/
 - **Open settings → change mic device**: UI writes `Settings.input_device` →
   `Session` rebuilds the voice capture branch live (pad-block swap) → next packets
   use the new device; the monitor pipeline (if mic-testing) swaps too.
-- **Toggle noise suppression**: UI → `Session` sets `webrtcdsp.noise-suppression`
-  live on every active voice flow + the monitor.
+- **Toggle noise suppression**: UI → `Session` sets the `Processor` NS flag live;
+  it applies to the shared DSP for every active voice flow + the monitor.
 - **Speak (VAD) / hold PTT**: `level`/hotkey → activation gate opens `mic_valve`
   → audio transmits; meter reflects input the whole time.
 - **Start share**: picker returns {source, res, fps, content-type, audio-source}
@@ -201,32 +211,28 @@ share_resolution, share_fps, share_content_type, share_audio_source
 
 Local file only. No backend, protocol, or DB changes.
 
-## Prerequisites (Linux dev box, install once)
+## Prerequisites (Linux dev box)
 
-```bash
-sudo apt update
-# webrtcdsp (AEC/NS/AGC/VAD) lives in plugins-bad's webrtc-audio-processing;
-# pipewire + pulse GStreamer plugins for device + app/system audio capture.
-sudo apt install -y \
-  gstreamer1.0-plugins-bad \
-  gstreamer1.0-pipewire \
-  gstreamer1.0-pulseaudio
-# verify the DSP element is present (no error = good):
-gst-inspect-1.0 webrtcdsp
-```
+Already satisfied on the dev box (verified 2026-06-22):
 
-If `gst-inspect-1.0 webrtcdsp` still errors after install, this distro built
-`plugins-bad` without `webrtc-audio-processing`; the fallback is PipeWire's
-`module-echo-cancel`. X11 window enumeration (`x11rb`) and global PTT (`XGrabKey`
-via XCB) are pure-Rust cargo deps – no system package. `ximagesrc` is already in
-`gstreamer1.0-plugins-good`.
+- **GStreamer audio/screen elements** – `gstreamer1.0-pipewire`,
+  `gstreamer1.0-pulseaudio` installed; `level`, `pulsesrc`, `pipewiresrc`,
+  `ximagesrc` all present.
+- **Voice DSP build deps** – the `webrtc-audio-processing` Rust crate builds a
+  vendored libwebrtc copy via **cmake 3.28 + clang 18 + pkg-config** (all
+  present); the system also has `libwebrtc-audio-processing 0.3.1`.
+
+Note: the GStreamer `webrtcdsp`/`webrtcechoprobe` elements are **not provided** by
+Ubuntu Noble (`gst-inspect-1.0 webrtcdsp` → not found), which is why DSP runs
+in-process via the crate rather than in-pipeline. X11 window enumeration (`x11rb`)
+and global PTT (`XGrabKey` via XCB) are pure-Rust cargo deps – no system package.
 
 ## Testing
 
 - **TDD (engine logic)**: device-list parsing/labeling; settings
   serialization/round-trip; the activation-gate state machine (mute > ptt > vad >
-  always; threshold compare); PipeWire node-filter rules; `webrtcdsp` capability
-  probe.
+  always; threshold compare); PipeWire node-filter rules; DSP frame
+  bridging (10 ms i16 framing round-trip).
 - **Run-and-observe (DSP audio, capture, UI)**: device switch mid-call; NS/AEC/AGC
   audibly change; meter tracks speech; VAD gates; global PTT works unfocused;
   screen vs window capture; app-audio vs system-audio in a share; resolution/fps
@@ -236,8 +242,10 @@ via XCB) are pure-Rust cargo deps – no system package. `ximagesrc` is already 
 
 ## Risks / prerequisites
 
-- **`webrtcdsp` not installed** (gst-plugins-bad `webrtc-audio-processing`).
-  Prereq install; absent → DSP toggles disabled, voice still works.
+- **DSP via the `webrtc-audio-processing` crate** adds a C++ build step (cmake +
+  clang, both present) and a PCM bridge (`appsink`→process→`appsrc`) that must
+  hold strict 10 ms / 48 kHz framing; mis-framing degrades AEC. Isolated in
+  `audio::dsp` with a round-trip unit test.
 - **Live source hot-swap** is the trickiest engine bit – isolated behind a
   pad-block helper, run-and-observe tested.
 - **Global PTT on X11** via `XGrabKey` can conflict if another app grabs the same
