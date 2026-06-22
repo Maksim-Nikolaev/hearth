@@ -3,6 +3,7 @@ use crate::audio::dsp::{DspConfig, NsLevel};
 use crate::audio::monitor::Monitor;
 use crate::audio::gate::{ActivationMode, Gate};
 use crate::encoders;
+use crate::hotkey::{keysym_from_name, PttGrab};
 use crate::flow::{Flow, VideoSink};
 use crate::flow_peer::{
     build_screen_send_branch, build_voice_send_branch, link_video_recv, link_voice_recv,
@@ -317,6 +318,9 @@ pub struct Session {
     dsp_config: DspConfig,
     input_device: Option<String>,
     output_device: Option<String>,
+    /// Active X11 global key grab for push-to-talk. Dropped (ungrab + thread
+    /// join) whenever the PTT key is cleared or changed.
+    ptt_grab: Option<PttGrab>,
     _client: Option<SignalingClient>,
 }
 
@@ -412,6 +416,7 @@ impl Session {
             dsp_config: default_dsp_config(),
             input_device: None,
             output_device: None,
+            ptt_grab: None,
             _client: Some(conn.client),
         };
 
@@ -622,6 +627,35 @@ impl Session {
         self.gate.lock().unwrap().set_ptt_held(held);
     }
 
+    /// Set (or clear) the global PTT key by name (e.g. `"F12"`, `"space"`).
+    ///
+    /// Passing `None` removes any existing grab. The grab is only meaningful
+    /// while the activation mode is `PushToTalk`; the gate's mode check still
+    /// applies on each press/release.
+    pub fn set_ptt_key(&mut self, key: Option<String>) {
+        // Drop the current grab (releases the X grab and joins the thread).
+        self.ptt_grab = None;
+
+        let Some(name) = key else { return };
+
+        let keysym = match keysym_from_name(&name) {
+            Some(k) => k,
+            None => {
+                self.emit(SessionEvent::Error(format!("unknown PTT key: {name}")));
+                return;
+            }
+        };
+
+        let gate = self.gate.clone();
+
+        match PttGrab::grab(keysym, move |held| {
+            gate.lock().unwrap().set_ptt_held(held);
+        }) {
+            Ok(grab) => self.ptt_grab = Some(grab),
+            Err(e) => self.emit(SessionEvent::Error(format!("PTT grab failed: {e}"))),
+        }
+    }
+
     /// Select the mic input device; restarts the running capture (brief blip).
     pub fn set_input_device(&mut self, dev: Option<String>) {
         self.input_device = dev;
@@ -792,6 +826,7 @@ mod tests {
                 dsp_config: default_dsp_config(),
                 input_device: None,
                 output_device: None,
+                ptt_grab: None,
                 _client: None,
             };
             (s, evt_rx)

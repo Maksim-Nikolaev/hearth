@@ -18,3 +18,4 @@ uuid = { version = "1", features = ["v7", "serde"] }
 base64 = "0.22"
 hearth-protocol = { path = "../protocol" }
 webrtc-audio-processing = { version = "0.3", features = ["bundled"] }
+x11rb = "0.13"
