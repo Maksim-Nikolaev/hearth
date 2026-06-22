@@ -1,0 +1,517 @@
+use crate::config::{ActivationKind, NsLevel, Settings};
+use crate::ui::meter::{Meter, MeterInput};
+use engine::audio::devices::{AudioDevice, DeviceKind};
+use gtk::glib::SignalHandlerId;
+use gtk::prelude::*;
+use relm4::prelude::*;
+
+// ── Output ────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub enum SettingsOutput {
+    InputDevice(Option<String>),
+    OutputDevice(Option<String>),
+    InputVolume(f64),
+    OutputVolume(f64),
+    NoiseSuppression(NsLevel),
+    EchoCancellation(bool),
+    Agc(bool),
+    Vad(bool),
+    InputSensitivity(f32),
+    Activation(ActivationKind),
+    PttKey(Option<String>),
+    MicTest(bool),
+}
+
+// ── Input ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum SettingsInput {
+    /// Populate device dropdowns from a fresh enumeration.
+    SetDevices(Vec<AudioDevice>),
+    /// Populate all controls from persisted settings.
+    SetSettings(Settings),
+    /// Forward a live input level reading to the embedded meter.
+    SetLevel(f32),
+}
+
+// ── Model ─────────────────────────────────────────────────────────────────────
+
+pub struct SettingsWindow {
+    settings: Settings,
+    mic_devices: Vec<AudioDevice>,
+    spk_devices: Vec<AudioDevice>,
+    meter: Controller<Meter>,
+    // Shared with the device-selection signal closures so repopulate can update
+    // the list without reconnecting the signal.
+    mic_devices_cell: std::rc::Rc<std::cell::RefCell<Vec<AudioDevice>>>,
+    spk_devices_cell: std::rc::Rc<std::cell::RefCell<Vec<AudioDevice>>>,
+}
+
+// ── Widget struct (named fields the macro generates) ─────────────────────────
+
+pub struct SettingsWindowWidgets {
+    mic_dropdown: gtk::DropDown,
+    spk_dropdown: gtk::DropDown,
+    input_vol_scale: gtk::Scale,
+    output_vol_scale: gtk::Scale,
+    sensitivity_scale: gtk::Scale,
+    ns_dropdown: gtk::DropDown,
+    ec_switch: gtk::Switch,
+    agc_switch: gtk::Switch,
+    vad_switch: gtk::Switch,
+    activation_dropdown: gtk::DropDown,
+    ptt_entry: gtk::Entry,
+    // Signal handler IDs – stored so programmatic updates can be blocked.
+    mic_selected_id: SignalHandlerId,
+    spk_selected_id: SignalHandlerId,
+    input_vol_id: SignalHandlerId,
+    output_vol_id: SignalHandlerId,
+    sensitivity_id: SignalHandlerId,
+    ns_selected_id: SignalHandlerId,
+    ec_active_id: SignalHandlerId,
+    agc_active_id: SignalHandlerId,
+    vad_active_id: SignalHandlerId,
+    activation_selected_id: SignalHandlerId,
+}
+
+// ── Component ─────────────────────────────────────────────────────────────────
+
+impl Component for SettingsWindow {
+    type Init = ();
+    type Input = SettingsInput;
+    type Output = SettingsOutput;
+    type CommandOutput = ();
+    type Root = gtk::Window;
+    type Widgets = SettingsWindowWidgets;
+
+    fn init_root() -> Self::Root {
+        gtk::Window::builder()
+            .title("Settings – Voice")
+            .default_width(520)
+            .default_height(620)
+            .hide_on_close(true)
+            .build()
+    }
+
+    fn init(
+        _init: Self::Init,
+        window: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let meter = Meter::builder().launch(()).detach();
+        let meter_widget = meter.widget().clone();
+
+        // ── Build the widget tree manually ────────────────────────────────────
+        let root_box = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(16)
+            .margin_top(20)
+            .margin_bottom(20)
+            .margin_start(20)
+            .margin_end(20)
+            .build();
+
+        window.set_child(Some(&root_box));
+
+        // Devices section
+        root_box.append(&section_label("DEVICES"));
+
+        let mic_dropdown = gtk::DropDown::from_strings(&["Default"]);
+        mic_dropdown.set_hexpand(true);
+        root_box.append(&hrow("Microphone", 140, &mic_dropdown));
+
+        let spk_dropdown = gtk::DropDown::from_strings(&["Default"]);
+        spk_dropdown.set_hexpand(true);
+        root_box.append(&hrow("Speaker", 140, &spk_dropdown));
+
+        // Volume section
+        root_box.append(&section_label("VOLUME"));
+
+        let input_vol_scale =
+            gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
+        input_vol_scale.set_hexpand(true);
+        input_vol_scale.set_draw_value(true);
+        input_vol_scale.set_value_pos(gtk::PositionType::Right);
+        input_vol_scale.set_value(1.0);
+        root_box.append(&hrow("Mic volume", 140, &input_vol_scale));
+
+        let output_vol_scale =
+            gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.05);
+        output_vol_scale.set_hexpand(true);
+        output_vol_scale.set_draw_value(true);
+        output_vol_scale.set_value_pos(gtk::PositionType::Right);
+        output_vol_scale.set_value(1.0);
+        root_box.append(&hrow("Speaker vol.", 140, &output_vol_scale));
+
+        // Mic test section
+        root_box.append(&section_label("MIC TEST"));
+
+        let mic_test_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .build();
+
+        let mic_test_btn = gtk::ToggleButton::with_label("Test Mic");
+        meter_widget.set_hexpand(true);
+        meter_widget.set_valign(gtk::Align::Center);
+        mic_test_row.append(&mic_test_btn);
+        mic_test_row.append(&meter_widget);
+        root_box.append(&mic_test_row);
+
+        // Input sensitivity
+        let sensitivity_scale =
+            gtk::Scale::with_range(gtk::Orientation::Horizontal, -60.0, 0.0, 1.0);
+        sensitivity_scale.set_hexpand(true);
+        sensitivity_scale.set_draw_value(true);
+        sensitivity_scale.set_value_pos(gtk::PositionType::Right);
+        sensitivity_scale.set_value(-40.0);
+        root_box.append(&hrow("Sensitivity (dB)", 140, &sensitivity_scale));
+
+        // DSP section
+        root_box.append(&section_label("AUDIO PROCESSING"));
+
+        let ns_dropdown =
+            gtk::DropDown::from_strings(&["Off", "Low", "Moderate", "High"]);
+        ns_dropdown.set_selected(2); // Moderate default
+        root_box.append(&hrow("Noise suppression", 180, &ns_dropdown));
+
+        let ec_switch = gtk::Switch::new();
+        ec_switch.set_active(true);
+        root_box.append(&hrow("Echo cancellation", 180, &ec_switch));
+
+        let agc_switch = gtk::Switch::new();
+        agc_switch.set_active(true);
+        root_box.append(&hrow("Auto gain control", 180, &agc_switch));
+
+        let vad_switch = gtk::Switch::new();
+        vad_switch.set_active(true);
+        root_box.append(&hrow("Voice activity det.", 180, &vad_switch));
+
+        // Activation section
+        root_box.append(&section_label("ACTIVATION"));
+
+        let activation_dropdown =
+            gtk::DropDown::from_strings(&["Voice activity", "Push-to-talk", "Always on"]);
+        root_box.append(&hrow("Mode", 140, &activation_dropdown));
+
+        let ptt_entry = gtk::Entry::builder()
+            .placeholder_text("e.g. F12")
+            .hexpand(true)
+            .build();
+        root_box.append(&hrow("PTT key", 140, &ptt_entry));
+
+        // ── Wire signals (once; handler IDs stored for block/unblock) ─────────
+
+        // Device dropdowns – the closure captures a shared cell so repopulate can
+        // swap the device list without reconnecting the signal.
+        let mic_devices_cell: std::rc::Rc<std::cell::RefCell<Vec<AudioDevice>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let spk_devices_cell: std::rc::Rc<std::cell::RefCell<Vec<AudioDevice>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+
+        let mic_selected_id = {
+            let s = sender.clone();
+            let cell = mic_devices_cell.clone();
+            mic_dropdown.connect_selected_notify(move |dd| {
+                let idx = dd.selected() as usize;
+                let id = if idx == 0 {
+                    None
+                } else {
+                    cell.borrow().get(idx - 1).map(|d| d.id.clone())
+                };
+                let _ = s.output(SettingsOutput::InputDevice(id));
+            })
+        };
+
+        let spk_selected_id = {
+            let s = sender.clone();
+            let cell = spk_devices_cell.clone();
+            spk_dropdown.connect_selected_notify(move |dd| {
+                let idx = dd.selected() as usize;
+                let id = if idx == 0 {
+                    None
+                } else {
+                    cell.borrow().get(idx - 1).map(|d| d.id.clone())
+                };
+                let _ = s.output(SettingsOutput::OutputDevice(id));
+            })
+        };
+
+        let input_vol_id = {
+            let s = sender.clone();
+            input_vol_scale.connect_value_changed(move |sc| {
+                let _ = s.output(SettingsOutput::InputVolume(sc.value()));
+            })
+        };
+
+        let output_vol_id = {
+            let s = sender.clone();
+            output_vol_scale.connect_value_changed(move |sc| {
+                let _ = s.output(SettingsOutput::OutputVolume(sc.value()));
+            })
+        };
+
+        {
+            let s = sender.clone();
+            mic_test_btn.connect_toggled(move |b| {
+                let _ = s.output(SettingsOutput::MicTest(b.is_active()));
+            });
+        }
+
+        let sensitivity_id = {
+            let s = sender.clone();
+            sensitivity_scale.connect_value_changed(move |sc| {
+                let _ = s.output(SettingsOutput::InputSensitivity(sc.value() as f32));
+            })
+        };
+
+        let ns_selected_id = {
+            let s = sender.clone();
+            ns_dropdown.connect_selected_notify(move |dd| {
+                let level = match dd.selected() {
+                    0 => NsLevel::Off,
+                    1 => NsLevel::Low,
+                    2 => NsLevel::Moderate,
+                    _ => NsLevel::High,
+                };
+                let _ = s.output(SettingsOutput::NoiseSuppression(level));
+            })
+        };
+
+        let ec_active_id = {
+            let s = sender.clone();
+            ec_switch.connect_active_notify(move |sw| {
+                let _ = s.output(SettingsOutput::EchoCancellation(sw.is_active()));
+            })
+        };
+
+        let agc_active_id = {
+            let s = sender.clone();
+            agc_switch.connect_active_notify(move |sw| {
+                let _ = s.output(SettingsOutput::Agc(sw.is_active()));
+            })
+        };
+
+        let vad_active_id = {
+            let s = sender.clone();
+            vad_switch.connect_active_notify(move |sw| {
+                let _ = s.output(SettingsOutput::Vad(sw.is_active()));
+            })
+        };
+
+        let activation_selected_id = {
+            let s = sender.clone();
+            activation_dropdown.connect_selected_notify(move |dd| {
+                let kind = match dd.selected() {
+                    0 => ActivationKind::Voice,
+                    1 => ActivationKind::PushToTalk,
+                    _ => ActivationKind::AlwaysOn,
+                };
+                let _ = s.output(SettingsOutput::Activation(kind));
+            })
+        };
+
+        {
+            let s = sender.clone();
+            ptt_entry.connect_changed(move |e| {
+                let text = e.text().to_string();
+                let key = if text.is_empty() { None } else { Some(text) };
+                let _ = s.output(SettingsOutput::PttKey(key));
+            });
+        }
+
+        let model = SettingsWindow {
+            settings: Settings::default(),
+            mic_devices: Vec::new(),
+            spk_devices: Vec::new(),
+            meter,
+            mic_devices_cell,
+            spk_devices_cell,
+        };
+
+        let widgets = SettingsWindowWidgets {
+            mic_dropdown,
+            spk_dropdown,
+            input_vol_scale,
+            output_vol_scale,
+            sensitivity_scale,
+            ns_dropdown,
+            ec_switch,
+            agc_switch,
+            vad_switch,
+            activation_dropdown,
+            ptt_entry,
+            mic_selected_id,
+            spk_selected_id,
+            input_vol_id,
+            output_vol_id,
+            sensitivity_id,
+            ns_selected_id,
+            ec_active_id,
+            agc_active_id,
+            vad_active_id,
+            activation_selected_id,
+        };
+
+        ComponentParts { model, widgets }
+    }
+
+    fn update_with_view(
+        &mut self,
+        widgets: &mut Self::Widgets,
+        msg: Self::Input,
+        _sender: ComponentSender<Self>,
+        _root: &Self::Root,
+    ) {
+        match msg {
+            SettingsInput::SetDevices(devices) => {
+                self.mic_devices = devices.iter()
+                    .filter(|d| d.kind == DeviceKind::Source)
+                    .cloned()
+                    .collect();
+
+                self.spk_devices = devices.iter()
+                    .filter(|d| d.kind == DeviceKind::Sink)
+                    .cloned()
+                    .collect();
+
+                self.repopulate_dropdowns(widgets);
+            }
+
+            SettingsInput::SetSettings(s) => {
+                self.settings = s.clone();
+                self.apply_settings_to_widgets(widgets, &s);
+            }
+
+            SettingsInput::SetLevel(db) => {
+                let _ = self.meter.sender().send(MeterInput::SetLevel(db));
+            }
+        }
+    }
+
+    fn update(
+        &mut self,
+        _msg: Self::Input,
+        _sender: ComponentSender<Self>,
+        _root: &Self::Root,
+    ) {
+        // All logic is in update_with_view; this is a no-op required by the trait.
+    }
+}
+
+impl SettingsWindow {
+    /// Rebuild the mic/speaker `StringList` models and restore the saved selection.
+    /// The selection signals are blocked during all programmatic writes to prevent
+    /// spurious outputs.
+    fn repopulate_dropdowns(&self, widgets: &mut SettingsWindowWidgets) {
+        let mic_labels: Vec<&str> = std::iter::once("Default")
+            .chain(self.mic_devices.iter().map(|d| d.label.as_str()))
+            .collect();
+
+        let spk_labels: Vec<&str> = std::iter::once("Default")
+            .chain(self.spk_devices.iter().map(|d| d.label.as_str()))
+            .collect();
+
+        let mic_idx = self.settings.input_device
+            .as_deref()
+            .and_then(|id| self.mic_devices.iter().position(|d| d.id == id))
+            .map(|i| i + 1)
+            .unwrap_or(0) as u32;
+
+        let spk_idx = self.settings.output_device
+            .as_deref()
+            .and_then(|id| self.spk_devices.iter().position(|d| d.id == id))
+            .map(|i| i + 1)
+            .unwrap_or(0) as u32;
+
+        // Update the device lists read by the live signal closures.
+        *self.mic_devices_cell.borrow_mut() = self.mic_devices.clone();
+        *self.spk_devices_cell.borrow_mut() = self.spk_devices.clone();
+
+        // Block signals so set_model / set_selected do not emit outputs.
+        widgets.mic_dropdown.block_signal(&widgets.mic_selected_id);
+        widgets.spk_dropdown.block_signal(&widgets.spk_selected_id);
+
+        widgets.mic_dropdown.set_model(Some(&gtk::StringList::new(&mic_labels)));
+        widgets.spk_dropdown.set_model(Some(&gtk::StringList::new(&spk_labels)));
+        widgets.mic_dropdown.set_selected(mic_idx);
+        widgets.spk_dropdown.set_selected(spk_idx);
+
+        widgets.mic_dropdown.unblock_signal(&widgets.mic_selected_id);
+        widgets.spk_dropdown.unblock_signal(&widgets.spk_selected_id);
+    }
+
+    /// Sync every non-device-dropdown widget to the given settings snapshot.
+    /// All signals are blocked so loading saved settings emits no outputs.
+    fn apply_settings_to_widgets(&self, widgets: &mut SettingsWindowWidgets, s: &Settings) {
+        widgets.input_vol_scale.block_signal(&widgets.input_vol_id);
+        widgets.output_vol_scale.block_signal(&widgets.output_vol_id);
+        widgets.sensitivity_scale.block_signal(&widgets.sensitivity_id);
+        widgets.ns_dropdown.block_signal(&widgets.ns_selected_id);
+        widgets.ec_switch.block_signal(&widgets.ec_active_id);
+        widgets.agc_switch.block_signal(&widgets.agc_active_id);
+        widgets.vad_switch.block_signal(&widgets.vad_active_id);
+        widgets.activation_dropdown.block_signal(&widgets.activation_selected_id);
+
+        widgets.input_vol_scale.set_value(s.input_volume);
+        widgets.output_vol_scale.set_value(s.output_volume);
+        widgets.sensitivity_scale.set_value(s.input_sensitivity as f64);
+
+        let ns_idx = match s.noise_suppression {
+            NsLevel::Off => 0,
+            NsLevel::Low => 1,
+            NsLevel::Moderate => 2,
+            NsLevel::High => 3,
+        };
+        widgets.ns_dropdown.set_selected(ns_idx);
+
+        widgets.ec_switch.set_active(s.echo_cancellation);
+        widgets.agc_switch.set_active(s.agc);
+        widgets.vad_switch.set_active(s.vad);
+
+        let act_idx = match s.activation {
+            ActivationKind::Voice => 0,
+            ActivationKind::PushToTalk => 1,
+            ActivationKind::AlwaysOn => 2,
+        };
+        widgets.activation_dropdown.set_selected(act_idx);
+
+        widgets.ptt_entry.set_text(s.ptt_key.as_deref().unwrap_or(""));
+
+        widgets.input_vol_scale.unblock_signal(&widgets.input_vol_id);
+        widgets.output_vol_scale.unblock_signal(&widgets.output_vol_id);
+        widgets.sensitivity_scale.unblock_signal(&widgets.sensitivity_id);
+        widgets.ns_dropdown.unblock_signal(&widgets.ns_selected_id);
+        widgets.ec_switch.unblock_signal(&widgets.ec_active_id);
+        widgets.agc_switch.unblock_signal(&widgets.agc_active_id);
+        widgets.vad_switch.unblock_signal(&widgets.vad_active_id);
+        widgets.activation_dropdown.unblock_signal(&widgets.activation_selected_id);
+    }
+}
+
+// ── Layout helpers ────────────────────────────────────────────────────────────
+
+fn section_label(text: &str) -> gtk::Label {
+    let l = gtk::Label::new(Some(text));
+    l.set_xalign(0.0);
+    l.add_css_class("section-header");
+    l
+}
+
+/// A horizontal row with a fixed-width label on the left and a widget on the right.
+fn hrow(label: &str, label_width: i32, widget: &impl IsA<gtk::Widget>) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(8)
+        .build();
+
+    let lbl = gtk::Label::new(Some(label));
+    lbl.set_width_request(label_width);
+    lbl.set_xalign(0.0);
+
+    row.append(&lbl);
+    row.append(widget);
+
+    row
+}

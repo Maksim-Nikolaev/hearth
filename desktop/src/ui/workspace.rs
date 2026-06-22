@@ -59,6 +59,7 @@ pub enum WorkspaceInput {
     Share(bool),
     SelectSharer(Uuid),
     SendChat(String),
+    OpenSettings,
 }
 
 #[derive(Debug)]
@@ -70,6 +71,7 @@ pub enum WorkspaceOutput {
     StartShare,
     StopShare,
     SendChat(String),
+    OpenSettings,
 }
 
 #[relm4::component(pub)]
@@ -145,6 +147,7 @@ impl SimpleComponent for Workspace {
                 SelfPanelOutput::Mute(b) => WorkspaceInput::Mute(b),
                 SelfPanelOutput::Deafen(b) => WorkspaceInput::Deafen(b),
                 SelfPanelOutput::Share(b) => WorkspaceInput::Share(b),
+                SelfPanelOutput::OpenSettings => WorkspaceInput::OpenSettings,
             });
 
         let members = Members::builder().launch(()).detach();
@@ -256,6 +259,9 @@ impl SimpleComponent for Workspace {
                 } else {
                     WorkspaceOutput::StopShare
                 });
+            }
+            WorkspaceInput::OpenSettings => {
+                let _ = sender.output(WorkspaceOutput::OpenSettings);
             }
         }
 

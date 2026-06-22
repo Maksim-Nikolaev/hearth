@@ -1,6 +1,10 @@
-use crate::config::Config;
+use crate::config::{ActivationKind, Config, NsLevel};
 use crate::ui::login::{LoginForm, LoginInput, LoginOutput};
+use crate::ui::settings::{SettingsInput, SettingsOutput, SettingsWindow};
 use crate::ui::workspace::{Screens, Workspace, WorkspaceInput, WorkspaceOutput};
+use engine::audio::devices::list_devices;
+use engine::audio::dsp::{DspConfig, NsLevel as EngineNsLevel};
+use engine::audio::gate::ActivationMode;
 use engine::flow::VideoSink;
 use engine::session::{Connection, Presence, Session, SessionEvent};
 use gtk::prelude::*;
@@ -25,12 +29,14 @@ pub struct AppModel {
     screens: Screens,
     login: Controller<LoginForm>,
     workspace: Controller<Workspace>,
+    settings_window: Controller<SettingsWindow>,
 }
 
 #[derive(Debug)]
 pub enum AppMsg {
     Login { username: String, password: String },
     Workspace(WorkspaceOutput),
+    Settings(SettingsOutput),
 }
 
 /// Async/command results. Manual `Debug` because `Connection` is opaque.
@@ -114,6 +120,10 @@ impl Component for AppModel {
             .launch(screens.clone())
             .forward(sender.input_sender(), AppMsg::Workspace);
 
+        let settings_window = SettingsWindow::builder()
+            .launch(())
+            .forward(sender.input_sender(), AppMsg::Settings);
+
         let model = AppModel {
             config,
             title,
@@ -122,6 +132,7 @@ impl Component for AppModel {
             screens,
             login,
             workspace,
+            settings_window,
         };
 
         let login_widget = model.login.widget();
@@ -148,17 +159,35 @@ impl Component for AppModel {
                 });
             }
             AppMsg::Workspace(out) => {
-                if let Some(s) = self.session.as_mut() {
-                    match out {
-                        WorkspaceOutput::JoinVoice => s.join_voice(),
-                        WorkspaceOutput::LeaveVoice => s.leave_voice(),
-                        WorkspaceOutput::Mute(b) => s.mute(b),
-                        WorkspaceOutput::Deafen(b) => s.deafen(b),
-                        WorkspaceOutput::StartShare => s.start_share(engine::screen::ShareConfig::default()),
-                        WorkspaceOutput::StopShare => s.stop_share(),
-                        WorkspaceOutput::SendChat(body) => s.send_chat(&body),
+                match out {
+                    WorkspaceOutput::OpenSettings => {
+                        let saved = self.config.load_settings();
+                        let _ = self.settings_window.sender().send(
+                            SettingsInput::SetDevices(list_devices()),
+                        );
+                        let _ = self.settings_window.sender().send(
+                            SettingsInput::SetSettings(saved),
+                        );
+                        self.settings_window.widget().present();
+                    }
+                    out => {
+                        if let Some(s) = self.session.as_mut() {
+                            match out {
+                                WorkspaceOutput::JoinVoice => s.join_voice(),
+                                WorkspaceOutput::LeaveVoice => s.leave_voice(),
+                                WorkspaceOutput::Mute(b) => s.mute(b),
+                                WorkspaceOutput::Deafen(b) => s.deafen(b),
+                                WorkspaceOutput::StartShare => s.start_share(engine::screen::ShareConfig::default()),
+                                WorkspaceOutput::StopShare => s.stop_share(),
+                                WorkspaceOutput::SendChat(body) => s.send_chat(&body),
+                                WorkspaceOutput::OpenSettings => unreachable!(),
+                            }
+                        }
                     }
                 }
+            }
+            AppMsg::Settings(out) => {
+                self.apply_settings_output(out);
             }
         }
     }
@@ -168,13 +197,17 @@ impl Component for AppModel {
             Cmd::Opened(conn) => {
                 self.config.save_token(conn.token());
 
-                let (session, mut inbound, mut events) = Session::start(conn, VideoSink::Paintable);
+                let (mut session, mut inbound, mut events) = Session::start(conn, VideoSink::Paintable);
                 session.join("main");
 
                 let _ = self.workspace.sender().send(WorkspaceInput::SetSelf {
                     id: session.self_id(),
                     username: session.self_name().to_string(),
                 });
+
+                // Apply persisted audio settings so saved prefs take effect on connect.
+                let saved = self.config.load_settings();
+                Self::apply_settings_to_session(&mut session, &saved);
 
                 self.session = Some(session);
                 self.screen = Screen::Workspace;
@@ -266,9 +299,9 @@ impl AppModel {
                     }
                 }
             }
-            // The input meter UI lands in Task 10; for now the level is observed
-            // only in the engine (it already feeds the gate there).
-            SessionEvent::InputLevel(_) => {}
+            SessionEvent::InputLevel(db) => {
+                let _ = self.settings_window.sender().send(SettingsInput::SetLevel(db));
+            }
             SessionEvent::FlowState { .. } | SessionEvent::Error(_) => {}
         }
     }
@@ -279,5 +312,62 @@ impl AppModel {
             Screen::Connecting => "connecting",
             Screen::Workspace => "workspace",
         }
+    }
+
+    /// Persist a settings change and, if connected, apply it to the live session.
+    fn apply_settings_output(&mut self, out: SettingsOutput) {
+        let mut settings = self.config.load_settings();
+
+        match out {
+            SettingsOutput::InputDevice(id) => settings.input_device = id,
+            SettingsOutput::OutputDevice(id) => settings.output_device = id,
+            SettingsOutput::InputVolume(v) => settings.input_volume = v,
+            SettingsOutput::OutputVolume(v) => settings.output_volume = v,
+            SettingsOutput::NoiseSuppression(ns) => settings.noise_suppression = ns,
+            SettingsOutput::EchoCancellation(b) => settings.echo_cancellation = b,
+            SettingsOutput::Agc(b) => settings.agc = b,
+            SettingsOutput::Vad(b) => settings.vad = b,
+            SettingsOutput::InputSensitivity(db) => settings.input_sensitivity = db,
+            SettingsOutput::Activation(a) => settings.activation = a,
+            SettingsOutput::PttKey(k) => settings.ptt_key = k,
+            SettingsOutput::MicTest(on) => {
+                if let Some(s) = self.session.as_mut() {
+                    if on { s.start_mic_test() } else { s.stop_mic_test() }
+                }
+                return; // mic-test is not persisted
+            }
+        }
+
+        self.config.save_settings(&settings);
+
+        if let Some(s) = self.session.as_mut() {
+            Self::apply_settings_to_session(s, &settings);
+        }
+    }
+
+    /// Push all audio-relevant settings to a live `Session`.
+    fn apply_settings_to_session(session: &mut Session, s: &crate::config::Settings) {
+        session.set_dsp(DspConfig {
+            echo_cancel: s.echo_cancellation,
+            noise_suppression: match s.noise_suppression {
+                NsLevel::Off => EngineNsLevel::Off,
+                NsLevel::Low => EngineNsLevel::Low,
+                NsLevel::Moderate => EngineNsLevel::Moderate,
+                NsLevel::High => EngineNsLevel::High,
+            },
+            agc: s.agc,
+            vad: s.vad,
+            high_pass: true,
+        });
+
+        session.set_activation(match s.activation {
+            ActivationKind::Voice => ActivationMode::Voice { threshold: s.input_sensitivity },
+            ActivationKind::PushToTalk => ActivationMode::PushToTalk,
+            ActivationKind::AlwaysOn => ActivationMode::AlwaysOn,
+        });
+
+        session.set_input_device(s.input_device.clone());
+        session.set_output_device(s.output_device.clone());
+        session.set_ptt_key(s.ptt_key.clone());
     }
 }

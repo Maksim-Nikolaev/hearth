@@ -436,6 +436,8 @@ dependencies = [
  "hearth-protocol",
  "keyring",
  "relm4",
+ "serde",
+ "serde_json",
  "tokio",
  "uuid",
 ]

@@ -16,6 +16,7 @@ pub enum SelfPanelOutput {
     Mute(bool),
     Deafen(bool),
     Share(bool),
+    OpenSettings,
 }
 
 #[relm4::component(pub)]
@@ -60,6 +61,13 @@ impl SimpleComponent for SelfPanel {
                 set_label: "Share screen",
                 connect_toggled[sender] => move |b| {
                     let _ = sender.output(SelfPanelOutput::Share(b.is_active()));
+                },
+            },
+
+            gtk::Button {
+                set_label: "Settings",
+                connect_clicked[sender] => move |_| {
+                    let _ = sender.output(SelfPanelOutput::OpenSettings);
                 },
             },
         }
