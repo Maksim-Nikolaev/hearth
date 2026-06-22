@@ -390,6 +390,11 @@ impl Session {
                     p.add_ice(mline, &candidate);
                 }
             }
+            ServerMessage::VoiceState { .. }
+            | ServerMessage::VoiceJoined { .. }
+            | ServerMessage::VoiceLeft { .. }
+            | ServerMessage::ShareStarted { .. }
+            | ServerMessage::ShareStopped { .. } => {}
         }
     }
 

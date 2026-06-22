@@ -359,6 +359,11 @@ fn handle_signal(
         }
         ServerMessage::PeerLeft { .. } => {}
         ServerMessage::Chat { .. } | ServerMessage::ChatHistory { .. } => {}
+        ServerMessage::VoiceState { .. }
+        | ServerMessage::VoiceJoined { .. }
+        | ServerMessage::VoiceLeft { .. }
+        | ServerMessage::ShareStarted { .. }
+        | ServerMessage::ShareStopped { .. } => {}
     }
 }
 

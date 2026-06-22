@@ -37,6 +37,10 @@ pub enum ClientMessage {
     Ice { to: Uuid, flow: Flow, mline: u32, candidate: String },
     Chat { body: String },
     Leave,
+    VoiceJoin,
+    VoiceLeave,
+    ShareStart,
+    ShareStop,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -50,6 +54,11 @@ pub enum ServerMessage {
     Ice { from: Uuid, flow: Flow, mline: u32, candidate: String },
     Chat { from: Uuid, username: String, body: String, at: i64 },
     ChatHistory { messages: Vec<ChatEntry> },
+    VoiceState { members: Vec<PeerInfo> },
+    VoiceJoined { user: Uuid, username: String },
+    VoiceLeft { user: Uuid },
+    ShareStarted { user: Uuid },
+    ShareStopped { user: Uuid },
 }
 
 #[cfg(test)]
@@ -90,6 +99,22 @@ mod tests {
 
         assert_eq!(msg, back);
         assert!(json.contains("\"flow\":\"screen\""));
+    }
+
+    #[test]
+    fn voice_and_share_round_trip() {
+        let id = Uuid::now_v7();
+        for msg in [
+            ServerMessage::VoiceJoined { user: id, username: "a".into() },
+            ServerMessage::VoiceLeft { user: id },
+            ServerMessage::ShareStarted { user: id },
+            ServerMessage::ShareStopped { user: id },
+        ] {
+            let j = serde_json::to_string(&msg).unwrap();
+            assert_eq!(msg, serde_json::from_str::<ServerMessage>(&j).unwrap());
+        }
+        let cm = ClientMessage::VoiceJoin;
+        assert_eq!(cm, serde_json::from_str::<ClientMessage>(&serde_json::to_string(&cm).unwrap()).unwrap());
     }
 
     #[test]

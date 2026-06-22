@@ -102,5 +102,9 @@ async fn dispatch(state: &AppState, from: uuid::Uuid, msg: crate::signaling::mes
             }
         }
         ClientMessage::Leave => state.signaling.leave_room(from),
+        ClientMessage::VoiceJoin => {}
+        ClientMessage::VoiceLeave => {}
+        ClientMessage::ShareStart => {}
+        ClientMessage::ShareStop => {}
     }
 }
