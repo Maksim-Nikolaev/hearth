@@ -18,4 +18,11 @@ uuid = { version = "1", features = ["v7", "serde"] }
 base64 = "0.22"
 hearth-protocol = { path = "../protocol" }
 webrtc-audio-processing = { version = "0.3", features = ["bundled"] }
-x11rb = "0.13"
+x11rb = { version = "0.13", features = ["composite", "xfixes", "randr"] }
+
+# Spike-only: the X11 GPU-capture feasibility example (engine/examples/).
+# Kept out of the shipped library build.
+[dev-dependencies]
+khronos-egl = { version = "6", features = ["dynamic"] }
+gstreamer-allocators = "0.23"
+libloading = "0.8"
