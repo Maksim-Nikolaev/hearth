@@ -26,6 +26,8 @@ pub struct ShareConfig {
     /// Desired frame rate. `ContentType::Clarity` silently caps this at 15.
     pub fps: u32,
     pub content: ContentType,
+    /// Optional audio source to capture alongside the video track.
+    pub audio: crate::screen::audio::ShareAudio,
 }
 
 impl Default for ShareConfig {
@@ -36,6 +38,7 @@ impl Default for ShareConfig {
             height: 1080,
             fps: 30,
             content: ContentType::Smoothness,
+            audio: crate::screen::audio::ShareAudio::None,
         }
     }
 }

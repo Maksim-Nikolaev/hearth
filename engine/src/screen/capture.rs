@@ -61,6 +61,7 @@ mod tests {
             height: 1080,
             fps: 60,
             content: ContentType::Smoothness,
+            ..Default::default()
         };
         let chain = capture_chain(&cfg);
 
@@ -77,6 +78,7 @@ mod tests {
             height: 720,
             fps: 30,
             content: ContentType::Clarity,
+            ..Default::default()
         };
         let chain = capture_chain(&cfg);
 
@@ -91,6 +93,7 @@ mod tests {
             height: 1080,
             fps: 60,
             content: ContentType::Clarity,
+            ..Default::default()
         };
         let chain = capture_chain(&cfg);
 
@@ -106,6 +109,7 @@ mod tests {
             height: 720,
             fps: 30,
             content: ContentType::Smoothness,
+            ..Default::default()
         };
         let chain = capture_chain(&cfg);
 

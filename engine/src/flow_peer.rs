@@ -96,7 +96,7 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
             Flow::Screen => {
                 let encoder = encoders::detect().0.unwrap_or("x265enc");
                 let chain = capture::capture_chain();
-                build_screen_send_branch(&pipeline, &webrtc, encoder, &chain)?;
+                build_screen_send_branch(&pipeline, &webrtc, encoder, &chain, None)?;
             }
             Flow::Voice => {
                 build_voice_send_branch(&pipeline, &webrtc)?;
@@ -125,7 +125,8 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
         Some(Arc::new(s))
     };
 
-    // Incoming media (answerer): the flow fixes the media type, so no caps-sniffing.
+    // Incoming media (answerer): demux by caps so screen flows handle both the
+    // video track and the optional audio track (payload 98).
     let pipeline_weak = pipeline.downgrade();
     let flow = cfg.flow;
     let vsink = video_sink.clone();
@@ -139,6 +140,21 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
 
         match flow {
             Flow::Voice => link_voice_recv(&pipeline, pad),
+            Flow::Screen => {
+                // Distinguish the audio track from the video track by caps.
+                let is_audio = pad
+                    .current_caps()
+                    .as_ref()
+                    .and_then(|c| c.structure(0))
+                    .map(|s| s.get::<&str>("media").map(|m| m == "audio").unwrap_or(false))
+                    .unwrap_or(false);
+
+                if is_audio {
+                    link_screen_audio_recv(&pipeline, pad);
+                } else if let Some(vsink) = vsink.as_ref() {
+                    link_video_recv(&pipeline, pad, vsink);
+                }
+            }
             _ => {
                 if let Some(vsink) = vsink.as_ref() {
                     link_video_recv(&pipeline, pad, vsink);
@@ -200,11 +216,16 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
 /// `capture::capture_chain()` for the legacy/standalone path. The chain must
 /// already embed a `video/x-raw` capsfilter so the encoder receives a known
 /// format.
+///
+/// `audio_chain` is an optional string for the audio source chain produced by
+/// `screen::screen_audio_chain`. When `Some`, a second audio media is added to
+/// the same `webrtcbin` at payload type 98 (distinct from voice at 97).
 pub(crate) fn build_screen_send_branch(
     pipeline: &gst::Pipeline,
     webrtc: &gst::Element,
     encoder: &str,
     chain: &str,
+    audio_chain: Option<&str>,
 ) -> Result<()> {
     let cap = gst::parse::bin_from_description(chain, true)?;
 
@@ -230,7 +251,69 @@ pub(crate) fn build_screen_send_branch(
     gst::Element::link_many([cap.upcast_ref(), &enc, &parse, &pay, &caps])?;
     caps.link(webrtc)?;
 
+    if let Some(achain) = audio_chain {
+        build_screen_audio_send_branch(pipeline, webrtc, achain)?;
+    }
+
     Ok(())
+}
+
+/// Add a second audio media track to an existing screen `webrtcbin`.
+///
+/// Uses payload type 98 to avoid clashing with voice (97). No DSP is applied:
+/// the captured audio is encoded directly to Opus and sent raw.
+fn build_screen_audio_send_branch(
+    pipeline: &gst::Pipeline,
+    webrtc: &gst::Element,
+    audio_chain: &str,
+) -> Result<()> {
+    let src_bin = gst::parse::bin_from_description(audio_chain, true)?;
+
+    let pay = gst::ElementFactory::make("rtpopuspay").build()?;
+    let caps = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gst::Caps::builder("application/x-rtp")
+                .field("media", "audio")
+                .field("encoding-name", "OPUS")
+                .field("payload", 98i32)
+                .build(),
+        )
+        .build()?;
+
+    pipeline.add_many([src_bin.upcast_ref(), &pay, &caps])?;
+    gst::Element::link_many([src_bin.upcast_ref(), &pay, &caps])?;
+    caps.link(webrtc)?;
+
+    Ok(())
+}
+
+/// Link an incoming screenshare audio pad (OPUS, payload 98) to an audio sink.
+///
+/// Used by the screen answerer to play the sharer's captured system/app audio.
+/// Distinct from the voice recv chain: no DSP, no valve, direct to `autoaudiosink`.
+pub(crate) fn link_screen_audio_recv(pipeline: &gst::Pipeline, pad: &gst::Pad) {
+    let depay = gst::ElementFactory::make("rtpopusdepay").build().unwrap();
+    let dec = gst::ElementFactory::make("opusdec").build().unwrap();
+    let conv = gst::ElementFactory::make("audioconvert").build().unwrap();
+    let resample = gst::ElementFactory::make("audioresample").build().unwrap();
+    let sink = gst::ElementFactory::make("autoaudiosink").property("sync", false).build().unwrap();
+
+    pipeline.add_many([&depay, &dec, &conv, &resample, &sink]).unwrap();
+    gst::Element::link_many([&depay, &dec, &conv, &resample, &sink]).unwrap();
+
+    for e in [&depay, &dec, &conv, &resample, &sink] {
+        e.sync_state_with_parent().unwrap();
+    }
+
+    let sink_pad = depay.static_pad("sink").unwrap();
+
+    if let Err(e) = pad.link(&sink_pad) {
+        eprintln!("screen audio pad link failed: {e}");
+        return;
+    }
+
+    eprintln!("incoming screen audio linked -> playing");
 }
 
 pub(crate) fn link_video_recv(pipeline: &gst::Pipeline, pad: &gst::Pad, vsink: &gst::Element) {

@@ -1,0 +1,282 @@
+use std::process::Command;
+
+/// Which audio source to capture alongside the screenshare, if any.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ShareAudio {
+    /// No audio track is sent with the screenshare.
+    #[default]
+    None,
+    /// Capture the default PulseAudio/PipeWire sink monitor (system output).
+    System,
+    /// Capture a specific PipeWire application node by its node name.
+    App { node: String },
+}
+
+/// A PipeWire audio node suitable for per-app capture.
+#[derive(Debug, Clone)]
+pub struct AudioNode {
+    /// Node name (pass to `pipewiresrc target-object=`).
+    pub node: String,
+    /// Human-readable label (application name or description).
+    pub label: String,
+}
+
+/// Raw properties of a PipeWire node, as parsed from `pw-dump`.
+#[derive(Debug, Clone)]
+pub struct NodeProps {
+    pub pid: u32,
+    pub media_class: String,
+    pub virtual_node: bool,
+}
+
+/// Filtering options for [`keep_node`].
+#[derive(Debug, Clone)]
+pub struct NodeFilter {
+    /// Drop nodes whose `media.class` contains `"Input"`.
+    pub ignore_input: bool,
+    /// Drop virtual nodes (loopbacks, network sinks, etc.).
+    pub ignore_virtual: bool,
+    /// Drop device-level nodes (not application streams).
+    pub ignore_devices: bool,
+    /// Reserved: not yet enforced by [`keep_node`]. Determining which nodes are
+    /// speaker-routed requires routing graph info not currently captured from
+    /// `pw-dump`.
+    pub only_speakers: bool,
+}
+
+impl Default for NodeFilter {
+    fn default() -> Self {
+        Self {
+            ignore_input: true,
+            ignore_virtual: false,
+            ignore_devices: true,
+            only_speakers: true,
+        }
+    }
+}
+
+impl NodeFilter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Returns `true` when the node should be included in the listing.
+///
+/// Always excludes the process with `own_pid` to prevent a feedback loop when
+/// the sharer's own renderer appears as a capturable node.
+pub(crate) fn keep_node(props: &NodeProps, own_pid: u32, filt: &NodeFilter) -> bool {
+    if props.pid == own_pid {
+        return false;
+    }
+
+    if filt.ignore_input && props.media_class.contains("Input") {
+        return false;
+    }
+
+    if filt.ignore_virtual && props.virtual_node {
+        return false;
+    }
+
+    true
+}
+
+/// Returns `true` when PipeWire is available at runtime (the `pipewiresrc`
+/// GStreamer plugin factory can be found).
+pub fn has_pipewire() -> bool {
+    gstreamer::ElementFactory::find("pipewiresrc").is_some()
+}
+
+/// List PipeWire application audio output nodes, excluding our own process.
+///
+/// Returns an empty `Vec` when PipeWire is not available or `pw-dump` fails.
+pub fn list_app_nodes() -> Vec<AudioNode> {
+    if !has_pipewire() {
+        return Vec::new();
+    }
+
+    list_app_nodes_inner().unwrap_or_default()
+}
+
+fn list_app_nodes_inner() -> Option<Vec<AudioNode>> {
+    let own_pid = std::process::id();
+    let output = Command::new("pw-dump").output().ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let filt = NodeFilter::default();
+
+    Some(parse_nodes(&json, own_pid, &filt))
+}
+
+/// Parse a `pw-dump` JSON value (top-level array) into a list of audio nodes.
+///
+/// Non-node entries (links, factories, devices, etc.) are skipped rather than
+/// aborting the parse, so the returned `Vec` reflects all valid nodes found.
+pub(crate) fn parse_nodes(json: &serde_json::Value, own_pid: u32, filt: &NodeFilter) -> Vec<AudioNode> {
+    let Some(arr) = json.as_array() else {
+        return Vec::new();
+    };
+
+    let mut nodes = Vec::new();
+
+    for item in arr {
+        let Some(obj) = item.as_object() else { continue; };
+
+        let type_str = obj.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if type_str != "PipeWire:Interface:Node" {
+            continue;
+        }
+
+        let Some(info) = obj.get("info").and_then(|v| v.as_object()) else { continue; };
+        let Some(props) = info.get("props").and_then(|v| v.as_object()) else { continue; };
+
+        let media_class = props
+            .get("media.class")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        // Only application stream nodes (not hardware device nodes).
+        if !media_class.starts_with("Stream/") {
+            continue;
+        }
+
+        let pid = props
+            .get("application.process.id")
+            .or_else(|| props.get("pipewire.sec.pid"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+
+        let virtual_node = props
+            .get("node.virtual")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let node_props = NodeProps { pid, media_class, virtual_node };
+
+        if !keep_node(&node_props, own_pid, &filt) {
+            continue;
+        }
+
+        let node_name = props
+            .get("node.name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if node_name.is_empty() {
+            continue;
+        }
+
+        let label = props
+            .get("application.name")
+            .or_else(|| props.get("node.description"))
+            .or_else(|| props.get("node.name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&node_name)
+            .to_string();
+
+        nodes.push(AudioNode { node: node_name, label });
+    }
+
+    nodes
+}
+
+/// Build the GStreamer source chain string for the given audio choice.
+///
+/// Returns `None` for [`ShareAudio::None`]. The returned string is suitable
+/// as the source portion of a `gst_parse_launch` description, producing
+/// stereo Opus at 48 kHz, ready to feed into `rtpopuspay`.
+pub fn screen_audio_chain(a: &ShareAudio) -> Option<String> {
+    match a {
+        ShareAudio::None => None,
+        ShareAudio::System => Some(
+            "pulsesrc device=@DEFAULT_SINK@.monitor \
+             ! audioconvert \
+             ! audioresample \
+             ! audio/x-raw,rate=48000,channels=2 \
+             ! opusenc audio-type=generic"
+                .to_string(),
+        ),
+        ShareAudio::App { node } => Some(format!(
+            "pipewiresrc target-object={node} \
+             ! audioconvert \
+             ! audioresample \
+             ! audio/x-raw,rate=48000,channels=2 \
+             ! opusenc audio-type=generic"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn props(pid: u32, media_class: &str, virt: bool) -> NodeProps {
+        NodeProps { pid, media_class: media_class.into(), virtual_node: virt }
+    }
+
+    #[test]
+    fn excludes_own_process() {
+        let f = NodeFilter::default();
+
+        assert!(!keep_node(&props(42, "Stream/Output/Audio", false), 42, &f));
+        assert!(keep_node(&props(99, "Stream/Output/Audio", false), 42, &f));
+    }
+
+    #[test]
+    fn excludes_inputs_and_virtual_when_requested() {
+        let f = NodeFilter { ignore_input: true, ignore_virtual: true, ..Default::default() };
+
+        assert!(!keep_node(&props(1, "Stream/Input/Audio", false), 0, &f));
+        assert!(!keep_node(&props(1, "Stream/Output/Audio", true), 0, &f));
+        assert!(keep_node(&props(1, "Stream/Output/Audio", false), 0, &f));
+    }
+
+    #[test]
+    fn system_chain_uses_monitor_and_app_uses_target_object() {
+        assert!(screen_audio_chain(&ShareAudio::None).is_none());
+        assert!(screen_audio_chain(&ShareAudio::System).unwrap().contains(".monitor"));
+
+        let app = screen_audio_chain(&ShareAudio::App { node: "Firefox".into() }).unwrap();
+
+        assert!(app.contains("target-object=Firefox"));
+    }
+
+    #[test]
+    fn parse_nodes_skips_non_node_entries() {
+        // A realistic pw-dump array mixing a valid audio stream node with a
+        // non-node entry (a Link interface). The non-node must not cause the
+        // whole parse to bail out early.
+        let json: serde_json::Value = serde_json::json!([
+            {
+                "type": "PipeWire:Interface:Link",
+                "id": 10,
+                "info": {}
+            },
+            {
+                "type": "PipeWire:Interface:Node",
+                "id": 42,
+                "info": {
+                    "props": {
+                        "media.class": "Stream/Output/Audio",
+                        "node.name": "Firefox",
+                        "application.name": "Firefox",
+                        "application.process.id": 9999
+                    }
+                }
+            }
+        ]);
+
+        let filt = NodeFilter::default();
+        // Use a pid that doesn't match the node's pid so it isn't filtered out.
+        let nodes = parse_nodes(&json, 1, &filt);
+
+        assert!(!nodes.is_empty(), "non-node entry must not cause empty result");
+        assert_eq!(nodes[0].node, "Firefox");
+    }
+}

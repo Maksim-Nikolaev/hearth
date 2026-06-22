@@ -6,7 +6,8 @@ use crate::encoders;
 use crate::hotkey::{keysym_from_name, PttGrab};
 use crate::flow::{Flow, VideoSink};
 use crate::flow_peer::{
-    build_screen_send_branch, build_voice_send_branch, link_video_recv, link_voice_recv,
+    build_screen_send_branch, build_voice_send_branch, link_screen_audio_recv, link_video_recv,
+    link_voice_recv,
 };
 use crate::capture;
 use crate::screen::{self, ShareConfig};
@@ -127,6 +128,9 @@ impl FlowPeer {
         // Pre-built capture+caps chain for Screen offerer flows. `None` falls
         // back to the env-override / OS default from `capture::capture_chain`.
         screen_chain: Option<String>,
+        // Optional audio source chain for the screen flow (payload 98). `None`
+        // means no audio track is added (video-only share, M6 default).
+        screen_audio: Option<String>,
     ) -> Result<Self> {
         gst::init()?;
 
@@ -164,7 +168,13 @@ impl FlowPeer {
                 Flow::Screen => {
                     let encoder = encoders::detect().0.unwrap_or("x265enc");
                     let chain = screen_chain.unwrap_or_else(|| capture::capture_chain());
-                    build_screen_send_branch(&pipeline, &webrtc, encoder, &chain)?;
+                    build_screen_send_branch(
+                        &pipeline,
+                        &webrtc,
+                        encoder,
+                        &chain,
+                        screen_audio.as_deref(),
+                    )?;
                 }
                 Flow::Voice => voice_appsrc = Some(build_voice_send_branch(&pipeline, &webrtc)?),
                 Flow::Webcam => anyhow::bail!("webcam flow is out of M5 scope"),
@@ -201,6 +211,22 @@ impl FlowPeer {
             };
             match flow {
                 Flow::Voice => link_voice_recv(&pipeline, pad),
+                Flow::Screen => {
+                    // Distinguish the optional audio track (payload 98) from
+                    // the video track by checking the RTP media type in caps.
+                    let is_audio = pad
+                        .current_caps()
+                        .as_ref()
+                        .and_then(|c| c.structure(0))
+                        .map(|s| s.get::<&str>("media").map(|m| m == "audio").unwrap_or(false))
+                        .unwrap_or(false);
+
+                    if is_audio {
+                        link_screen_audio_recv(&pipeline, pad);
+                    } else if let Some(vsink) = vsink.as_ref() {
+                        link_video_recv(&pipeline, pad, vsink);
+                    }
+                }
                 _ => {
                     if let Some(vsink) = vsink.as_ref() {
                         link_video_recv(&pipeline, pad, vsink);
@@ -578,7 +604,22 @@ impl Session {
             None
         };
 
-        let p = FlowPeer::new(flow, Role::Offerer, peer, self.sink, self.out_tx.clone(), self.evt_tx.clone(), screen_chain)?;
+        let screen_audio = if flow == Flow::Screen {
+            screen::screen_audio_chain(&self.share_config.audio)
+        } else {
+            None
+        };
+
+        let p = FlowPeer::new(
+            flow,
+            Role::Offerer,
+            peer,
+            self.sink,
+            self.out_tx.clone(),
+            self.evt_tx.clone(),
+            screen_chain,
+            screen_audio,
+        )?;
         self.peers.insert(key, p);
 
         if flow == Flow::Voice {
@@ -818,7 +859,7 @@ impl Session {
                     old.stop();
                 }
 
-                match FlowPeer::new(flow, Role::Answerer, from, self.sink, self.out_tx.clone(), self.evt_tx.clone(), None) {
+                match FlowPeer::new(flow, Role::Answerer, from, self.sink, self.out_tx.clone(), self.evt_tx.clone(), None, None) {
                     Ok(p) => {
                         p.handle_offer(&sdp);
                         self.peers.insert(key, p);
