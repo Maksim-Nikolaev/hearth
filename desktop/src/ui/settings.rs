@@ -21,6 +21,7 @@ pub enum SettingsOutput {
     Activation(ActivationKind),
     PttKey(Option<String>),
     MicTest(bool),
+    ResetDefaults,
 }
 
 // ── Input ─────────────────────────────────────────────────────────────────────
@@ -205,6 +206,11 @@ impl Component for SettingsWindow {
             .build();
         root_box.append(&hrow("PTT key", 140, &ptt_entry));
 
+        // Reset section
+        let reset_btn = gtk::Button::with_label("Reset to Default");
+        reset_btn.set_halign(gtk::Align::End);
+        root_box.append(&reset_btn);
+
         // ── Wire signals (once; handler IDs stored for block/unblock) ─────────
 
         // Device dropdowns – the closure captures a shared cell so repopulate can
@@ -322,6 +328,13 @@ impl Component for SettingsWindow {
                 let text = e.text().to_string();
                 let key = if text.is_empty() { None } else { Some(text) };
                 let _ = s.output(SettingsOutput::PttKey(key));
+            });
+        }
+
+        {
+            let s = sender.clone();
+            reset_btn.connect_clicked(move |_| {
+                let _ = s.output(SettingsOutput::ResetDefaults);
             });
         }
 

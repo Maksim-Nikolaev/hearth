@@ -458,6 +458,20 @@ impl AppModel {
                 }
                 return; // mic-test is not persisted
             }
+            SettingsOutput::ResetDefaults => {
+                let defaults = Settings::default();
+
+                self.config.save_settings(&defaults);
+
+                if let Some(s) = self.session.as_mut() {
+                    Self::apply_settings_to_session(s, &defaults);
+                }
+
+                let _ = self.settings_window.sender()
+                    .send(SettingsInput::SetSettings(defaults));
+
+                return;
+            }
         }
 
         self.config.save_settings(&settings);
