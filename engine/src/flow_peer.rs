@@ -266,6 +266,70 @@ pub(crate) fn build_screen_send_branch(
     Ok(())
 }
 
+/// Screen offerer send branch fed by the shared `ScreenSource` appsink (no
+/// per-peer capture/encode). The caller registers the returned `AppSrc` with
+/// `ScreenSource::register_viewer` so encoded H265 frames flow into it.
+///
+/// Branch: appsrc → rtph265pay → capsfilter → webrtcbin. The optional audio
+/// track is added best-effort via `build_screen_audio_send_branch`, identical
+/// to the legacy `build_screen_send_branch` behaviour.
+pub(crate) fn build_screen_send_appsrc_branch(
+    pipeline: &gst::Pipeline,
+    webrtc: &gst::Element,
+    audio_chain: Option<&str>,
+) -> Result<gst_app::AppSrc> {
+    let h265_caps = gst::Caps::builder("video/x-h265")
+        .field("stream-format", "byte-stream")
+        .field("alignment", "au")
+        .build();
+
+    // `do-timestamp=true`: stamp each access unit against THIS viewer pipeline's
+    // clock as it arrives, so video stays coherent with the per-pipeline audio
+    // branch (the shared `ScreenSource` encodes against a different clock, so its
+    // PTS would not align here). Bounded + `leaky-type=downstream` so a slow
+    // viewer drops the oldest queued frames instead of growing memory unbounded
+    // or blocking the shared fan-out (the appsink callback pushes here while
+    // holding the viewer-registry lock, so `block` must stay false).
+    let appsrc = gst_app::AppSrc::builder()
+        .name("screen_in")
+        .caps(&h265_caps)
+        .is_live(true)
+        .format(gst::Format::Time)
+        .do_timestamp(true)
+        .build();
+    appsrc.set_property("block", false);
+    appsrc.set_property("max-bytes", 2_000_000u64);
+    appsrc.set_property_from_str("leaky-type", "downstream");
+
+    let pay = gst::ElementFactory::make("rtph265pay")
+        .property("config-interval", -1i32)
+        .build()?;
+    let caps = gst::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gst::Caps::builder("application/x-rtp")
+                .field("media", "video")
+                .field("encoding-name", "H265")
+                .field("payload", 96i32)
+                .build(),
+        )
+        .build()?;
+
+    pipeline.add_many([appsrc.upcast_ref(), &pay, &caps])?;
+    gst::Element::link_many([appsrc.upcast_ref(), &pay, &caps])?;
+    caps.link(webrtc)?;
+
+    if let Some(achain) = audio_chain {
+        eprintln!("screen audio branch: {achain}");
+        match build_screen_audio_send_branch(pipeline, webrtc, achain) {
+            Ok(()) => eprintln!("screen audio branch linked"),
+            Err(e) => eprintln!("screen audio branch failed, continuing video-only: {e}"),
+        }
+    }
+
+    Ok(appsrc)
+}
+
 /// Add a second audio media track to an existing screen `webrtcbin`.
 ///
 /// Uses payload type 98 to avoid clashing with voice (97). No DSP is applied:
@@ -420,7 +484,7 @@ pub(crate) fn build_voice_send_branch(
 /// `bitrate_kbps` is the configured target; `HEARTH_BITRATE_KBPS` env var
 /// overrides it when set. All properties are applied via `set_if_present` so
 /// missing props on any encoder (x265enc, vah265lpenc, etc.) are silently skipped.
-fn tune_encoder(enc: &gst::Element, bitrate_kbps: u32) {
+pub(crate) fn tune_encoder(enc: &gst::Element, bitrate_kbps: u32) {
     let bitrate = std::env::var("HEARTH_BITRATE_KBPS")
         .unwrap_or_else(|_| bitrate_kbps.to_string());
 

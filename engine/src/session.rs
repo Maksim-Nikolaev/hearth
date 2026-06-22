@@ -2,14 +2,12 @@ use crate::audio::capture::VoiceCapture;
 use crate::audio::dsp::{DspConfig, NsLevel};
 use crate::audio::monitor::Monitor;
 use crate::audio::gate::{ActivationMode, Gate};
-use crate::encoders;
 use crate::hotkey::{keysym_from_name, PttGrab};
 use crate::flow::{Flow, VideoSink};
 use crate::flow_peer::{
-    build_screen_send_branch, build_voice_send_branch, link_screen_audio_recv, link_video_recv,
-    link_voice_recv,
+    build_screen_send_appsrc_branch, build_voice_send_branch, link_screen_audio_recv,
+    link_video_recv, link_voice_recv,
 };
-use crate::capture;
 use crate::screen::{self, ShareConfig};
 use crate::signaling::{login, SignalingClient};
 use anyhow::Result;
@@ -115,6 +113,9 @@ pub(crate) struct FlowPeer {
     /// For Voice send flows: the `appsrc` the shared `VoiceCapture` pushes the
     /// DSP'd mic frame into. `None` for receive-only / non-voice flows.
     voice_appsrc: Option<gst_app::AppSrc>,
+    /// For Screen offerer flows: the `appsrc` that `ScreenSource` fans encoded
+    /// H265 buffers into. `None` for answerer / non-screen flows.
+    screen_appsrc: Option<gst_app::AppSrc>,
 }
 
 impl FlowPeer {
@@ -125,14 +126,15 @@ impl FlowPeer {
         sink: VideoSink,
         out_tx: UnboundedSender<ClientMessage>,
         evt_tx: UnboundedSender<SessionEvent>,
-        // Pre-built capture+caps chain for Screen offerer flows. `None` falls
-        // back to the env-override / OS default from `capture::capture_chain`.
-        screen_chain: Option<String>,
+        // Capture chain string; kept for the legacy `flow_peer::run()` path.
+        // Session-managed Screen flows always pass `None` – the shared
+        // `ScreenSource` handles capture centrally.
+        _screen_chain: Option<String>,
         // Optional audio source chain for the screen flow (payload 98). `None`
         // means no audio track is added (video-only share, M6 default).
         screen_audio: Option<String>,
         // Encoder bitrate in kbps; overridden by HEARTH_BITRATE_KBPS env var.
-        bitrate_kbps: u32,
+        _bitrate_kbps: u32,
     ) -> Result<Self> {
         gst::init()?;
 
@@ -165,19 +167,15 @@ impl FlowPeer {
         // Send branch: voice is bidirectional; screenshare flows offerer -> answerer.
         let do_send = matches!(flow, Flow::Voice) || matches!(role, Role::Offerer);
         let mut voice_appsrc = None;
+        let mut screen_appsrc = None;
         if do_send {
             match flow {
                 Flow::Screen => {
-                    let encoder = encoders::detect().0.unwrap_or("x265enc");
-                    let chain = screen_chain.unwrap_or_else(|| capture::capture_chain());
-                    build_screen_send_branch(
+                    screen_appsrc = Some(build_screen_send_appsrc_branch(
                         &pipeline,
                         &webrtc,
-                        encoder,
-                        &chain,
                         screen_audio.as_deref(),
-                        bitrate_kbps,
-                    )?;
+                    )?);
                 }
                 Flow::Voice => voice_appsrc = Some(build_voice_send_branch(&pipeline, &webrtc)?),
                 Flow::Webcam => anyhow::bail!("webcam flow is out of M5 scope"),
@@ -287,12 +285,17 @@ impl FlowPeer {
             let _ = evt_tx.send(SessionEvent::VideoReady { peer: target, flow });
         }
 
-        Ok(Self { pipeline, webrtc, flow, target, out_tx, paintable, voice_appsrc })
+        Ok(Self { pipeline, webrtc, flow, target, out_tx, paintable, voice_appsrc, screen_appsrc })
     }
 
     /// The voice send `appsrc` for this flow, if it is a Voice send branch.
     fn voice_appsrc(&self) -> Option<gst_app::AppSrc> {
         self.voice_appsrc.clone()
+    }
+
+    /// The screen send `appsrc` for this flow, if it is a Screen offerer branch.
+    pub(crate) fn screen_appsrc(&self) -> Option<gst_app::AppSrc> {
+        self.screen_appsrc.clone()
     }
 
     fn handle_offer(&self, sdp: &str) {
@@ -370,9 +373,10 @@ pub struct Session {
     /// join) whenever the PTT key is cleared or changed.
     ptt_grab: Option<PttGrab>,
     _client: Option<SignalingClient>,
-    /// Local preview pipeline (capture → gtk4paintablesink), active while
-    /// sharing. `None` when not sharing or when the sink element is unavailable.
-    preview_pipeline: Option<(gst::Pipeline, glib::Object)>,
+    /// Single capture+encode+preview pipeline. Active during both preview-only
+    /// (`encode == false`) and live share (`encode == true`). `None` when idle
+    /// or when the elements are unavailable (e.g. headless test environments).
+    screen_source: Option<screen::ScreenSource>,
 }
 
 /// Sensible defaults: AEC + high-pass + moderate NS + AGC + VAD on.
@@ -470,7 +474,7 @@ impl Session {
             output_device: None,
             ptt_grab: None,
             _client: Some(conn.client),
-            preview_pipeline: None,
+            screen_source: None,
         };
 
         (session, conn.inbound, evt_rx)
@@ -543,16 +547,22 @@ impl Session {
     /// Start sharing your screen to every current voice member, via the active
     /// `ScreenTransport` (P2P now). Also tells the server so others list you.
     ///
-    /// `cfg` controls the capture source, resolution, frame rate, and quality
-    /// hint. The `HEARTH_CAPTURE` env var still overrides the capture element
-    /// entirely, regardless of `cfg`, for bench/dev testing.
+    /// Builds ONE `ScreenSource` (capture + encode + preview); encoded H265 is
+    /// fanned from the single appsink into per-viewer appsrcs registered in
+    /// `start_offerer`. The `HEARTH_CAPTURE` env var overrides the capture
+    /// element entirely, regardless of `cfg`, for bench/dev testing.
     pub fn start_share(&mut self, cfg: ShareConfig) {
+        // Going live: drop any preview-only source first so we hold at most one
+        // pipeline at a time. The ScreenSource Drop tears down synchronously.
+        self.screen_source = None;
+
         self.share_config = cfg;
         let _ = self.out_tx.send(ClientMessage::ShareStart);
 
-        // Try to spin up a local preview pipeline (capture → gtk4paintablesink).
-        // Failure is non-fatal: the share still goes to peers without a preview.
-        self.preview_pipeline = self.build_preview_pipeline();
+        self.screen_source = screen::ScreenSource::new(&self.share_config, true);
+        if self.screen_source.is_none() {
+            eprintln!("start_share: ScreenSource unavailable (capture/encode/sink missing) – viewers will receive no video");
+        }
 
         let viewers = self.voice_members.clone();
         let mut t = std::mem::replace(&mut self.screen_transport, Box::new(P2pTransport));
@@ -560,61 +570,41 @@ impl Session {
         self.screen_transport = t;
     }
 
-    /// Build a local `(capture chain) → gtk4paintablesink` pipeline for the
-    /// local preview overlay. Returns `None` when the element is missing or
-    /// the pipeline fails to start (e.g. in headless test environments).
-    fn build_preview_pipeline(&self) -> Option<(gst::Pipeline, glib::Object)> {
-        let sink = gst::ElementFactory::make("gtk4paintablesink").build().ok()?;
-        let paintable: glib::Object = sink.property("paintable");
-
-        let chain_str = screen::capture_chain(&self.share_config);
-        let src_bin = gst::parse::bin_from_description(&chain_str, true).ok()?;
-
-        let pipeline = gst::Pipeline::new();
-        pipeline.add_many([src_bin.upcast_ref::<gst::Element>(), &sink]).ok()?;
-        gst::Element::link_many([src_bin.upcast_ref::<gst::Element>(), &sink]).ok()?;
-
-        pipeline.set_state(gst::State::Playing).ok()?;
-
-        Some((pipeline, paintable))
-    }
-
-    /// Stop sharing: tear down the local screenshare flows and notify the server.
+    /// Stop sharing: unregister all viewers, tear down the source, notify the server.
+    ///
+    /// `ScreenSource::Drop` sets the pipeline to Null synchronously so the next
+    /// `start_share` or `start_preview` does not race against resource release.
     pub fn stop_share(&mut self) {
         let _ = self.out_tx.send(ClientMessage::ShareStop);
-
-        if let Some((pipe, _)) = self.preview_pipeline.take() {
-            let _ = pipe.set_state(gst::State::Null);
-        }
 
         let mut t = std::mem::replace(&mut self.screen_transport, Box::new(P2pTransport));
         t.stop(self);
         self.screen_transport = t;
+
+        // Drop the source after the transport has stopped (and unregistered all
+        // viewers), so no in-flight callbacks push into removed appsrcs.
+        self.screen_source = None;
     }
 
-    /// Return the local preview paintable for the current share session, or
-    /// `None` if not sharing or if `gtk4paintablesink` is unavailable.
+    /// Return the local preview paintable for the current share or preview session.
     ///
     /// The returned `glib::Object` is a `gdk::Paintable` and can be cast by
     /// the caller with `obj.dynamic_cast::<gtk4::gdk::Paintable>()`.
     pub fn preview_paintable(&self) -> Option<glib::Object> {
-        self.preview_pipeline.as_ref().map(|(_, p)| p.clone())
+        self.screen_source.as_ref().map(|s| s.paintable())
     }
 
-    /// Start a local-only preview pipeline for the given config so the picker
-    /// can show a live preview before going live. Any prior preview is torn
-    /// down first. Does NOT start the actual WebRTC share.
+    /// Start a local-only preview pipeline (no encode, no WebRTC) so the picker
+    /// can show a live preview before going live. Any prior source is torn down first.
     pub fn start_preview(&mut self, cfg: ShareConfig) {
         self.stop_preview();
         self.share_config = cfg;
-        self.preview_pipeline = self.build_preview_pipeline();
+        self.screen_source = screen::ScreenSource::new(&self.share_config, false);
     }
 
-    /// Stop the local preview pipeline. No-op when not running.
+    /// Stop the local preview. No-op when not running.
     pub fn stop_preview(&mut self) {
-        if let Some((pipe, _)) = self.preview_pipeline.take() {
-            let _ = pipe.set_state(gst::State::Null);
-        }
+        self.screen_source = None;
     }
 
     pub fn start_call(&mut self, peer: Uuid) -> Result<()> {
@@ -627,12 +617,9 @@ impl Session {
             return Ok(());
         }
 
-        let screen_chain = if flow == Flow::Screen {
-            Some(screen::capture_chain(&self.share_config))
-        } else {
-            None
-        };
-
+        // Screen offerers no longer pass a capture chain: the shared ScreenSource
+        // handles capture+encode centrally. The screen_chain and bitrate_kbps
+        // params in FlowPeer::new are kept for the legacy run() path and Voice.
         let screen_audio = if flow == Flow::Screen {
             screen::screen_audio_chain(&self.share_config.audio)
         } else {
@@ -646,10 +633,17 @@ impl Session {
             self.sink,
             self.out_tx.clone(),
             self.evt_tx.clone(),
-            screen_chain,
+            None,
             screen_audio,
             self.share_config.bitrate_kbps,
         )?;
+
+        if flow == Flow::Screen {
+            if let (Some(appsrc), Some(ss)) = (p.screen_appsrc(), self.screen_source.as_ref()) {
+                ss.register_viewer(peer, appsrc);
+            }
+        }
+
         self.peers.insert(key, p);
 
         if flow == Flow::Voice {
@@ -702,6 +696,13 @@ impl Session {
     pub fn stop_flow(&mut self, peer: Uuid, flow: Flow) {
         if let Some(p) = self.peers.remove(&(peer, flow)) {
             let appsrc = p.voice_appsrc();
+
+            if flow == Flow::Screen {
+                if let Some(ss) = &self.screen_source {
+                    ss.unregister_viewer(&peer);
+                }
+            }
+
             p.stop();
 
             if flow == Flow::Voice {
@@ -986,7 +987,7 @@ mod tests {
                 output_device: None,
                 ptt_grab: None,
                 _client: None,
-                preview_pipeline: None,
+                screen_source: None,
             };
             (s, evt_rx)
         }
