@@ -1,3 +1,6 @@
+use crate::audio::capture::VoiceCapture;
+use crate::audio::dsp::{DspConfig, NsLevel};
+use crate::audio::gate::{ActivationMode, Gate};
 use crate::encoders;
 use crate::flow::{Flow, VideoSink};
 use crate::flow_peer::{
@@ -8,10 +11,12 @@ use anyhow::Result;
 use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use hearth_protocol::{ChatEntry, ClientMessage, PeerInfo, ServerMessage};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use uuid::Uuid;
 
@@ -37,6 +42,9 @@ pub enum SessionEvent {
     VoiceLeft { user: Uuid },
     ShareStarted { user: Uuid },
     ShareStopped { user: Uuid },
+    /// Local microphone level in RMS dBFS, emitted ~once per processed frame for
+    /// the input meter. The capture already feeds the gate; the UI only displays.
+    InputLevel(f32),
     Error(String),
 }
 
@@ -99,6 +107,9 @@ pub(crate) struct FlowPeer {
     target: Uuid,
     out_tx: UnboundedSender<ClientMessage>,
     paintable: Option<glib::Object>,
+    /// For Voice send flows: the `appsrc` the shared `VoiceCapture` pushes the
+    /// DSP'd mic frame into. `None` for receive-only / non-voice flows.
+    voice_appsrc: Option<gst_app::AppSrc>,
 }
 
 impl FlowPeer {
@@ -140,13 +151,14 @@ impl FlowPeer {
 
         // Send branch: voice is bidirectional; screenshare flows offerer -> answerer.
         let do_send = matches!(flow, Flow::Voice) || matches!(role, Role::Offerer);
+        let mut voice_appsrc = None;
         if do_send {
             match flow {
                 Flow::Screen => {
                     let encoder = encoders::detect().0.unwrap_or("x265enc");
                     build_screen_send_branch(&pipeline, &webrtc, encoder)?;
                 }
-                Flow::Voice => build_voice_send_branch(&pipeline, &webrtc)?,
+                Flow::Voice => voice_appsrc = Some(build_voice_send_branch(&pipeline, &webrtc)?),
                 Flow::Webcam => anyhow::bail!("webcam flow is out of M5 scope"),
             }
         }
@@ -228,7 +240,12 @@ impl FlowPeer {
             let _ = evt_tx.send(SessionEvent::VideoReady { peer: target, flow });
         }
 
-        Ok(Self { pipeline, webrtc, flow, target, out_tx, paintable })
+        Ok(Self { pipeline, webrtc, flow, target, out_tx, paintable, voice_appsrc })
+    }
+
+    /// The voice send `appsrc` for this flow, if it is a Voice send branch.
+    fn voice_appsrc(&self) -> Option<gst_app::AppSrc> {
+        self.voice_appsrc.clone()
     }
 
     fn handle_offer(&self, sdp: &str) {
@@ -288,7 +305,26 @@ pub struct Session {
     voice_members: Vec<Uuid>,
     screen_transport: Box<dyn ScreenTransport>,
     pub(crate) peers: HashMap<(Uuid, Flow), FlowPeer>,
+    /// The single mic capture + DSP, shared by every Voice flow. Lazily started
+    /// when the first voice peer connects, dropped when the last leaves.
+    voice_capture: Option<VoiceCapture>,
+    /// Software activation gate, shared with the capture callback thread.
+    gate: Arc<Mutex<Gate>>,
+    dsp_config: DspConfig,
+    input_device: Option<String>,
+    output_device: Option<String>,
     _client: Option<SignalingClient>,
+}
+
+/// Sensible defaults: AEC + high-pass + moderate NS + AGC + VAD on.
+fn default_dsp_config() -> DspConfig {
+    DspConfig {
+        echo_cancel: true,
+        noise_suppression: NsLevel::Moderate,
+        agc: true,
+        vad: true,
+        high_pass: true,
+    }
 }
 
 /// Read our identity (`sub`, `username`) from a JWT without verifying the
@@ -366,6 +402,11 @@ impl Session {
             voice_members: Vec::new(),
             screen_transport: Box::new(P2pTransport),
             peers: HashMap::new(),
+            voice_capture: None,
+            gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
+            dsp_config: default_dsp_config(),
+            input_device: None,
+            output_device: None,
             _client: Some(conn.client),
         };
 
@@ -468,12 +509,61 @@ impl Session {
         let p = FlowPeer::new(flow, Role::Offerer, peer, self.sink, self.out_tx.clone(), self.evt_tx.clone())?;
         self.peers.insert(key, p);
 
+        if flow == Flow::Voice {
+            self.register_voice_send(peer);
+        }
+
         Ok(())
+    }
+
+    /// Ensure the shared capture is running and register this Voice flow's send
+    /// `appsrc` with it. Starting the mic is best-effort; failure surfaces as an
+    /// error event but never tears the flow down.
+    fn register_voice_send(&mut self, peer: Uuid) {
+        if self.voice_capture.is_none() {
+            match VoiceCapture::start(
+                self.input_device.clone(),
+                self.output_device.clone(),
+                self.dsp_config.clone(),
+                self.gate.clone(),
+                self.evt_tx.clone(),
+            ) {
+                Ok(vc) => self.voice_capture = Some(vc),
+                Err(e) => {
+                    self.emit(SessionEvent::Error(format!("voice capture: {e}")));
+                    return;
+                }
+            }
+        }
+
+        let appsrc = self.peers.get(&(peer, Flow::Voice)).and_then(|p| p.voice_appsrc());
+
+        if let (Some(vc), Some(appsrc)) = (self.voice_capture.as_ref(), appsrc) {
+            vc.add_peer(appsrc);
+        }
+    }
+
+    /// Unregister a Voice flow's send `appsrc`; drop the whole capture once no
+    /// Voice flows remain so the mic and DSP stop.
+    fn unregister_voice_send(&mut self, appsrc: Option<gst_app::AppSrc>) {
+        if let (Some(vc), Some(appsrc)) = (self.voice_capture.as_ref(), appsrc) {
+            vc.remove_peer(&appsrc);
+        }
+
+        let any_voice = self.peers.keys().any(|(_, f)| *f == Flow::Voice);
+        if !any_voice {
+            self.voice_capture = None;
+        }
     }
 
     pub fn stop_flow(&mut self, peer: Uuid, flow: Flow) {
         if let Some(p) = self.peers.remove(&(peer, flow)) {
+            let appsrc = p.voice_appsrc();
             p.stop();
+
+            if flow == Flow::Voice {
+                self.unregister_voice_send(appsrc);
+            }
         }
     }
 
@@ -482,22 +572,95 @@ impl Session {
         for (_, p) in self.peers.drain() {
             p.stop();
         }
+
+        self.voice_capture = None;
     }
 
+    /// Mute the mic. Gating is now software, so muting flips the shared gate; the
+    /// capture callback then pushes silence to every peer.
     pub fn mute(&self, on: bool) {
-        for p in self.peers.values() {
-            if p.flow == Flow::Voice {
-                p.set_valve("mic_valve", on);
-            }
-        }
+        self.set_muted(on);
     }
 
+    /// Deafen: silence incoming audio (spk_valve on every recv) and mute the mic.
     pub fn deafen(&self, on: bool) {
         for p in self.peers.values() {
             if p.flow == Flow::Voice {
                 p.set_valve("spk_valve", on);
-                p.set_valve("mic_valve", on);
             }
+        }
+
+        self.set_muted(on);
+    }
+
+    /// Apply a new DSP config live (no pipeline rebuild).
+    pub fn set_dsp(&mut self, cfg: DspConfig) {
+        self.dsp_config = cfg.clone();
+
+        if let Some(vc) = self.voice_capture.as_ref() {
+            vc.set_config(cfg);
+        }
+    }
+
+    /// Change the voice activation mode (voice-activity / push-to-talk / always-on).
+    pub fn set_activation(&self, mode: ActivationMode) {
+        self.gate.lock().unwrap().set_mode(mode);
+    }
+
+    /// Mute / unmute the mic via the shared gate.
+    pub fn set_muted(&self, muted: bool) {
+        self.gate.lock().unwrap().set_muted(muted);
+    }
+
+    /// Hold / release push-to-talk via the shared gate.
+    pub fn set_ptt_held(&self, held: bool) {
+        self.gate.lock().unwrap().set_ptt_held(held);
+    }
+
+    /// Select the mic input device; restarts the running capture (brief blip).
+    pub fn set_input_device(&mut self, dev: Option<String>) {
+        self.input_device = dev;
+        self.restart_voice_capture();
+    }
+
+    /// Select the speaker output device; restarts the capture so AEC references
+    /// the new sink's monitor (brief blip).
+    pub fn set_output_device(&mut self, dev: Option<String>) {
+        self.output_device = dev;
+        self.restart_voice_capture();
+    }
+
+    /// Rebuild the shared capture with the current devices/config, re-registering
+    /// every live Voice flow's send `appsrc`. No-op when no capture is running.
+    fn restart_voice_capture(&mut self) {
+        if self.voice_capture.is_none() {
+            return;
+        }
+
+        self.voice_capture = None;
+
+        let voice_peers: Vec<gst_app::AppSrc> = self
+            .peers
+            .iter()
+            .filter(|((_, f), _)| *f == Flow::Voice)
+            .filter_map(|(_, p)| p.voice_appsrc())
+            .collect();
+
+        match VoiceCapture::start(
+            self.input_device.clone(),
+            self.output_device.clone(),
+            self.dsp_config.clone(),
+            self.gate.clone(),
+            self.evt_tx.clone(),
+        ) {
+            Ok(vc) => {
+                for appsrc in voice_peers {
+                    vc.add_peer(appsrc);
+                }
+
+                self.voice_capture = Some(vc);
+            }
+            Err(e) => self.emit(SessionEvent::Error(format!("voice capture restart: {e}"))),
         }
     }
 
@@ -533,6 +696,10 @@ impl Session {
                     Ok(p) => {
                         p.handle_offer(&sdp);
                         self.peers.insert(key, p);
+
+                        if flow == Flow::Voice {
+                            self.register_voice_send(from);
+                        }
                     }
                     Err(e) => self.emit(SessionEvent::Error(format!("create answerer: {e}"))),
                 }
@@ -589,6 +756,11 @@ mod tests {
                 voice_members: Vec::new(),
                 screen_transport: Box::new(P2pTransport),
                 peers: HashMap::new(),
+                voice_capture: None,
+                gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
+                dsp_config: default_dsp_config(),
+                input_device: None,
+                output_device: None,
                 _client: None,
             };
             (s, evt_rx)

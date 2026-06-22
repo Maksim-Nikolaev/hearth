@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 gstreamer = "0.23"
+gstreamer-app = "0.23"
 gstreamer-webrtc = "0.23"
 gstreamer-sdp = "0.23"
 tokio = { version = "1", features = ["full"] }

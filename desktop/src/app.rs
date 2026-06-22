@@ -266,6 +266,9 @@ impl AppModel {
                     }
                 }
             }
+            // The input meter UI lands in Task 10; for now the level is observed
+            // only in the engine (it already feeds the gate there).
+            SessionEvent::InputLevel(_) => {}
             SessionEvent::FlowState { .. } | SessionEvent::Error(_) => {}
         }
     }

@@ -7,6 +7,7 @@ use anyhow::Result;
 use gstreamer as gst;
 use gstreamer::glib;
 use gstreamer::prelude::*;
+use gstreamer_app as gst_app;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use hearth_protocol::{ClientMessage, Flow, ServerMessage};
@@ -96,7 +97,9 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
                 let encoder = encoders::detect().0.unwrap_or("x265enc");
                 build_screen_send_branch(&pipeline, &webrtc, encoder)?;
             }
-            Flow::Voice => build_voice_send_branch(&pipeline, &webrtc)?,
+            Flow::Voice => {
+                build_voice_send_branch(&pipeline, &webrtc)?;
+            }
             Flow::Webcam => anyhow::bail!("webcam flow is out of M5 scope"),
         }
     }
@@ -258,13 +261,30 @@ pub(crate) fn link_voice_recv(pipeline: &gst::Pipeline, pad: &gst::Pad) {
     println!("incoming voice linked -> playing");
 }
 
-pub(crate) fn build_voice_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::Element) -> Result<()> {
-    let src = gst::parse::bin_from_description(
-        "autoaudiosrc ! audioconvert ! audioresample ! queue",
-        true,
-    )?;
-    // mute gate: drop=true stops sending mic audio without renegotiating.
-    let valve = gst::ElementFactory::make("valve").name("mic_valve").property("drop", false).build()?;
+/// The voice send branch is fed by an `appsrc` that [`VoiceCapture`] pushes the
+/// single DSP'd mic frame into. Software gating happens in the capture callback,
+/// so there is no `mic_valve` here. Returns the `voice_in` appsrc for the session
+/// to register with the capture.
+pub(crate) fn build_voice_send_branch(
+    pipeline: &gst::Pipeline,
+    webrtc: &gst::Element,
+) -> Result<gst_app::AppSrc> {
+    let pcm_caps = gst::Caps::builder("audio/x-raw")
+        .field("format", "S16LE")
+        .field("channels", 1i32)
+        .field("rate", 48000i32)
+        .field("layout", "interleaved")
+        .build();
+
+    let appsrc = gst_app::AppSrc::builder()
+        .name("voice_in")
+        .caps(&pcm_caps)
+        .is_live(true)
+        .format(gst::Format::Time)
+        .build();
+
+    let convert = gst::ElementFactory::make("audioconvert").build()?;
+    let resample = gst::ElementFactory::make("audioresample").build()?;
     let enc = gst::ElementFactory::make("opusenc").build()?;
     let pay = gst::ElementFactory::make("rtpopuspay").build()?;
     let caps = gst::ElementFactory::make("capsfilter")
@@ -278,11 +298,11 @@ pub(crate) fn build_voice_send_branch(pipeline: &gst::Pipeline, webrtc: &gst::El
         )
         .build()?;
 
-    pipeline.add_many([src.upcast_ref(), &valve, &enc, &pay, &caps])?;
-    gst::Element::link_many([src.upcast_ref(), &valve, &enc, &pay, &caps])?;
+    pipeline.add_many([appsrc.upcast_ref(), &convert, &resample, &enc, &pay, &caps])?;
+    gst::Element::link_many([appsrc.upcast_ref(), &convert, &resample, &enc, &pay, &caps])?;
     caps.link(webrtc)?;
 
-    Ok(())
+    Ok(appsrc)
 }
 
 fn tune_encoder(enc: &gst::Element) {
