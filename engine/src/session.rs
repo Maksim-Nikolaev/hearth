@@ -212,7 +212,13 @@ impl FlowPeer {
                     .property("sync", false)
                     .build()?,
                 VideoSink::Paintable => {
-                    let s = gst::ElementFactory::make("gtk4paintablesink").build()?;
+                    // sync=false: render each frame on arrival rather than
+                    // clock-syncing to its PTS. For a live screen view that keeps
+                    // latency low and avoids dropping frames the sink judges
+                    // "too late" (matches the autovideosink path above).
+                    let s = gst::ElementFactory::make("gtk4paintablesink")
+                        .property("sync", false)
+                        .build()?;
                     paintable = Some(s.property::<glib::Object>("paintable"));
                     s
                 }

@@ -115,7 +115,11 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
                 .property("sync", false)
                 .build()?,
             VideoSink::Paintable => {
-                let s = gst::ElementFactory::make("gtk4paintablesink").build()?;
+                // sync=false: render on arrival for low-latency live video and to
+                // avoid dropping frames judged "too late" (see session.rs).
+                let s = gst::ElementFactory::make("gtk4paintablesink")
+                    .property("sync", false)
+                    .build()?;
                 if let Some(cb) = on_paintable.take() {
                     cb(s.property::<glib::Object>("paintable"));
                 }
