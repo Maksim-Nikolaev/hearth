@@ -1,5 +1,5 @@
 use crate::config::{ActivationKind, NsLevel, Settings};
-use crate::ui::meter::{Meter, MeterInput};
+use crate::ui::meter::LevelBar;
 use engine::audio::devices::{AudioDevice, DeviceKind};
 use gtk::glib::SignalHandlerId;
 use gtk::prelude::*;
@@ -32,7 +32,7 @@ pub enum SettingsInput {
     SetDevices(Vec<AudioDevice>),
     /// Populate all controls from persisted settings.
     SetSettings(Settings),
-    /// Forward a live input level reading to the embedded meter.
+    /// Forward a live input level reading to the embedded level bar.
     SetLevel(f32),
     /// Programmatically set the Mic Test toggle without re-emitting its handler.
     SetMicTestActive(bool),
@@ -44,7 +44,7 @@ pub struct SettingsWindow {
     settings: Settings,
     mic_devices: Vec<AudioDevice>,
     spk_devices: Vec<AudioDevice>,
-    meter: Controller<Meter>,
+    level_bar: LevelBar,
     // Shared with the device-selection signal closures so repopulate can update
     // the list without reconnecting the signal.
     mic_devices_cell: std::rc::Rc<std::cell::RefCell<Vec<AudioDevice>>>,
@@ -58,7 +58,6 @@ pub struct SettingsWindowWidgets {
     spk_dropdown: gtk::DropDown,
     input_vol_scale: gtk::Scale,
     output_vol_scale: gtk::Scale,
-    sensitivity_scale: gtk::Scale,
     ns_dropdown: gtk::DropDown,
     ec_switch: gtk::Switch,
     agc_switch: gtk::Switch,
@@ -72,7 +71,6 @@ pub struct SettingsWindowWidgets {
     spk_selected_id: SignalHandlerId,
     input_vol_id: SignalHandlerId,
     output_vol_id: SignalHandlerId,
-    sensitivity_id: SignalHandlerId,
     ns_selected_id: SignalHandlerId,
     ec_active_id: SignalHandlerId,
     agc_active_id: SignalHandlerId,
@@ -104,9 +102,6 @@ impl Component for SettingsWindow {
         window: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let meter = Meter::builder().launch(()).detach();
-        let meter_widget = meter.widget().clone();
-
         // ── Build the widget tree manually ────────────────────────────────────
         let root_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
@@ -149,8 +144,16 @@ impl Component for SettingsWindow {
         output_vol_scale.set_value(1.0);
         root_box.append(&hrow("Speaker vol.", 140, &output_vol_scale));
 
-        // Mic test section
-        root_box.append(&section_label("MIC TEST"));
+        // Mic test + input sensitivity section
+        root_box.append(&section_label("MIC TEST & SENSITIVITY"));
+
+        // The LevelBar emits InputSensitivity whenever the user drags the handle.
+        let level_bar = {
+            let s = sender.clone();
+            LevelBar::new(-40.0, move |db| {
+                let _ = s.output(SettingsOutput::InputSensitivity(db));
+            })
+        };
 
         let mic_test_row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -158,20 +161,10 @@ impl Component for SettingsWindow {
             .build();
 
         let mic_test_btn = gtk::ToggleButton::with_label("Test Mic");
-        meter_widget.set_hexpand(true);
-        meter_widget.set_valign(gtk::Align::Center);
+        level_bar.drawing_area.set_valign(gtk::Align::Center);
         mic_test_row.append(&mic_test_btn);
-        mic_test_row.append(&meter_widget);
+        mic_test_row.append(&level_bar.drawing_area);
         root_box.append(&mic_test_row);
-
-        // Input sensitivity
-        let sensitivity_scale =
-            gtk::Scale::with_range(gtk::Orientation::Horizontal, -60.0, 0.0, 1.0);
-        sensitivity_scale.set_hexpand(true);
-        sensitivity_scale.set_draw_value(true);
-        sensitivity_scale.set_value_pos(gtk::PositionType::Right);
-        sensitivity_scale.set_value(-40.0);
-        root_box.append(&hrow("Sensitivity (dB)", 140, &sensitivity_scale));
 
         // DSP section
         root_box.append(&section_label("AUDIO PROCESSING"));
@@ -269,13 +262,6 @@ impl Component for SettingsWindow {
             })
         };
 
-        let sensitivity_id = {
-            let s = sender.clone();
-            sensitivity_scale.connect_value_changed(move |sc| {
-                let _ = s.output(SettingsOutput::InputSensitivity(sc.value() as f32));
-            })
-        };
-
         let ns_selected_id = {
             let s = sender.clone();
             ns_dropdown.connect_selected_notify(move |dd| {
@@ -342,7 +328,7 @@ impl Component for SettingsWindow {
             settings: Settings::default(),
             mic_devices: Vec::new(),
             spk_devices: Vec::new(),
-            meter,
+            level_bar,
             mic_devices_cell,
             spk_devices_cell,
         };
@@ -352,7 +338,6 @@ impl Component for SettingsWindow {
             spk_dropdown,
             input_vol_scale,
             output_vol_scale,
-            sensitivity_scale,
             ns_dropdown,
             ec_switch,
             agc_switch,
@@ -365,7 +350,6 @@ impl Component for SettingsWindow {
             spk_selected_id,
             input_vol_id,
             output_vol_id,
-            sensitivity_id,
             ns_selected_id,
             ec_active_id,
             agc_active_id,
@@ -404,7 +388,7 @@ impl Component for SettingsWindow {
             }
 
             SettingsInput::SetLevel(db) => {
-                let _ = self.meter.sender().send(MeterInput::SetLevel(db));
+                self.level_bar.set_level(db);
             }
 
             SettingsInput::SetMicTestActive(active) => {
@@ -469,10 +453,10 @@ impl SettingsWindow {
 
     /// Sync every non-device-dropdown widget to the given settings snapshot.
     /// All signals are blocked so loading saved settings emits no outputs.
+    /// The level bar threshold is updated silently via `set_threshold_silent`.
     fn apply_settings_to_widgets(&self, widgets: &mut SettingsWindowWidgets, s: &Settings) {
         widgets.input_vol_scale.block_signal(&widgets.input_vol_id);
         widgets.output_vol_scale.block_signal(&widgets.output_vol_id);
-        widgets.sensitivity_scale.block_signal(&widgets.sensitivity_id);
         widgets.ns_dropdown.block_signal(&widgets.ns_selected_id);
         widgets.ec_switch.block_signal(&widgets.ec_active_id);
         widgets.agc_switch.block_signal(&widgets.agc_active_id);
@@ -481,7 +465,9 @@ impl SettingsWindow {
 
         widgets.input_vol_scale.set_value(s.input_volume);
         widgets.output_vol_scale.set_value(s.output_volume);
-        widgets.sensitivity_scale.set_value(s.input_sensitivity as f64);
+
+        // Threshold is on the level bar, not a GTK signal – set silently.
+        self.level_bar.set_threshold_silent(s.input_sensitivity);
 
         let ns_idx = match s.noise_suppression {
             NsLevel::Off => 0,
@@ -506,7 +492,6 @@ impl SettingsWindow {
 
         widgets.input_vol_scale.unblock_signal(&widgets.input_vol_id);
         widgets.output_vol_scale.unblock_signal(&widgets.output_vol_id);
-        widgets.sensitivity_scale.unblock_signal(&widgets.sensitivity_id);
         widgets.ns_dropdown.unblock_signal(&widgets.ns_selected_id);
         widgets.ec_switch.unblock_signal(&widgets.ec_active_id);
         widgets.agc_switch.unblock_signal(&widgets.agc_active_id);
