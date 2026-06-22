@@ -1,3 +1,7 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
 use engine::screen::audio::{has_pipewire, list_app_nodes, ShareAudio};
 use engine::screen::sources::{list_windows, ContentType, ShareConfig, ShareSource, ShareWindow};
 use engine::screen::thumbnail::thumbnail;
@@ -88,8 +92,12 @@ pub struct ScreenSharePicker {
     source_flow: gtk::FlowBox,
     /// Parallel list of card widgets for highlighting; index 0 = "Whole screen".
     source_cards: Vec<gtk::Box>,
+    /// Parallel list of Picture widgets for async thumbnail delivery; index 0 = "Whole screen".
+    thumb_pics: Vec<gtk::Picture>,
     /// Index into `source_cards` that is currently highlighted.
     selected_idx: usize,
+    /// "Running" flag for the current thumbnail worker. Flip to `false` to stop it.
+    thumb_worker: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -112,6 +120,8 @@ pub enum PickerInput {
     SetAudioNodes(Vec<engine::screen::audio::AudioNode>),
     /// Apply persisted settings: update model fields + button state atomically.
     ApplySettings { width: u32, height: u32, fps: u32, content: ContentType, audio: ShareAudio, bitrate_kbps: u32 },
+    /// Background worker delivers a captured thumbnail.
+    ThumbnailReady { index: usize, png: Vec<u8> },
     GoLive,
     Cancel,
 }
@@ -310,27 +320,27 @@ impl SimpleComponent for ScreenSharePicker {
         source_flow.set_selection_mode(gtk::SelectionMode::None);
 
         let mut source_cards: Vec<gtk::Box> = Vec::new();
+        let mut thumb_pics: Vec<gtk::Picture> = Vec::new();
+
+        // Build the initial source list for the thumbnail worker.
+        let mut init_sources: Vec<(usize, ShareSource)> = Vec::new();
 
         // "Whole screen" card at index 0.
-        let whole_card = build_card(
-            "Whole screen",
-            thumbnail(&ShareSource::Screen { monitor: 0 }, 240, 135),
-            true,
-        );
+        let (whole_card, whole_pic) = build_source_card("Whole screen", true);
         attach_card_click(&whole_card, 0, ShareSource::Screen { monitor: 0 }, &sender);
         source_flow.append(&whole_card);
         source_cards.push(whole_card);
+        thumb_pics.push(whole_pic);
+        init_sources.push((0, ShareSource::Screen { monitor: 0 }));
 
         for (i, w) in windows.iter().enumerate() {
             let xid = w.xid;
-            let card = build_card(
-                &w.title,
-                thumbnail(&ShareSource::Window { xid }, 240, 135),
-                false,
-            );
+            let (card, pic) = build_source_card(&w.title, false);
             attach_card_click(&card, i + 1, ShareSource::Window { xid }, &sender);
             source_flow.append(&card);
             source_cards.push(card);
+            thumb_pics.push(pic);
+            init_sources.push((i + 1, ShareSource::Window { xid }));
         }
 
         drop(windows);
@@ -485,7 +495,10 @@ impl SimpleComponent for ScreenSharePicker {
             .map(|&(_, h, _)| h)
             .unwrap_or(1080);
 
-        let model = ScreenSharePicker {
+        // Dead flag – replaced immediately by spawn_thumb_worker below.
+        let thumb_worker = Arc::new(AtomicBool::new(false));
+
+        let mut model = ScreenSharePicker {
             source: ShareSource::Screen { monitor: 0 },
             width: default_res_w,
             height: default_res_h,
@@ -504,8 +517,12 @@ impl SimpleComponent for ScreenSharePicker {
             bitrate_handler,
             source_flow: source_flow.clone(),
             source_cards,
+            thumb_pics,
             selected_idx: 0,
+            thumb_worker,
         };
+
+        model.spawn_thumb_worker(&sender, init_sources);
 
         let widgets = view_output!();
 
@@ -552,19 +569,29 @@ impl SimpleComponent for ScreenSharePicker {
             PickerInput::ApplySettings { width, height, fps, content, audio, bitrate_kbps } => {
                 self.apply_settings(width, height, fps, content, &audio, bitrate_kbps);
             }
+            PickerInput::ThumbnailReady { index, png } => {
+                if let Some(pic) = self.thumb_pics.get(index) {
+                    let bytes = gtk::glib::Bytes::from(&png);
+                    if let Ok(tex) = gtk::gdk::Texture::from_bytes(&bytes) {
+                        pic.set_paintable(Some(&tex));
+                    }
+                }
+            }
             PickerInput::GoLive => {
+                self.thumb_worker.store(false, Ordering::Relaxed);
                 let _ = sender.output(PickerOutput::GoLive(self.current_config()));
             }
             PickerInput::Cancel => {
+                self.thumb_worker.store(false, Ordering::Relaxed);
                 let _ = sender.output(PickerOutput::Cancel);
             }
         }
     }
 }
 
-/// Build a source card: optional thumbnail Picture above a title label, inside
-/// a styled rounded box. `selected` adds the `.selected` CSS class immediately.
-fn build_card(title: &str, png: Option<Vec<u8>>, selected: bool) -> gtk::Box {
+/// Build a source card with a placeholder Picture. Returns both the outer card
+/// `gtk::Box` and the inner `gtk::Picture` so thumbnails can be delivered later.
+fn build_source_card(title: &str, selected: bool) -> (gtk::Box, gtk::Picture) {
     let card = gtk::Box::new(gtk::Orientation::Vertical, 4);
     card.add_css_class("source-card");
 
@@ -577,13 +604,6 @@ fn build_card(title: &str, png: Option<Vec<u8>>, selected: bool) -> gtk::Box {
     picture.set_size_request(120, 68);
     picture.set_can_shrink(true);
 
-    if let Some(bytes) = png {
-        let glib_bytes = gtk::glib::Bytes::from_owned(bytes);
-        if let Ok(texture) = gtk::gdk::Texture::from_bytes(&glib_bytes) {
-            picture.set_paintable(Some(&texture));
-        }
-    }
-
     let label = gtk::Label::new(Some(title));
     label.set_ellipsize(gtk::pango::EllipsizeMode::End);
     label.set_max_width_chars(18);
@@ -592,7 +612,7 @@ fn build_card(title: &str, png: Option<Vec<u8>>, selected: bool) -> gtk::Box {
     card.append(&picture);
     card.append(&label);
 
-    card
+    (card, picture)
 }
 
 /// Wire a click gesture on `card` that sends `SelectSourceAt { idx, source }`.
@@ -746,31 +766,65 @@ impl ScreenSharePicker {
             self.source_flow.remove(&child);
         }
         self.source_cards.clear();
+        self.thumb_pics.clear();
+
+        let mut sources: Vec<(usize, ShareSource)> = Vec::new();
 
         // "Whole screen" at index 0.
-        let whole_card = build_card(
-            "Whole screen",
-            thumbnail(&ShareSource::Screen { monitor: 0 }, 240, 135),
-            true,
-        );
+        let (whole_card, whole_pic) = build_source_card("Whole screen", true);
         attach_card_click(&whole_card, 0, ShareSource::Screen { monitor: 0 }, sender);
         self.source_flow.append(&whole_card);
         self.source_cards.push(whole_card);
+        self.thumb_pics.push(whole_pic);
+        sources.push((0, ShareSource::Screen { monitor: 0 }));
 
         for (i, w) in windows.iter().enumerate() {
             let xid = w.xid;
-            let card = build_card(
-                &w.title,
-                thumbnail(&ShareSource::Window { xid }, 240, 135),
-                false,
-            );
+            let (card, pic) = build_source_card(&w.title, false);
             attach_card_click(&card, i + 1, ShareSource::Window { xid }, sender);
             self.source_flow.append(&card);
             self.source_cards.push(card);
+            self.thumb_pics.push(pic);
+            sources.push((i + 1, ShareSource::Window { xid }));
         }
 
         // Reset selection to "Whole screen".
         self.selected_idx = 0;
         self.source = ShareSource::Screen { monitor: 0 };
+
+        self.spawn_thumb_worker(sender, sources);
+    }
+
+    /// Stop any running worker and start a fresh one that captures thumbnails
+    /// sequentially, delivering each via `ThumbnailReady`, then sleeps 4 s
+    /// before repeating. At most one worker thread is alive at a time.
+    fn spawn_thumb_worker(
+        &mut self,
+        sender: &ComponentSender<Self>,
+        sources: Vec<(usize, ShareSource)>,
+    ) {
+        // Signal the previous worker to stop.
+        self.thumb_worker.store(false, Ordering::Relaxed);
+
+        let flag = Arc::new(AtomicBool::new(true));
+        self.thumb_worker = Arc::clone(&flag);
+
+        let sender = sender.clone();
+
+        std::thread::spawn(move || {
+            while flag.load(Ordering::Relaxed) {
+                for (index, src) in &sources {
+                    if !flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    if let Some(png) = thumbnail(src, 240, 135) {
+                        let _ = sender.input(PickerInput::ThumbnailReady { index: *index, png });
+                    }
+                }
+
+                std::thread::sleep(Duration::from_secs(4));
+            }
+        });
     }
 }
