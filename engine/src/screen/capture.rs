@@ -31,13 +31,17 @@ fn default_chain(cfg: &ShareConfig) -> String {
 
     let fps = effective_fps(cfg);
 
-    // `videorate` adapts the live capture to the target fps, and the trailing
-    // `queue` decouples the live `ximagesrc` thread from the downstream sink /
-    // encoder (a live source feeding `gtk4paintablesink` directly stalls without
-    // it – the cause of the black preview/share with a real screen).
+    // `videorate` adapts the live capture to the target fps. The trailing queue
+    // decouples `ximagesrc` from the downstream encoder/sink (without it a live
+    // source feeding `gtk4paintablesink` goes black). `leaky=downstream` drops
+    // the oldest buffered frame when full (newest-wins, lowest latency) so
+    // back-pressure never reaches the X grabber. Bounded to 3 buffers;
+    // `max-size-bytes=0`/`max-size-time=0` disable those limits because a
+    // single 4K frame exceeds the 10 MB default, which would misbehave.
     format!(
         "{src} ! videoconvert ! videorate ! videoscale \
-         ! video/x-raw,width={w},height={h},framerate={fps}/1 ! queue",
+         ! video/x-raw,width={w},height={h},framerate={fps}/1 \
+         ! queue leaky=downstream max-size-buffers=3 max-size-bytes=0 max-size-time=0",
         w = cfg.width,
         h = cfg.height,
     )
@@ -76,6 +80,10 @@ mod tests {
         assert!(chain.contains("ximagesrc"));
         assert!(chain.contains("framerate=60/1"));
         assert!(chain.contains("1920") && chain.contains("1080"));
+        assert!(chain.contains("leaky=downstream"));
+        assert!(chain.contains("max-size-buffers=3"));
+        assert!(chain.contains("max-size-bytes=0"));
+        assert!(chain.contains("max-size-time=0"));
     }
 
     #[test]
