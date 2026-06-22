@@ -11,7 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 /// S16LE / 48 kHz / mono / interleaved – the only format the DSP frame loop
 /// accepts. Both pipelines and every per-peer send appsrc share these caps.
-fn pcm_caps() -> gst::Caps {
+pub(super) fn pcm_caps() -> gst::Caps {
     gst::Caps::builder("audio/x-raw")
         .field("format", "S16LE")
         .field("channels", 1i32)
@@ -277,7 +277,7 @@ fn build_mic_pipeline(
 }
 
 /// Pull an interleaved S16 buffer out of a sample as an f32 frame.
-fn sample_to_f32(sample: &gst::Sample) -> Option<Vec<f32>> {
+pub(super) fn sample_to_f32(sample: &gst::Sample) -> Option<Vec<f32>> {
     let buffer = sample.buffer()?;
     let map = buffer.map_readable().ok()?;
 
@@ -290,7 +290,7 @@ fn sample_to_f32(sample: &gst::Sample) -> Option<Vec<f32>> {
 
 /// Reinterpret a little-endian byte slice as `i16` samples. The capsfilter
 /// guarantees S16LE, so length is always a multiple of two.
-fn bytemuck_cast(bytes: &[u8]) -> &[i16] {
+pub(super) fn bytemuck_cast(bytes: &[u8]) -> &[i16] {
     let len = bytes.len() / 2;
     // SAFETY: caps pin the format to S16LE interleaved, so the bytes are a valid
     // run of native-endian i16 on the little-endian targets this app supports.

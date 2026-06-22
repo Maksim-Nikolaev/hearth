@@ -1,5 +1,6 @@
 use crate::audio::capture::VoiceCapture;
 use crate::audio::dsp::{DspConfig, NsLevel};
+use crate::audio::monitor::Monitor;
 use crate::audio::gate::{ActivationMode, Gate};
 use crate::encoders;
 use crate::flow::{Flow, VideoSink};
@@ -308,6 +309,9 @@ pub struct Session {
     /// The single mic capture + DSP, shared by every Voice flow. Lazily started
     /// when the first voice peer connects, dropped when the last leaves.
     voice_capture: Option<VoiceCapture>,
+    /// Standalone loopback monitor for the Settings mic-test. Runs only when
+    /// NOT in a call; `start_mic_test`/`stop_mic_test` gate it.
+    mic_monitor: Option<Monitor>,
     /// Software activation gate, shared with the capture callback thread.
     gate: Arc<Mutex<Gate>>,
     dsp_config: DspConfig,
@@ -403,6 +407,7 @@ impl Session {
             screen_transport: Box::new(P2pTransport),
             peers: HashMap::new(),
             voice_capture: None,
+            mic_monitor: None,
             gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
             dsp_config: default_dsp_config(),
             input_device: None,
@@ -630,6 +635,31 @@ impl Session {
         self.restart_voice_capture();
     }
 
+    /// Start the standalone mic loopback for the Settings mic-test panel.
+    ///
+    /// Captures the mic, runs DSP, plays it back on the output device, and
+    /// emits `SessionEvent::InputLevel`. Should only be called when not in a
+    /// voice call (the UI enforces this in Task 10). Calling while already
+    /// running replaces the previous monitor.
+    pub fn start_mic_test(&mut self) {
+        self.mic_monitor = None;
+
+        match Monitor::start(
+            self.input_device.clone(),
+            self.output_device.clone(),
+            self.dsp_config.clone(),
+            self.evt_tx.clone(),
+        ) {
+            Ok(m) => self.mic_monitor = Some(m),
+            Err(e) => self.emit(SessionEvent::Error(format!("mic test: {e}"))),
+        }
+    }
+
+    /// Stop the mic-test loopback. No-op if not running.
+    pub fn stop_mic_test(&mut self) {
+        self.mic_monitor = None;
+    }
+
     /// Rebuild the shared capture with the current devices/config, re-registering
     /// every live Voice flow's send `appsrc`. No-op when no capture is running.
     fn restart_voice_capture(&mut self) {
@@ -757,6 +787,7 @@ mod tests {
                 screen_transport: Box::new(P2pTransport),
                 peers: HashMap::new(),
                 voice_capture: None,
+                mic_monitor: None,
                 gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
                 dsp_config: default_dsp_config(),
                 input_device: None,
