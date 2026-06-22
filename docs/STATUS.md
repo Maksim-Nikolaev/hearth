@@ -1,6 +1,6 @@
 # Hearth – Status
 
-_Living status doc. Last updated: 2026-06-21._
+_Living status doc. Last updated: 2026-06-22._
 
 Self-hosted, low-latency voice + high-fidelity screenshare + webcam for 2–3 close
 friends over a P2P mesh with a small Rust control server. Stack: **pure-Rust
@@ -24,6 +24,7 @@ congests independently (revised from the earlier single-bundle "Approach A").
 | M4 networked engine (Tasks 1–4) | ✅ done, Linux loopback GO | real `engine/` crate driven by the server, no `/tmp` |
 | M4 Task 5 (cross-machine) | ⏸ blocked – user-run on Windows | the Approach-A go/no-go; needs the Windows 11 box |
 | M5 Rust GTK4 desktop shell | ✅ done, verified | relm4 app: login + presence + chat + voice (engine) + screenshare share/view **in-window**; per-flow framework. 9 tasks, all committed on `main` |
+| M6 Discord group experience | ✅ done, verified | 3-pane shell (channels+self-panel \| stage+chat \| members); group **voice mesh** (smaller-UUID offerer); multi-sharer screenshare + Watching switcher behind a `ScreenTransport` seam. 7 tasks on `main`. Two-instance live run: voice mesh + bob renders alice's screenshare on the stage. |
 
 ## Component state
 
@@ -76,6 +77,32 @@ Runtime note: in-window video needs `gtk4paintablesink` from `gst-plugins-rs`,
 built locally and installed to `~/.local/lib/hearth-gst-plugins/`; the desktop
 app prepends it to `GST_PLUGIN_PATH` automatically.
 
+## M6 done (2026-06-22)
+
+Discord-style group experience on the M5 shell. Protocol gained voice/share
+messages; the backend gained a **voice sub-room** (membership roster + join/leave
+notify + share relay, integration-tested in `tests/voice.rs`). The engine
+`Session` decodes `self_id`/`self_name` from the JWT, builds a **group voice
+mesh** (one Voice `FlowPeer` per member, smaller-`Uuid` peer offers –
+`should_offer`), and fans screenshare to each voice member behind a
+**`ScreenTransport`** seam (`P2pTransport` now, SFU later). The desktop monolith
+split into relm4 components: `app.rs` (root: `Session` + routing) +
+`ui/{login,workspace,channels,self_panel,stage,chat,members}.rs` + `theme.rs`
+(dark CSS). 7 tasks, one commit each, on `main`. TDD for protocol/backend/engine;
+UI run-and-observe (see `desktop/README.md` M6 T5–T7).
+
+**Verified (two live instances, synthetic capture):** dark 3-pane shell; presence
++ chat; **join Voice → group voice mesh connects**; **Share → the viewer's stage
+renders the sharer's screen** (live `timeoverlay`) under a **Watching** switcher,
+with chat and voice running concurrently.
+
+**Known limitation (screenshare, same as the SFU gap):** `Offer/Answer/Ice` carry
+only `(peer, flow)` and the engine keys flows by `(peer, Flow)`, so two peers
+**sharing to each other simultaneously** collide on `(other, Screen)` and only one
+direction connects. The designed multi-sharer case (several share, others watch –
+distinct peer pairs) is unaffected. A per-stream id in the protocol fixes it;
+deferred alongside the screenshare SFU.
+
 ## Next candidates
 
 - **M4 Task 5** – cross-machine Windows↔Linux measurement (user-run; see
@@ -86,11 +113,11 @@ app prepends it to `GST_PLUGIN_PATH` automatically.
   already shows everyone.
 - **Polish** – theming, scroll-to-bottom chat, token-restore UX. (The startup
   GtkStack warning is fixed; presence verified race-free on simultaneous join.)
-- **M6 – Discord-style group experience (planned & approved, not started)** –
-  group voice mesh + multi-sharer screenshare + 3-pane Discord UI; spec + 7-task
-  plan in `docs/superpowers/{specs,plans}/2026-06-22-hearth-m6-*`. Execute inline.
-  Media: voice P2P mesh always; screenshare P2P now behind a `ScreenTransport`
-  seam, backend SFU later (target 5–8 gamers).
+- **Screenshare SFU** – server-side fan-out for 5–8 viewers, dropping into the
+  `ScreenTransport` seam; also fixes mutual same-pair screenshare via a per-stream
+  id in the protocol (see the M6 limitation above).
+- **Multiple voice channels / webcam flow** – the structure supports more Voice
+  channels and the per-flow `Webcam` variant; both deferred from M6.
 - **Deployment (later)** – Traefik proxy + coturn relay; packaging/auto-update.
 - **Post-M5 fixes landed:** re-share after Stop (replace-on-offer), GtkStack
   startup warning, presence verified race-free.
