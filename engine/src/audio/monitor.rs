@@ -62,7 +62,7 @@ fn build_in_pipeline(
     let pipeline = gst::Pipeline::new();
 
     let src = {
-        let b = gst::ElementFactory::make("pulsesrc");
+        let b = gst::ElementFactory::make(crate::audio::capture_src_factory());
         match input {
             Some(dev) => b.property("device", dev),
             None => b,
@@ -146,7 +146,7 @@ fn build_out_pipeline(output: Option<String>, appsrc: gst_app::AppSrc) -> Result
     let resample = gst::ElementFactory::make("audioresample").build()?;
 
     let sink = {
-        let b = gst::ElementFactory::make("pulsesink");
+        let b = gst::ElementFactory::make(crate::audio::playback_sink_factory());
         match output {
             Some(dev) => b.property("device", dev),
             None => b,

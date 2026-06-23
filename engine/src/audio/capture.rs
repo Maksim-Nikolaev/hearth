@@ -80,6 +80,16 @@ impl VoiceCapture {
         // so AEC needs no cross-pipeline far-end collection. Missing monitor =>
         // run without a reference (AEC still loads, just no far-end signal).
         let (ref_tx, ref_rx) = mpsc::channel::<Vec<f32>>();
+
+        // The AEC far-end reference is a PulseAudio sink monitor. On Windows the
+        // DSP is a passthrough (no AEC) and Pulse monitors don't exist, so skip
+        // it — remote playback goes through autoaudiosink independently.
+        #[cfg(target_os = "windows")]
+        let ref_pipeline: Option<gst::Pipeline> = {
+            let _ = (&output, ref_tx);
+            None
+        };
+        #[cfg(not(target_os = "windows"))]
         let ref_pipeline = match output {
             Some(sink) => build_ref_pipeline(&format!("{sink}.monitor"), ref_tx).ok(),
             None => None,
@@ -130,6 +140,8 @@ impl Drop for VoiceCapture {
 
 /// `pulsesrc <output>.monitor ! convert/resample ! S16/48k/mono ! appsink`.
 /// Each pulled 10 ms frame is forwarded as `Vec<f32>` to the `cap` callback.
+/// Linux/macOS only — the AEC reference relies on a PulseAudio sink monitor.
+#[cfg(not(target_os = "windows"))]
 fn build_ref_pipeline(monitor_device: &str, ref_tx: mpsc::Sender<Vec<f32>>) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::new();
 
@@ -184,7 +196,7 @@ fn build_mic_pipeline(
 ) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::new();
 
-    let src = gst::ElementFactory::make("pulsesrc");
+    let src = gst::ElementFactory::make(crate::audio::capture_src_factory());
     let src = match input {
         Some(dev) => src.property("device", dev),
         None => src,

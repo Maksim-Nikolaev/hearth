@@ -19,13 +19,32 @@ pub(crate) fn is_default(default_name: Option<&str>, id: &str) -> bool {
     default_name == Some(id)
 }
 
-/// The PipeWire/Pulse `node.name` (stable id) for a device, used as `device=`.
-fn device_node_name(d: &gst::Device) -> Option<String> {
+/// The stable id for a device, used as the `device=` value on the platform
+/// capture/playback element. PipeWire/Pulse expose `node.name`; WASAPI
+/// (`wasapi2`) exposes `device.id` (a GUID). Try them in order.
+fn device_id(d: &gst::Device) -> Option<String> {
     let props = d.properties()?;
     props
         .get::<String>("node.name")
         .or_else(|_| props.get::<String>("device.name"))
+        .or_else(|_| props.get::<String>("device.id"))
         .ok()
+}
+
+/// True when GStreamer marks this device as the system default (`device.default`
+/// on WASAPI). Used as a fallback when no explicit default name is known.
+fn property_is_default(d: &gst::Device) -> bool {
+    d.properties()
+        .and_then(|p| p.get::<bool>("device.default").ok())
+        .unwrap_or(false)
+}
+
+/// True when a WASAPI device is a render-endpoint loopback (system-audio
+/// capture surfaced as a source). It should not appear as a microphone choice.
+fn is_loopback_source(d: &gst::Device) -> bool {
+    d.properties()
+        .and_then(|p| p.get::<bool>("wasapi2.device.loopback").ok())
+        .unwrap_or(false)
 }
 
 pub(crate) fn device_to_info(d: &gst::Device, default_name: Option<&str>) -> Option<AudioDevice> {
@@ -37,9 +56,15 @@ pub(crate) fn device_to_info(d: &gst::Device, default_name: Option<&str>) -> Opt
     } else {
         return None;
     };
-    let id = device_node_name(d)?;
+
+    // A render endpoint exposed as a loopback "source" is system audio, not a mic.
+    if kind == DeviceKind::Source && is_loopback_source(d) {
+        return None;
+    }
+
+    let id = device_id(d)?;
     let label = d.display_name().to_string();
-    let is_default = is_default(default_name, &id);
+    let is_default = is_default(default_name, &id) || property_is_default(d);
 
     Some(AudioDevice { id, label, kind, is_default })
 }
