@@ -1,0 +1,16 @@
+# Keep the Docker build context small and reproducible. Note: all workspace
+# member crates (engine/, desktop/, protocol/) must stay in the context — cargo
+# needs every member's Cargo.toml to resolve the workspace, even though the
+# backend image only compiles hearth-backend.
+target/
+**/target/
+.git/
+.github/
+docs/
+*.log
+*.msi
+*.zip
+*.AppImage
+.env
+.env.*
+!.env.example

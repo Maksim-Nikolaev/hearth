@@ -1,12 +1,4 @@
-use anyhow::{anyhow, Result};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::thread::JoinHandle;
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConnectionExt, GrabMode, ModMask};
-use x11rb::protocol::Event;
+use anyhow::Result;
 
 /// Map a human-readable X11 key name to its keysym value.
 ///
@@ -36,6 +28,25 @@ pub fn keysym_from_name(name: &str) -> Option<u32> {
         _ => return None,
     })
 }
+
+#[cfg(target_os = "linux")]
+pub use linux::PttGrab;
+#[cfg(not(target_os = "linux"))]
+pub use stub::PttGrab;
+
+/// X11 global push-to-talk grab. Linux/X11 only.
+#[cfg(target_os = "linux")]
+mod linux {
+    use super::Result;
+    use anyhow::anyhow;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
+    use std::thread::JoinHandle;
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{ConnectionExt, GrabMode, ModMask};
+    use x11rb::protocol::Event;
 
 /// Convert a keysym to the X11 keycode by querying the keyboard mapping.
 ///
@@ -130,6 +141,31 @@ impl Drop for PttGrab {
 
         if let Some(h) = self.handle.take() {
             let _ = h.join();
+        }
+    }
+}
+} // mod linux
+
+/// Push-to-talk stub for platforms without a global-grab backend yet.
+///
+/// Keeps the engine compiling and the app running on Windows/macOS; a real
+/// global hotkey here needs a low-level keyboard hook (Win32 `WH_KEYBOARD_LL`
+/// on Windows, `CGEventTap` on macOS). Tracked as follow-up work — until then
+/// [`grab`](PttGrab::grab) reports the limitation instead of silently failing.
+#[cfg(not(target_os = "linux"))]
+mod stub {
+    use super::Result;
+    use anyhow::anyhow;
+
+    pub struct PttGrab {
+        _private: (),
+    }
+
+    impl PttGrab {
+        pub fn grab(_keysym: u32, _on_change: impl Fn(bool) + Send + 'static) -> Result<Self> {
+            Err(anyhow!(
+                "global push-to-talk is not yet implemented on this platform"
+            ))
         }
     }
 }

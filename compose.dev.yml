@@ -9,6 +9,28 @@ services:
       - "5433:5432"
     volumes:
       - hearth_pg:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hearth -d hearth"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      # Reaches Postgres over the compose network (service name + internal port).
+      DATABASE_URL: postgres://hearth:hearth@postgres:5432/hearth
+      JWT_SECRET: dev-only-change-me-min-32-bytes-long-secret
+      ACCESS_TTL_SECS: "900"
+      REFRESH_TTL_SECS: "2592000"
+      RUST_LOG: info
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
 
 volumes:
   hearth_pg:

@@ -16,6 +16,20 @@
 //! (always reports INVALID + a linear stride), so a tiled AMD pixmap decodes as
 //! garbage. DRI3 BuffersFromPixmap reports the authoritative modifier/stride.
 
+// Linux/X11 + DRI3 + Unix FD passing only. Gated so `cargo test`/`cargo build
+// --examples` stays green on Windows/macOS, where x11rb and OwnedFd are absent.
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("x11_gpu_capture_spike is a Linux/X11 + DRI3 spike; unsupported on this platform.");
+}
+
+#[cfg(target_os = "linux")]
+fn main() {
+    imp::main();
+}
+
+#[cfg(target_os = "linux")]
+mod imp {
 use std::os::fd::OwnedFd;
 
 use gstreamer as gst;
@@ -64,7 +78,7 @@ fn arg_u32(name: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
-fn main() {
+pub fn main() {
     let (conn, screen_num) = x11rb::connect(None).expect("connect to X");
     let root = conn.setup().roots[screen_num].root;
 
@@ -195,3 +209,4 @@ fn encode_dmabuf(frame: DmabufFrame, fps: u32, secs: u32) {
     let _ = pipeline.set_state(gst::State::Null);
     println!("wrote /tmp/spike.h265 ({n} frames @ {fps} fps)");
 }
+} // mod imp

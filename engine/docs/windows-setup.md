@@ -1,8 +1,13 @@
-# Engine on Windows 11 (Task 5 runbook)
+# Hearth on Windows 11
 
-Goal: build the same `engine` crate on the Windows 11 / AMD box and run the
-cross-machine screenshare test against a Hearth backend, with **no source edits**
-(everything adapts through environment variables).
+Build the `engine` crate and the full GTK4 desktop app on the Windows 11 / AMD
+box. Runtime behaviour still adapts through environment variables (capture chain,
+encoder, server), but the crates now need small **compile-time platform gates**:
+since M7 the engine pulls in X11 (`x11rb`) and the bundled `webrtc-audio-processing`
+build (autotools), neither of which works on Windows/MSVC. The `windows-dev`
+branch gates both behind `cfg(target_os = "linux")` and falls back to a screen
+capture with no window-enumeration and a passthrough voice DSP. See the
+**Desktop app (GTK4)** section below for the GUI build.
 
 ## 1. Toolchain
 
@@ -115,3 +120,54 @@ docker run -d --net=host coturn/coturn \
   --user test:test --realm hearth --listening-port 3478
 # then HEARTH_TURN="turn://test:test@<linux-lan-ip>:3478" on both engines
 ```
+
+---
+
+## Desktop app (GTK4)
+
+The `desktop` crate is a pure-Rust GTK4 + relm4 app. On Windows the cleanest
+MSVC path is the **prebuilt gvsbuild GTK4 bundle** (no from-source build).
+
+### 1. GTK4 (gvsbuild prebuilt)
+
+Download `GTK4_Gvsbuild_<ver>_x64.zip` from
+<https://github.com/wingtk/gvsbuild/releases/latest> and extract it so its files
+land at the prefix baked into the bundle's `.pc` files (currently
+`C:\gtk-build\gtk\x64\release`) — extracting elsewhere breaks pkg-config's
+`-I`/`-L` paths. Verify:
+
+```powershell
+$gtk = "C:\gtk-build\gtk\x64\release"
+$env:PKG_CONFIG_PATH = "$gtk\lib\pkgconfig;$env:GSTREAMER_1_0_ROOT_MSVC_X86_64\lib\pkgconfig"
+pkg-config --modversion gtk4   # expect 4.2x
+```
+
+### 2. Build + run
+
+GTK DLLs and GStreamer DLLs must both be on `PATH` at build and run time:
+
+```powershell
+$gtk = "C:\gtk-build\gtk\x64\release"
+$gst = $env:GSTREAMER_1_0_ROOT_MSVC_X86_64.TrimEnd('\')
+$env:Path = "$gtk\bin;$gst\bin;$env:USERPROFILE\.cargo\bin;$env:Path"
+$env:PKG_CONFIG_PATH = "$gtk\lib\pkgconfig;$gst\lib\pkgconfig"
+$env:LIB = "$gtk\lib;$env:LIB"
+
+cargo build -p desktop      # or: cargo build --workspace
+cargo run   -p desktop
+```
+
+The gvsbuild bundle ships the required runtime assets (`gschemas.compiled`,
+gdk-pixbuf `loaders.cache`, Adwaita icons), so the window opens without extra
+setup.
+
+### Known gap: in-window video
+
+`gtk4paintablesink` (the `gst-plugin-gtk4` element used to render a remote
+screenshare *inside* the window) is **not** in the stock GStreamer MSVC build, so
+viewing a stream in-window does not work yet on Windows. The app still launches,
+captures, and encodes (AMF). To close this gap, build/obtain `gstgtk4.dll` and
+drop it in `…\gstreamer\1.0\msvc_x86_64\lib\gstreamer-1.0\`, or point
+`GST_PLUGIN_PATH` at it. Push-to-talk (global key grab) is likewise a Linux-only
+path today; a Win32 `WH_KEYBOARD_LL` hook is the follow-up.
+

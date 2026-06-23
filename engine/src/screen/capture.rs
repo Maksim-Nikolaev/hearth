@@ -24,10 +24,7 @@ pub fn capture_chain(cfg: &ShareConfig) -> String {
 }
 
 fn default_chain(cfg: &ShareConfig) -> String {
-    let src = match cfg.source {
-        ShareSource::Screen { .. } => "ximagesrc use-damage=false".to_string(),
-        ShareSource::Window { xid } => format!("ximagesrc use-damage=false xid=0x{xid:x}"),
-    };
+    let src = source_element(&cfg.source);
 
     let fps = effective_fps(cfg);
 
@@ -47,6 +44,35 @@ fn default_chain(cfg: &ShareConfig) -> String {
     )
 }
 
+/// The platform capture source element, emitting system-memory video ready for
+/// the shared `videoconvert ! videorate ! videoscale` tail.
+#[cfg(target_os = "linux")]
+fn source_element(source: &ShareSource) -> String {
+    match source {
+        ShareSource::Screen { .. } => "ximagesrc use-damage=false".to_string(),
+        ShareSource::Window { xid } => format!("ximagesrc use-damage=false xid=0x{xid:x}"),
+    }
+}
+
+/// Windows: `d3d11screencapturesrc` yields GPU (D3D11) memory, so download to
+/// system memory before the shared `videoconvert` tail. Per-window capture is
+/// not wired yet (no window enumeration on Windows), so both source variants
+/// capture a full monitor.
+#[cfg(target_os = "windows")]
+fn source_element(source: &ShareSource) -> String {
+    match source {
+        ShareSource::Screen { monitor } => {
+            format!("d3d11screencapturesrc monitor-index={monitor} ! d3d11download")
+        },
+        ShareSource::Window { .. } => "d3d11screencapturesrc ! d3d11download".to_string(),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn source_element(_source: &ShareSource) -> String {
+    "videotestsrc is-live=true".to_string()
+}
+
 /// Resolve the actual fps ceiling: `Clarity` caps at 15, `Smoothness` keeps
 /// the configured value.
 fn effective_fps(cfg: &ShareConfig) -> u32 {
@@ -62,11 +88,28 @@ mod tests {
     use crate::screen::sources::{ContentType, ShareConfig, ShareSource};
 
     // Serializes all tests that read or write HEARTH_CAPTURE so parallel `cargo
-    // test` runs can't observe each other's transient env state.
+    // test` runs can't observe each other's transient env state. Every test that
+    // calls `capture_chain` must hold this (not just the writer), or it may read
+    // the writer's transient value. Poison-tolerant: a failing assertion in one
+    // test must not cascade-panic the others.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The capture source element for the current platform (used by the
+    /// platform-agnostic chain-shape assertions below).
+    #[cfg(target_os = "linux")]
+    const PLATFORM_SRC: &str = "ximagesrc";
+    #[cfg(target_os = "windows")]
+    const PLATFORM_SRC: &str = "d3d11screencapturesrc";
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    const PLATFORM_SRC: &str = "videotestsrc";
+
     #[test]
-    fn screen_chain_uses_ximagesrc_and_caps() {
+    fn screen_chain_uses_platform_source_and_caps() {
+        let _guard = env_guard();
         let cfg = ShareConfig {
             source: ShareSource::Screen { monitor: 0 },
             width: 1920,
@@ -77,7 +120,7 @@ mod tests {
         };
         let chain = capture_chain(&cfg);
 
-        assert!(chain.contains("ximagesrc"));
+        assert!(chain.contains(PLATFORM_SRC));
         assert!(chain.contains("framerate=60/1"));
         assert!(chain.contains("1920") && chain.contains("1080"));
         assert!(chain.contains("leaky=downstream"));
@@ -86,8 +129,10 @@ mod tests {
         assert!(chain.contains("max-size-time=0"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn window_chain_sets_xid() {
+        let _guard = env_guard();
         let cfg = ShareConfig {
             source: ShareSource::Window { xid: 0x1400003 },
             width: 1280,
@@ -103,6 +148,7 @@ mod tests {
 
     #[test]
     fn clarity_caps_fps_at_15() {
+        let _guard = env_guard();
         let cfg = ShareConfig {
             source: ShareSource::Screen { monitor: 0 },
             width: 1920,
@@ -119,6 +165,7 @@ mod tests {
 
     #[test]
     fn smoothness_keeps_configured_fps() {
+        let _guard = env_guard();
         let cfg = ShareConfig {
             source: ShareSource::Screen { monitor: 0 },
             width: 1280,
@@ -134,7 +181,7 @@ mod tests {
 
     #[test]
     fn env_override_bypasses_config() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_guard();
 
         std::env::set_var("HEARTH_CAPTURE", "videotestsrc is-live=true pattern=ball");
 

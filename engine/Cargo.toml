@@ -17,12 +17,22 @@ anyhow = "1"
 uuid = { version = "1", features = ["v7", "serde"] }
 base64 = "0.22"
 hearth-protocol = { path = "../protocol" }
+
+# Voice DSP (AEC/NS/AGC/VAD). The `bundled` build uses autotools and only links
+# under a Unix toolchain, so it is gated off Windows; `audio/dsp.rs` falls back
+# to a passthrough there (GStreamer `webrtcdsp` is the planned replacement).
+[target.'cfg(not(target_os = "windows"))'.dependencies]
 webrtc-audio-processing = { version = "0.3", features = ["bundled"] }
+
+# X11 is Linux-only: global push-to-talk grab (hotkey.rs) and window
+# enumeration (screen/sources.rs). Gated so the crate builds on Windows/macOS,
+# where those paths fall back to platform stubs.
+[target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["composite", "xfixes", "randr", "dri3"] }
 
 # Spike-only: the X11 GPU-capture feasibility example (engine/examples/).
-# Kept out of the shipped library build.
-[dev-dependencies]
+# Kept out of the shipped library build, and only built on Linux.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 khronos-egl = { version = "6", features = ["dynamic"] }
 gstreamer-allocators = "0.23"
 libloading = "0.8"

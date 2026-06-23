@@ -67,6 +67,15 @@ pub fn list_windows() -> Vec<ShareWindow> {
     list_windows_inner().unwrap_or_default()
 }
 
+/// Non-Linux platforms have no per-window enumeration yet; full-screen capture
+/// still works. Window picking on Windows would use the Graphics Capture API
+/// (WGC) / `EnumWindows`; tracked as follow-up.
+#[cfg(not(target_os = "linux"))]
+fn list_windows_inner() -> Option<Vec<ShareWindow>> {
+    None
+}
+
+#[cfg(target_os = "linux")]
 fn list_windows_inner() -> Option<Vec<ShareWindow>> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _};
@@ -116,6 +125,7 @@ mod tests {
 }
 
 /// Try `_NET_WM_NAME` (UTF-8) first, fall back to `WM_NAME` (Latin-1).
+#[cfg(target_os = "linux")]
 fn window_title(
     conn: &x11rb::rust_connection::RustConnection,
     xid: u32,
