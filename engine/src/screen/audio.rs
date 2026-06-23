@@ -82,9 +82,23 @@ pub(crate) fn keep_node(props: &NodeProps, own_pid: u32, filt: &NodeFilter) -> b
 }
 
 /// Returns `true` when PipeWire is available at runtime (the `pipewiresrc`
-/// GStreamer plugin factory can be found).
+/// GStreamer plugin factory can be found). Required only for *per-application*
+/// audio capture.
 pub fn has_pipewire() -> bool {
     gstreamer::ElementFactory::find("pipewiresrc").is_some()
+}
+
+/// Returns `true` when whole-system output capture is available — the platform
+/// loopback/monitor source element exists. Unlike per-app capture this does not
+/// need PipeWire (Windows uses `wasapi2src loopback`, Linux the `pulsesrc`
+/// sink monitor).
+pub fn has_system_audio() -> bool {
+    let factory = if cfg!(target_os = "windows") {
+        "wasapi2src"
+    } else {
+        "pulsesrc"
+    };
+    gstreamer::ElementFactory::find(factory).is_some()
 }
 
 /// List PipeWire application audio output nodes, excluding our own process.
@@ -217,22 +231,43 @@ pub(crate) fn parse_nodes(json: &serde_json::Value, own_pid: u32, filt: &NodeFil
 pub fn screen_audio_chain(a: &ShareAudio) -> Option<String> {
     match a {
         ShareAudio::None => None,
-        ShareAudio::System => Some(
-            "pulsesrc device=@DEFAULT_SINK@.monitor \
-             ! audioconvert \
-             ! audioresample \
-             ! audio/x-raw,rate=48000,channels=2 \
-             ! opusenc audio-type=generic"
-                .to_string(),
-        ),
-        ShareAudio::App { node } => Some(format!(
-            "pipewiresrc target-object={node} \
-             ! audioconvert \
-             ! audioresample \
-             ! audio/x-raw,rate=48000,channels=2 \
-             ! opusenc audio-type=generic"
-        )),
+        ShareAudio::System => Some(with_opus_tail(&system_audio_src())),
+        ShareAudio::App { node } => Some(with_opus_tail(&app_audio_src(node))),
     }
+}
+
+/// Append the shared convert/resample/encode tail to a source element string,
+/// producing stereo 48 kHz Opus ready for `rtpopuspay`.
+fn with_opus_tail(src: &str) -> String {
+    format!(
+        "{src} \
+         ! audioconvert \
+         ! audioresample \
+         ! audio/x-raw,rate=48000,channels=2 \
+         ! opusenc audio-type=generic"
+    )
+}
+
+/// System-output capture source. Linux/macOS tap the default PulseAudio sink
+/// monitor; Windows uses a WASAPI render-endpoint loopback.
+#[cfg(target_os = "windows")]
+fn system_audio_src() -> String {
+    "wasapi2src loopback=true".to_string()
+}
+#[cfg(not(target_os = "windows"))]
+fn system_audio_src() -> String {
+    "pulsesrc device=@DEFAULT_SINK@.monitor".to_string()
+}
+
+/// Per-application capture source. PipeWire targets a specific node; Windows has
+/// no per-process loopback in GStreamer, so fall back to whole-system loopback.
+#[cfg(target_os = "windows")]
+fn app_audio_src(_node: &str) -> String {
+    system_audio_src()
+}
+#[cfg(not(target_os = "windows"))]
+fn app_audio_src(node: &str) -> String {
+    format!("pipewiresrc target-object={node}")
 }
 
 #[cfg(test)]
@@ -261,12 +296,21 @@ mod tests {
     }
 
     #[test]
-    fn system_chain_uses_monitor_and_app_uses_target_object() {
+    fn system_chain_uses_platform_source() {
         assert!(screen_audio_chain(&ShareAudio::None).is_none());
-        assert!(screen_audio_chain(&ShareAudio::System).unwrap().contains(".monitor"));
 
+        let system = screen_audio_chain(&ShareAudio::System).unwrap();
+        assert!(system.contains("opusenc"));
+        #[cfg(target_os = "windows")]
+        assert!(system.contains("wasapi2src") && system.contains("loopback=true"));
+        #[cfg(not(target_os = "windows"))]
+        assert!(system.contains(".monitor"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn app_chain_targets_the_node() {
         let app = screen_audio_chain(&ShareAudio::App { node: "Firefox".into() }).unwrap();
-
         assert!(app.contains("target-object=Firefox"));
     }
 

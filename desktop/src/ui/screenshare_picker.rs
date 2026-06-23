@@ -76,7 +76,7 @@ pub struct ScreenSharePicker {
     bitrate_kbps: u32,
     audio_rows: Vec<AudioRow>,
     audio_idx: u32,
-    pipewire_available: bool,
+    system_audio: bool,
     /// Widgets for res/fps/content radio groups – held so `apply_settings` can
     /// activate the correct button without going through a message round-trip.
     /// The `SignalHandlerId` per entry lets us block the toggled handler during
@@ -299,11 +299,17 @@ impl SimpleComponent for ScreenSharePicker {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let pipewire_available = has_pipewire();
+        let system_audio = engine::screen::audio::has_system_audio();
         let app_nodes = list_app_nodes();
         let windows = list_windows();
 
         // ── Audio rows ──────────────────────────────────────────────────────
-        let mut audio_rows = vec![AudioRow::None, AudioRow::System];
+        // Whole-system capture needs only the platform loopback/monitor;
+        // per-application rows additionally need PipeWire.
+        let mut audio_rows = vec![AudioRow::None];
+        if system_audio {
+            audio_rows.push(AudioRow::System);
+        }
         for n in &app_nodes {
             audio_rows.push(AudioRow::App { node: n.node.clone(), label: n.label.clone() });
         }
@@ -314,9 +320,10 @@ impl SimpleComponent for ScreenSharePicker {
         );
         let audio_dropdown = gtk::DropDown::new(Some(audio_string_list), gtk::Expression::NONE);
 
-        if !pipewire_available {
+        // Disable only when there is no capturable audio at all.
+        if !system_audio && !pipewire_available {
             audio_dropdown.set_sensitive(false);
-            audio_dropdown.set_tooltip_text(Some("PipeWire not available – audio capture disabled"));
+            audio_dropdown.set_tooltip_text(Some("No audio capture backend available"));
         }
 
         // ── Source FlowBox + initial cards ──────────────────────────────────
@@ -529,7 +536,7 @@ impl SimpleComponent for ScreenSharePicker {
             bitrate_kbps: 6000,
             audio_rows,
             audio_idx: 0,
-            pipewire_available,
+            system_audio,
             res_btns,
             fps_btns,
             content_btns,
@@ -680,14 +687,11 @@ fn attach_card_click(
 
 impl ScreenSharePicker {
     fn current_config(&self) -> ShareConfig {
-        let audio = if !self.pipewire_available {
-            ShareAudio::None
-        } else {
-            self.audio_rows
-                .get(self.audio_idx as usize)
-                .map(AudioRow::to_share_audio)
-                .unwrap_or(ShareAudio::None)
-        };
+        let audio = self
+            .audio_rows
+            .get(self.audio_idx as usize)
+            .map(AudioRow::to_share_audio)
+            .unwrap_or(ShareAudio::None);
 
         ShareConfig {
             source: self.source.clone(),
@@ -791,7 +795,10 @@ impl ScreenSharePicker {
 
     /// Rebuild the audio dropdown from a freshly queried node list.
     fn rebuild_audio_rows(&mut self, nodes: Vec<engine::screen::audio::AudioNode>) {
-        self.audio_rows = vec![AudioRow::None, AudioRow::System];
+        self.audio_rows = vec![AudioRow::None];
+        if self.system_audio {
+            self.audio_rows.push(AudioRow::System);
+        }
 
         for n in &nodes {
             self.audio_rows.push(AudioRow::App { node: n.node.clone(), label: n.label.clone() });
