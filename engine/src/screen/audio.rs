@@ -254,9 +254,17 @@ pub fn screen_audio_chain(a: &ShareAudio) -> Option<String> {
 
 /// Append the shared convert/resample/encode tail to a source element string,
 /// producing stereo 48 kHz Opus ready for `rtpopuspay`.
+///
+/// The `queue leaky=downstream` right after the source decouples the live
+/// capture thread from the encoder/webrtc. Without it, while the screen
+/// `webrtcbin` is still negotiating, downstream stalls and back-pressures the
+/// live source — on Windows that overruns the WASAPI ring buffer and the device
+/// gets invalidated (`AUDCLNT_E_DEVICE_INVALIDATED`), which kills the shared
+/// screen pipeline (black video). Leaking drops old audio instead.
 fn with_opus_tail(src: &str) -> String {
     format!(
         "{src} \
+         ! queue leaky=downstream max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 \
          ! audioconvert \
          ! audioresample \
          ! audio/x-raw,rate=48000,channels=2 \

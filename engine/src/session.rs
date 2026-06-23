@@ -244,13 +244,20 @@ impl FlowPeer {
             match flow {
                 Flow::Voice => link_voice_recv(&pipeline, pad),
                 Flow::Screen => {
-                    // Distinguish the optional audio track (payload 98) from
-                    // the video track by checking the RTP media type in caps.
+                    // Distinguish the optional audio track (payload 98) from the
+                    // video track by the RTP caps: prefer the `media` field, fall
+                    // back to the codec (`encoding-name` OPUS) so a missing media
+                    // field never misroutes the video pad into the audio sink.
                     let is_audio = pad
                         .current_caps()
                         .as_ref()
-                        .and_then(|c| c.structure(0))
-                        .map(|s| s.get::<&str>("media").map(|m| m == "audio").unwrap_or(false))
+                        .and_then(|c| c.structure(0).map(|s| s.to_owned()))
+                        .map(|s| {
+                            s.get::<&str>("media").map(|m| m == "audio").unwrap_or(false)
+                                || s.get::<&str>("encoding-name")
+                                    .map(|e| e.eq_ignore_ascii_case("OPUS"))
+                                    .unwrap_or(false)
+                        })
                         .unwrap_or(false);
 
                     if is_audio {
