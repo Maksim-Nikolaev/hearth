@@ -5,6 +5,12 @@ group of close friends. Three independent media flows – voice, screenshare (wi
 audio), and webcam – over a peer-to-peer mesh, coordinated by a small Rust
 server. A persistent "always available" hangout, not a federated platform.
 
+> **Read [`docs/VISION.md`](docs/VISION.md) first.** The north star: state-of-the-art,
+> native, **lowest-latency** audio (< 50 ms, Mumble/TeamSpeak-class) and
+> **OBS-style per-source** screenshare (window/app/game video **with** matching
+> audio) — no Discord compromises. Voice transport is moving off WebRTC; see
+> [`docs/research/voice-transport.md`](docs/research/voice-transport.md).
+
 ## Status
 
 Implemented and verified on **Linux / X11** through M7 (auth, presence, chat,
