@@ -161,13 +161,34 @@ The gvsbuild bundle ships the required runtime assets (`gschemas.compiled`,
 gdk-pixbuf `loaders.cache`, Adwaita icons), so the window opens without extra
 setup.
 
-### Known gap: in-window video
+### In-window video (gtk4paintablesink)
 
-`gtk4paintablesink` (the `gst-plugin-gtk4` element used to render a remote
-screenshare *inside* the window) is **not** in the stock GStreamer MSVC build, so
-viewing a stream in-window does not work yet on Windows. The app still launches,
-captures, and encodes (AMF). To close this gap, build/obtain `gstgtk4.dll` and
-drop it in `…\gstreamer\1.0\msvc_x86_64\lib\gstreamer-1.0\`, or point
-`GST_PLUGIN_PATH` at it. Push-to-talk (global key grab) is likewise a Linux-only
-path today; a Win32 `WH_KEYBOARD_LL` hook is the follow-up.
+`gtk4paintablesink` (from `gst-plugin-gtk4`) renders a remote screenshare
+*inside* the window. It is **not** in the stock GStreamer MSVC build (it needs
+GTK at build time), so build it once against the installed GTK4 + GStreamer:
+
+```powershell
+. .\scripts\dev\win-env.ps1
+.\scripts\dev\build-gtk4-plugin.ps1     # clones gst-plugins-rs, builds + installs gstgtk4.dll
+```
+
+This installs `gstgtk4.dll` to `%LOCALAPPDATA%\hearth\gst-plugins`, which the app
+adds to `GST_PLUGIN_PATH` automatically.
+
+Two Windows-specific hazards the app handles in `main.rs`, both from GTK shipping
+a **newer GLib** than the GStreamer binaries (2.88 vs 2.80):
+
+- **PATH order** — GTK's `bin` must precede GStreamer's so GTK's GLib loads
+  first (GStreamer 1.26 runs fine against the newer GLib; the reverse fails with
+  "specified procedure could not be found"). `win-env.ps1` / `launch-test.ps1`
+  do this; a packaged build ships a single GLib.
+- **In-process scan** — GStreamer's `gst-plugin-scanner.exe` lives in the
+  GStreamer install and loads the *old* GLib, so it blacklists the plugin. The
+  app sets `GST_REGISTRY_FORK=no` (scan in-process) and a Hearth-owned
+  `GST_REGISTRY` (isolated from the poisonable shared default).
+
+### Push-to-talk
+
+Global push-to-talk on Windows uses a Win32 `WH_KEYBOARD_LL` low-level keyboard
+hook (engine `hotkey.rs`), so PTT fires even when the app is unfocused.
 

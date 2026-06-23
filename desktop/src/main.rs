@@ -9,6 +9,7 @@ fn main() {
     install_panic_logger();
 
     ensure_gst_plugin_path();
+    ensure_inprocess_plugin_scan();
     gstreamer::init().expect("init gstreamer");
 
     let config = config::Config::load();
@@ -63,6 +64,41 @@ fn ensure_gst_plugin_path() {
 
     std::env::set_var("GST_PLUGIN_PATH", combined);
 }
+
+/// Windows only: make `gtk4paintablesink` (`gstgtk4`) loadable.
+///
+/// Two GStreamer-on-Windows hazards, both rooted in GTK shipping a newer GLib
+/// than the GStreamer binaries:
+///
+/// 1. The plugin scanner runs as `gst-plugin-scanner.exe`, which lives in the
+///    GStreamer install and loads GStreamer's older GLib — too old for the
+///    plugin, so it gets blacklisted. `GST_REGISTRY_FORK=no` scans in-process
+///    instead, reusing the GLib the app already loaded (GTK's, since GTK leads
+///    on PATH).
+/// 2. The shared default registry can be poisoned by a prior failed scan (or by
+///    other GStreamer tools), and the blacklist sticks while the file is
+///    unchanged. A Hearth-owned registry keeps our good scan isolated.
+///
+/// No-op elsewhere.
+#[cfg(target_os = "windows")]
+fn ensure_inprocess_plugin_scan() {
+    if std::env::var_os("GST_REGISTRY_FORK").is_none() {
+        std::env::set_var("GST_REGISTRY_FORK", "no");
+    }
+
+    if std::env::var_os("GST_REGISTRY").is_none() {
+        if let Some(base) = std::env::var_os("LOCALAPPDATA") {
+            let mut reg = std::path::PathBuf::from(base);
+            reg.push("hearth");
+            let _ = std::fs::create_dir_all(&reg);
+            reg.push("registry.bin");
+            std::env::set_var("GST_REGISTRY", reg);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_inprocess_plugin_scan() {}
 
 /// Linux/macOS: `~/.local/lib/hearth-gst-plugins`.
 #[cfg(not(target_os = "windows"))]

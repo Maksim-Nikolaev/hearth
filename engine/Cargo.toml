@@ -30,6 +30,15 @@ webrtc-audio-processing = { version = "0.3", features = ["bundled"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["composite", "xfixes", "randr", "dri3"] }
 
+# Windows global push-to-talk uses a WH_KEYBOARD_LL low-level keyboard hook.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+] }
+
 # Spike-only: the X11 GPU-capture feasibility example (engine/examples/).
 # Kept out of the shipped library build, and only built on Linux.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
