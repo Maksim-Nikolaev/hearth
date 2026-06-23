@@ -231,7 +231,18 @@ impl Component for AppModel {
                         if let Some(s) = self.session.as_mut() {
                             match out {
                                 WorkspaceOutput::JoinVoice => s.join_voice(),
-                                WorkspaceOutput::LeaveVoice => s.leave_voice(),
+                                WorkspaceOutput::LeaveVoice => {
+                                    // Discord-like: leaving the call also stops
+                                    // your screenshare (idempotent if not sharing).
+                                    self.previewed_source = None;
+                                    s.stop_preview();
+                                    s.stop_share();
+                                    self.share_picker.widget().set_visible(false);
+                                    let _ = self.workspace.sender().send(
+                                        WorkspaceInput::SetSharing(false),
+                                    );
+                                    s.leave_voice();
+                                }
                                 WorkspaceOutput::Mute(b) => s.mute(b),
                                 WorkspaceOutput::Deafen(b) => s.deafen(b),
                                 WorkspaceOutput::StopShare => {

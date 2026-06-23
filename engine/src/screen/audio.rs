@@ -276,7 +276,14 @@ fn with_opus_tail(src: &str) -> String {
 /// monitor; Windows uses a WASAPI render-endpoint loopback.
 #[cfg(target_os = "windows")]
 fn system_audio_src() -> String {
-    "wasapi2src loopback=true low-latency=true".to_string()
+    // Exclude our own process from the system mix so the shared audio doesn't
+    // include the peers' voice the app is already playing back — otherwise they
+    // hear themselves echoed. (Discord-style "system audio minus the call".)
+    format!(
+        "wasapi2src loopback=true low-latency=true \
+         loopback-mode=exclude-process-tree loopback-target-pid={}",
+        std::process::id()
+    )
 }
 #[cfg(not(target_os = "windows"))]
 fn system_audio_src() -> String {
