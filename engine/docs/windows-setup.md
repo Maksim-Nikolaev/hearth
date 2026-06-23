@@ -192,3 +192,18 @@ a **newer GLib** than the GStreamer binaries (2.88 vs 2.80):
 Global push-to-talk on Windows uses a Win32 `WH_KEYBOARD_LL` low-level keyboard
 hook (engine `hotkey.rs`), so PTT fires even when the app is unfocused.
 
+### Packaging a self-contained build
+
+```powershell
+. .\scripts\dev\win-env.ps1
+.\scripts\dev\build-gtk4-plugin.ps1   # once, if gstgtk4.dll isn't built yet
+.\scripts\dev\package-windows.ps1     # -> dist\hearth\ (hearth.exe + all DLLs)
+```
+
+`dist\hearth\` runs with nothing installed on the machine. The app detects the
+packaged layout (`lib\gstreamer-1.0` next to the exe) in `main.rs` and points
+`GST_PLUGIN_SYSTEM_PATH`, `GDK_PIXBUF_MODULE_FILE`, and `GSETTINGS_SCHEMA_DIR` at
+the bundled resources. GTK DLLs are laid down first so the whole bundle shares
+GTK's newer GLib (GStreamer is forward-compatible), which is what lets the
+bundled `gstgtk4` load. Verified by launching with only `System32` on `PATH`.
+

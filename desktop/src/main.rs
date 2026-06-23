@@ -8,6 +8,7 @@ use relm4::RelmApp;
 fn main() {
     install_panic_logger();
 
+    setup_portable_runtime();
     ensure_gst_plugin_path();
     ensure_inprocess_plugin_scan();
     gstreamer::init().expect("init gstreamer");
@@ -64,6 +65,37 @@ fn ensure_gst_plugin_path() {
 
     std::env::set_var("GST_PLUGIN_PATH", combined);
 }
+
+/// When running from a self-contained package — a `lib\gstreamer-1.0` folder
+/// sits next to the executable — point GStreamer, gdk-pixbuf, and GSettings at
+/// the bundled resources so nothing needs to be installed on the machine.
+/// No-op in a dev build (no such folder) and on non-Windows.
+#[cfg(target_os = "windows")]
+fn setup_portable_runtime() {
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(root) = exe.parent() else { return };
+
+    let plugins = root.join("lib").join("gstreamer-1.0");
+    if !plugins.exists() {
+        return; // dev build, not a packaged layout
+    }
+
+    let set = |k: &str, v: std::path::PathBuf| {
+        if std::env::var_os(k).is_none() {
+            std::env::set_var(k, v);
+        }
+    };
+
+    // Use only the bundled plugins; do not scan a machine-wide GStreamer install.
+    set("GST_PLUGIN_SYSTEM_PATH", plugins.clone());
+    set("GST_PLUGIN_PATH", plugins);
+    set("GDK_PIXBUF_MODULE_FILE", root.join("lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"));
+    set("GSETTINGS_SCHEMA_DIR", root.join("share/glib-2.0/schemas"));
+    // GST_REGISTRY is left to ensure_inprocess_plugin_scan (a writable per-user path).
+}
+
+#[cfg(not(target_os = "windows"))]
+fn setup_portable_runtime() {}
 
 /// Windows only: make `gtk4paintablesink` (`gstgtk4`) loadable.
 ///

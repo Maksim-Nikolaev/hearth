@@ -23,6 +23,9 @@ build/
 *.age
 secrets.dec.*
 
+# Packaged Windows build
+dist/
+
 # Build artifacts / installers
 *.AppImage
 *.exe
