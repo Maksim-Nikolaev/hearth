@@ -519,9 +519,13 @@ pub(crate) fn link_video_recv(pipeline: &gst::Pipeline, pad: &gst::Pad, vsink: &
 fn audio_recv_sink() -> gst::Element {
     #[cfg(target_os = "windows")]
     {
+        // sync=true (clock-synced) is deliberate: with sync=false the WASAPI
+        // ring buffer accumulates and audio latency grows unbounded (~1 s+ over
+        // a call). Synced playback stays bounded by the jitter buffer; low-latency
+        // keeps the device buffer small.
         gst::ElementFactory::make("wasapi2sink")
             .property("low-latency", true)
-            .property("sync", false)
+            .property("sync", true)
             .build()
             .expect("create wasapi2sink")
     }

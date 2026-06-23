@@ -258,6 +258,11 @@ impl SimpleComponent for Workspace {
                 } else {
                     self.voice.clear();
                     self.sharing = false;
+                    // Leaving the call clears the stage: stop watching anyone and
+                    // drop their (now-frozen) frames so no black box lingers.
+                    self.sharers.clear();
+                    self.screens.borrow_mut().clear();
+                    self.selected = None;
                     let _ = self.self_panel.sender().send(SelfPanelInput::SetShareActive(false));
                     let _ = sender.output(WorkspaceOutput::LeaveVoice);
                 }
