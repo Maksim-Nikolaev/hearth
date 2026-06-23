@@ -45,23 +45,47 @@ fn install_panic_logger() {
     }));
 }
 
-/// Dev convenience: make the locally-built `gtk4paintablesink` discoverable so
-/// in-window video works without the caller exporting GST_PLUGIN_PATH.
+/// Dev convenience: make the locally-built `gtk4paintablesink` (`gstgtk4`)
+/// discoverable so in-window video works without the caller exporting
+/// GST_PLUGIN_PATH. The plugin ships in `gst-plugins-rs`, not in the stock
+/// GStreamer binaries, so it is built/installed out of band per platform.
 fn ensure_gst_plugin_path() {
-    let Some(home) = std::env::var_os("HOME") else { return };
+    let Some(dir) = hearth_plugin_dir().filter(|d| d.exists()) else { return };
 
-    let mut dir = std::path::PathBuf::from(home);
-    dir.push(".local/lib/hearth-gst-plugins");
-    if !dir.exists() {
-        return;
-    }
-
+    // Windows uses ';' as the GST_PLUGIN_PATH separator, Unix uses ':'.
+    let sep = if cfg!(windows) { ';' } else { ':' };
     let existing = std::env::var("GST_PLUGIN_PATH").unwrap_or_default();
     let combined = if existing.is_empty() {
         dir.display().to_string()
     } else {
-        format!("{}:{}", dir.display(), existing)
+        format!("{}{}{}", dir.display(), sep, existing)
     };
 
     std::env::set_var("GST_PLUGIN_PATH", combined);
+}
+
+/// Linux/macOS: `~/.local/lib/hearth-gst-plugins`.
+#[cfg(not(target_os = "windows"))]
+fn hearth_plugin_dir() -> Option<std::path::PathBuf> {
+    let mut dir = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    dir.push(".local/lib/hearth-gst-plugins");
+    Some(dir)
+}
+
+/// Windows: a `gst-plugins\` folder next to the executable (packaged app) takes
+/// precedence; otherwise `%LOCALAPPDATA%\hearth\gst-plugins` (dev).
+#[cfg(target_os = "windows")]
+fn hearth_plugin_dir() -> Option<std::path::PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(adjacent) = exe.parent().map(|p| p.join("gst-plugins")) {
+            if adjacent.exists() {
+                return Some(adjacent);
+            }
+        }
+    }
+
+    let mut dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+    dir.push("hearth");
+    dir.push("gst-plugins");
+    Some(dir)
 }
