@@ -1,5 +1,6 @@
 pub mod audio;
 #[cfg(target_os = "windows")]
+#[allow(dead_code)] // enumeration is ready; wired back in once capture is isolated
 mod audio_win;
 pub mod backend;
 pub mod capture;

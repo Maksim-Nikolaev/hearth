@@ -114,7 +114,13 @@ pub fn has_system_audio() -> bool {
 /// loopback. Returns an empty `Vec` when unavailable.
 #[cfg(target_os = "windows")]
 pub fn list_app_nodes() -> Vec<AudioNode> {
-    super::audio_win::list_audio_sessions()
+    // Per-app capture is temporarily withheld on Windows: a WASAPI process
+    // loopback whose target isn't actively rendering fails to open (and can
+    // hang) the source, which blocks the SHARED screen pipeline's transition to
+    // PLAYING — blacking out the video. Re-enable once screen-audio capture is
+    // isolated from the video pipeline (like VoiceCapture / a fallbacksrc).
+    // The enumeration itself (`audio_win::list_audio_sessions`) already works.
+    Vec::new()
 }
 
 #[cfg(not(target_os = "windows"))]
