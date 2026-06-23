@@ -477,9 +477,7 @@ fn try_link_screen_audio_recv(pipeline: &gst::Pipeline, pad: &gst::Pad) -> Resul
     let dec = gst::ElementFactory::make("opusdec").build()?;
     let conv = gst::ElementFactory::make("audioconvert").build()?;
     let resample = gst::ElementFactory::make("audioresample").build()?;
-    let sink = gst::ElementFactory::make("autoaudiosink")
-        .property("sync", false)
-        .build()?;
+    let sink = audio_recv_sink();
 
     pipeline.add_many([&depay, &dec, &conv, &resample, &sink])?;
     gst::Element::link_many([&depay, &dec, &conv, &resample, &sink])?;
@@ -514,6 +512,28 @@ pub(crate) fn link_video_recv(pipeline: &gst::Pipeline, pad: &gst::Pad, vsink: &
     println!("incoming video linked -> displaying");
 }
 
+/// Playback sink for received audio. On Windows use `wasapi2sink low-latency`
+/// (autoaudiosink doesn't expose buffer tuning, and WASAPI's default ring buffer
+/// adds up to ~1 s of delay); elsewhere `autoaudiosink`. `sync=false` renders on
+/// arrival — the webrtcbin jitter buffer already handles de-jitter.
+fn audio_recv_sink() -> gst::Element {
+    #[cfg(target_os = "windows")]
+    {
+        gst::ElementFactory::make("wasapi2sink")
+            .property("low-latency", true)
+            .property("sync", false)
+            .build()
+            .expect("create wasapi2sink")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        gst::ElementFactory::make("autoaudiosink")
+            .property("sync", false)
+            .build()
+            .expect("create autoaudiosink")
+    }
+}
+
 pub(crate) fn link_voice_recv(pipeline: &gst::Pipeline, pad: &gst::Pad) {
     let depay = gst::ElementFactory::make("rtpopusdepay").build().unwrap();
     let dec = gst::ElementFactory::make("opusdec").build().unwrap();
@@ -521,7 +541,7 @@ pub(crate) fn link_voice_recv(pipeline: &gst::Pipeline, pad: &gst::Pad) {
     let resample = gst::ElementFactory::make("audioresample").build().unwrap();
     // deafen gate: drop=true silences incoming audio without tearing the flow down.
     let valve = gst::ElementFactory::make("valve").name("spk_valve").property("drop", false).build().unwrap();
-    let sink = gst::ElementFactory::make("autoaudiosink").property("sync", false).build().unwrap();
+    let sink = audio_recv_sink();
 
     pipeline.add_many([&depay, &dec, &conv, &resample, &valve, &sink]).unwrap();
     gst::Element::link_many([&depay, &dec, &conv, &resample, &valve, &sink]).unwrap();

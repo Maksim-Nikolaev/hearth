@@ -203,6 +203,11 @@ fn build_mic_pipeline(
     }
     .build()?;
 
+    // WASAPI defaults to a large capture ring buffer; low-latency mode (safe to
+    // enable per the element docs) keeps mic delay minimal on Windows.
+    #[cfg(target_os = "windows")]
+    src.set_property("low-latency", true);
+
     let convert = gst::ElementFactory::make("audioconvert").build()?;
     let resample = gst::ElementFactory::make("audioresample").build()?;
     let caps = gst::ElementFactory::make("capsfilter").property("caps", pcm_caps()).build()?;

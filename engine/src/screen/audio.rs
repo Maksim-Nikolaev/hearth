@@ -268,7 +268,7 @@ fn with_opus_tail(src: &str) -> String {
 /// monitor; Windows uses a WASAPI render-endpoint loopback.
 #[cfg(target_os = "windows")]
 fn system_audio_src() -> String {
-    "wasapi2src loopback=true".to_string()
+    "wasapi2src loopback=true low-latency=true".to_string()
 }
 #[cfg(not(target_os = "windows"))]
 fn system_audio_src() -> String {
@@ -282,7 +282,7 @@ fn system_audio_src() -> String {
 fn app_audio_src(node: &str) -> String {
     match node.parse::<u32>() {
         Ok(pid) => format!(
-            "wasapi2src loopback=true loopback-mode=include-process-tree loopback-target-pid={pid}"
+            "wasapi2src loopback=true low-latency=true loopback-mode=include-process-tree loopback-target-pid={pid}"
         ),
         Err(_) => system_audio_src(),
     }
