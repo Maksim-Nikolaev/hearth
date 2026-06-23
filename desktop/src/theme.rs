@@ -1,6 +1,16 @@
 /// Install the dark, Discord-like CSS on the default display. Safe to call once
 /// at startup after GTK is initialized.
 pub fn load() {
+    // The CSS below only colours our own widget classes; the base GTK widgets
+    // (buttons, entries, scrollbars, header bars, popovers) follow the active
+    // Adwaita variant. Without this, that variant defaults to *light* on
+    // Windows (where no desktop environment sets a dark preference), so the
+    // chrome renders light against our dark panels. Request the dark variant so
+    // the whole UI is consistent. Hearth is a dark-themed app by design.
+    if let Some(settings) = gtk::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(true);
+    }
+
     let Some(display) = gtk::gdk::Display::default() else {
         return;
     };
