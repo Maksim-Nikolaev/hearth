@@ -7,3 +7,4 @@ pub mod hotkey;
 pub mod screen;
 pub mod session;
 pub mod signaling;
+pub mod voice_udp;

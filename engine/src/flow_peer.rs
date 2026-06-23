@@ -516,7 +516,7 @@ pub(crate) fn link_video_recv(pipeline: &gst::Pipeline, pad: &gst::Pad, vsink: &
 /// (autoaudiosink doesn't expose buffer tuning, and WASAPI's default ring buffer
 /// adds up to ~1 s of delay); elsewhere `autoaudiosink`. `sync=false` renders on
 /// arrival — the webrtcbin jitter buffer already handles de-jitter.
-fn audio_recv_sink() -> gst::Element {
+pub(crate) fn audio_recv_sink() -> gst::Element {
     #[cfg(target_os = "windows")]
     {
         // sync=true (clock-synced) is deliberate: with sync=false the WASAPI

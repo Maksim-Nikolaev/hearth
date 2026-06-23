@@ -392,12 +392,6 @@ impl FlowPeer {
         self.webrtc.emit_by_name::<()>("add-ice-candidate", &[&mline, &candidate.to_string()]);
     }
 
-    fn set_valve(&self, name: &str, drop: bool) {
-        if let Some(v) = self.pipeline.by_name(name) {
-            v.set_property("drop", drop);
-        }
-    }
-
     fn stop(&self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
@@ -423,7 +417,11 @@ pub struct Session {
     /// Config supplied to the most recent `start_share`. Used to build the
     /// capture+caps chain for each Screen offerer flow.
     share_config: ShareConfig,
+    /// Screen (and webcam) flows, each a `webrtcbin`. Voice no longer lives here
+    /// — it uses the low-latency UDP transport in `voice_peers`.
     pub(crate) peers: HashMap<(Uuid, Flow), FlowPeer>,
+    /// Voice flows, one thin RTP/Opus-over-UDP transport per peer (no webrtcbin).
+    voice_peers: HashMap<Uuid, crate::voice_udp::VoiceUdpPeer>,
     /// The single mic capture + DSP, shared by every Voice flow. Lazily started
     /// when the first voice peer connects, dropped when the last leaves.
     voice_capture: Option<VoiceCapture>,
@@ -532,6 +530,7 @@ impl Session {
             screen_transport: Box::new(P2pTransport),
             share_config: ShareConfig::default(),
             peers: HashMap::new(),
+            voice_peers: HashMap::new(),
             voice_capture: None,
             mic_monitor: None,
             gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
@@ -574,9 +573,11 @@ impl Session {
     pub fn leave_voice(&mut self) {
         // Leaving the call disconnects every media flow — voice AND any
         // screenshare being watched (Discord-like). Chat/presence are untouched.
-        let all: Vec<(Uuid, Flow)> = self.peers.keys().copied().collect();
+        self.voice_peers.clear();
+        self.voice_capture = None;
 
-        for (peer, flow) in all {
+        let screen: Vec<(Uuid, Flow)> = self.peers.keys().copied().collect();
+        for (peer, flow) in screen {
             // Clear the stage for a screenshare we were watching.
             if flow == Flow::Screen {
                 self.emit(SessionEvent::ShareStopped { user: peer });
@@ -600,14 +601,69 @@ impl Session {
             self.voice_members.push(peer);
         }
 
-        if self.peers.contains_key(&(peer, Flow::Voice)) {
+        if self.voice_peers.contains_key(&peer) {
             return;
         }
 
         if should_offer(self.self_id, peer) {
-            if let Err(e) = self.start_offerer(peer, Flow::Voice) {
+            if let Err(e) = self.voice_offer(peer) {
                 self.emit(SessionEvent::Error(format!("voice offer: {e}")));
             }
+        }
+    }
+
+    /// Offerer side of a UDP voice flow: build the transport, register the mic
+    /// send, and hand the peer our `ip:port` (carried in the Offer's `sdp`).
+    fn voice_offer(&mut self, peer: Uuid) -> Result<()> {
+        let p = crate::voice_udp::VoiceUdpPeer::new(peer)?;
+        let endpoint = p.local_endpoint();
+        self.voice_peers.insert(peer, p);
+        self.register_voice_send(peer);
+        let _ = self.out_tx.send(ClientMessage::Offer {
+            to: peer,
+            flow: Flow::Voice,
+            sdp: endpoint,
+        });
+        Ok(())
+    }
+
+    /// Answerer side: the peer sent their endpoint; build our transport pointed
+    /// at them and reply with ours.
+    fn voice_on_offer(&mut self, from: Uuid, endpoint: &str) {
+        self.stop_voice(from); // a re-offer replaces any stale transport
+        match crate::voice_udp::VoiceUdpPeer::new(from) {
+            Ok(p) => {
+                if let Err(e) = p.set_remote(endpoint) {
+                    self.emit(SessionEvent::Error(format!("voice endpoint: {e}")));
+                }
+                let my_endpoint = p.local_endpoint();
+                self.voice_peers.insert(from, p);
+                self.register_voice_send(from);
+                let _ = self.out_tx.send(ClientMessage::Answer {
+                    to: from,
+                    flow: Flow::Voice,
+                    sdp: my_endpoint,
+                });
+            },
+            Err(e) => self.emit(SessionEvent::Error(format!("voice transport: {e}"))),
+        }
+    }
+
+    /// Offerer received the answer: point our sender at the peer.
+    fn voice_on_answer(&mut self, from: Uuid, endpoint: &str) {
+        if let Some(p) = self.voice_peers.get(&from) {
+            if let Err(e) = p.set_remote(endpoint) {
+                self.emit(SessionEvent::Error(format!("voice endpoint: {e}")));
+            }
+        }
+    }
+
+    /// Tear down one voice peer and unregister its mic send.
+    fn stop_voice(&mut self, peer: Uuid) {
+        if let Some(p) = self.voice_peers.remove(&peer) {
+            let appsrc = Some(p.voice_appsrc());
+            drop(p);
+            self.unregister_voice_send(appsrc);
         }
     }
 
@@ -675,7 +731,7 @@ impl Session {
     }
 
     pub fn start_call(&mut self, peer: Uuid) -> Result<()> {
-        self.start_offerer(peer, Flow::Voice)
+        self.voice_offer(peer)
     }
 
     pub(crate) fn start_offerer(&mut self, peer: Uuid, flow: Flow) -> Result<()> {
@@ -720,10 +776,6 @@ impl Session {
 
         self.peers.insert(key, p);
 
-        if flow == Flow::Voice {
-            self.register_voice_send(peer);
-        }
-
         Ok(())
     }
 
@@ -747,7 +799,7 @@ impl Session {
             }
         }
 
-        let appsrc = self.peers.get(&(peer, Flow::Voice)).and_then(|p| p.voice_appsrc());
+        let appsrc = self.voice_peers.get(&peer).map(|p| p.voice_appsrc());
 
         if let (Some(vc), Some(appsrc)) = (self.voice_capture.as_ref(), appsrc) {
             vc.add_peer(appsrc);
@@ -761,13 +813,16 @@ impl Session {
             vc.remove_peer(&appsrc);
         }
 
-        let any_voice = self.peers.keys().any(|(_, f)| *f == Flow::Voice);
-        if !any_voice {
+        if self.voice_peers.is_empty() {
             self.voice_capture = None;
         }
     }
 
     pub fn stop_flow(&mut self, peer: Uuid, flow: Flow) {
+        if flow == Flow::Voice {
+            self.stop_voice(peer);
+            return;
+        }
         if let Some(p) = self.peers.remove(&(peer, flow)) {
             let appsrc = p.voice_appsrc();
 
@@ -800,12 +855,10 @@ impl Session {
         self.set_muted(on);
     }
 
-    /// Deafen: silence incoming audio (spk_valve on every recv) and mute the mic.
+    /// Deafen: silence incoming audio (spk_valve on every voice recv) and mute the mic.
     pub fn deafen(&self, on: bool) {
-        for p in self.peers.values() {
-            if p.flow == Flow::Voice {
-                p.set_valve("spk_valve", on);
-            }
+        for p in self.voice_peers.values() {
+            p.set_deaf(on);
         }
 
         self.set_muted(on);
@@ -887,7 +940,7 @@ impl Session {
     /// True when at least one Voice-flow peer is connected. Used to gate the
     /// mic test so it cannot open a second concurrent capture during a call.
     pub fn in_voice(&self) -> bool {
-        self.peers.keys().any(|(_, f)| *f == Flow::Voice)
+        !self.voice_peers.is_empty()
     }
 
     /// Start the standalone mic loopback for the Settings mic-test panel.
@@ -932,12 +985,8 @@ impl Session {
 
         self.voice_capture = None;
 
-        let voice_peers: Vec<gst_app::AppSrc> = self
-            .peers
-            .iter()
-            .filter(|((_, f), _)| *f == Flow::Voice)
-            .filter_map(|(_, p)| p.voice_appsrc())
-            .collect();
+        let appsrcs: Vec<gst_app::AppSrc> =
+            self.voice_peers.values().map(|p| p.voice_appsrc()).collect();
 
         match VoiceCapture::start(
             self.input_device.clone(),
@@ -947,7 +996,7 @@ impl Session {
             self.evt_tx.clone(),
         ) {
             Ok(vc) => {
-                for appsrc in voice_peers {
+                for appsrc in appsrcs {
                     vc.add_peer(appsrc);
                 }
 
@@ -986,6 +1035,12 @@ impl Session {
             }
             ServerMessage::ChatHistory { messages } => self.emit(SessionEvent::ChatHistory(messages)),
             ServerMessage::Offer { from, flow, sdp } => {
+                // Voice uses the UDP transport: `sdp` carries the peer's ip:port.
+                if flow == Flow::Voice {
+                    self.voice_on_offer(from, &sdp);
+                    return;
+                }
+
                 let key = (from, flow);
 
                 // A fresh offer starts a new session for this flow. Drop any stale
@@ -999,20 +1054,24 @@ impl Session {
                     Ok(p) => {
                         p.handle_offer(&sdp);
                         self.peers.insert(key, p);
-
-                        if flow == Flow::Voice {
-                            self.register_voice_send(from);
-                        }
                     }
                     Err(e) => self.emit(SessionEvent::Error(format!("create answerer: {e}"))),
                 }
             }
             ServerMessage::Answer { from, flow, sdp } => {
+                if flow == Flow::Voice {
+                    self.voice_on_answer(from, &sdp);
+                    return;
+                }
                 if let Some(p) = self.peers.get(&(from, flow)) {
                     p.handle_answer(&sdp);
                 }
             }
             ServerMessage::Ice { from, flow, mline, candidate } => {
+                // No ICE for the UDP voice transport.
+                if flow == Flow::Voice {
+                    return;
+                }
                 if let Some(p) = self.peers.get(&(from, flow)) {
                     p.add_ice(mline, &candidate);
                 }
@@ -1060,6 +1119,7 @@ mod tests {
                 screen_transport: Box::new(P2pTransport),
                 share_config: ShareConfig::default(),
                 peers: HashMap::new(),
+                voice_peers: HashMap::new(),
                 voice_capture: None,
                 mic_monitor: None,
                 gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
