@@ -431,11 +431,47 @@ pub(crate) fn build_screen_send_appsrc_branch(
 ///
 /// Uses payload type 98 to avoid clashing with voice (97). No DSP is applied:
 /// the captured audio is encoded directly to Opus and sent raw.
+/// Probe the capture source in an isolated pipeline before committing it to the
+/// shared screen pipeline. A per-app WASAPI loopback whose target isn't playing
+/// (or a device-release race on restart) fails to *open*, and that failure would
+/// otherwise block the screen pipeline's state change — blacking out the video.
+/// Returns true only if the source reaches PAUSED.
+fn audio_source_opens(audio_chain: &str) -> bool {
+    let Ok(bin) = gst::parse::bin_from_description(audio_chain, true) else {
+        return false;
+    };
+    let probe = gst::Pipeline::new();
+    let Ok(sink) = gst::ElementFactory::make("fakesink").build() else {
+        return false;
+    };
+    if probe.add_many([bin.upcast_ref::<gst::Element>(), &sink]).is_err() || bin.link(&sink).is_err() {
+        let _ = probe.set_state(gst::State::Null);
+        return false;
+    }
+
+    use gst::StateChangeSuccess::{NoPreroll, Success};
+    let ok = match probe.set_state(gst::State::Paused) {
+        // Live sources return NoPreroll once the device is open.
+        Ok(Success | NoPreroll) => true,
+        Ok(gst::StateChangeSuccess::Async) => matches!(
+            probe.state(gst::ClockTime::from_mseconds(700)).0,
+            Ok(Success | NoPreroll)
+        ),
+        Err(_) => false,
+    };
+    let _ = probe.set_state(gst::State::Null);
+    ok
+}
+
 fn build_screen_audio_send_branch(
     pipeline: &gst::Pipeline,
     webrtc: &gst::Element,
     audio_chain: &str,
 ) -> Result<()> {
+    if !audio_source_opens(audio_chain) {
+        anyhow::bail!("screen audio source did not open (nothing to capture right now)");
+    }
+
     let src_bin = gst::parse::bin_from_description(audio_chain, true)?;
 
     let pay = gst::ElementFactory::make("rtpopuspay").build()?;
