@@ -1,3 +1,4 @@
+#[cfg(not(target_os = "windows"))]
 use std::process::Command;
 
 /// Which audio source to capture alongside the screenshare, if any.
@@ -21,7 +22,8 @@ pub struct AudioNode {
     pub label: String,
 }
 
-/// Raw properties of a PipeWire node, as parsed from `pw-dump`.
+/// Raw properties of a PipeWire node, as parsed from `pw-dump`. (Linux only.)
+#[cfg(not(target_os = "windows"))]
 #[derive(Debug, Clone)]
 pub struct NodeProps {
     pub pid: u32,
@@ -29,7 +31,8 @@ pub struct NodeProps {
     pub virtual_node: bool,
 }
 
-/// Filtering options for [`keep_node`].
+/// Filtering options for [`keep_node`]. (Linux only.)
+#[cfg(not(target_os = "windows"))]
 #[derive(Debug, Clone)]
 pub struct NodeFilter {
     /// Drop nodes whose `media.class` contains `"Input"`.
@@ -44,6 +47,7 @@ pub struct NodeFilter {
     pub only_speakers: bool,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl Default for NodeFilter {
     fn default() -> Self {
         Self {
@@ -55,6 +59,7 @@ impl Default for NodeFilter {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 impl NodeFilter {
     pub fn new() -> Self {
         Self::default()
@@ -64,7 +69,8 @@ impl NodeFilter {
 /// Returns `true` when the node should be included in the listing.
 ///
 /// Always excludes the process with `own_pid` to prevent a feedback loop when
-/// the sharer's own renderer appears as a capturable node.
+/// the sharer's own renderer appears as a capturable node. (Linux only.)
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn keep_node(props: &NodeProps, own_pid: u32, filt: &NodeFilter) -> bool {
     if props.pid == own_pid {
         return false;
@@ -101,9 +107,17 @@ pub fn has_system_audio() -> bool {
     gstreamer::ElementFactory::find(factory).is_some()
 }
 
-/// List PipeWire application audio output nodes, excluding our own process.
+/// List per-application audio output sources, excluding our own process.
 ///
-/// Returns an empty `Vec` when PipeWire is not available or `pw-dump` fails.
+/// Linux: PipeWire output nodes (via `pw-dump`). Windows: processes with an
+/// active WASAPI audio session, captured by pid through `wasapi2src` process
+/// loopback. Returns an empty `Vec` when unavailable.
+#[cfg(target_os = "windows")]
+pub fn list_app_nodes() -> Vec<AudioNode> {
+    super::audio_win::list_audio_sessions()
+}
+
+#[cfg(not(target_os = "windows"))]
 pub fn list_app_nodes() -> Vec<AudioNode> {
     if !has_pipewire() {
         return Vec::new();
@@ -112,6 +126,7 @@ pub fn list_app_nodes() -> Vec<AudioNode> {
     list_app_nodes_inner().unwrap_or_default()
 }
 
+#[cfg(not(target_os = "windows"))]
 fn list_app_nodes_inner() -> Option<Vec<AudioNode>> {
     let own_pid = std::process::id();
     let output = Command::new("pw-dump").output().ok()?;
@@ -130,6 +145,7 @@ fn list_app_nodes_inner() -> Option<Vec<AudioNode>> {
 ///
 /// Non-node entries (links, factories, devices, etc.) are skipped rather than
 /// aborting the parse, so the returned `Vec` reflects all valid nodes found.
+#[cfg(not(target_os = "windows"))]
 pub(crate) fn parse_nodes(json: &serde_json::Value, own_pid: u32, filt: &NodeFilter) -> Vec<AudioNode> {
     let Some(arr) = json.as_array() else {
         return Vec::new();
@@ -259,11 +275,17 @@ fn system_audio_src() -> String {
     "pulsesrc device=@DEFAULT_SINK@.monitor".to_string()
 }
 
-/// Per-application capture source. PipeWire targets a specific node; Windows has
-/// no per-process loopback in GStreamer, so fall back to whole-system loopback.
+/// Per-application capture source. PipeWire targets a node by name; Windows uses
+/// WASAPI process loopback, capturing the target pid and its child processes.
+/// A non-numeric node on Windows falls back to whole-system loopback.
 #[cfg(target_os = "windows")]
-fn app_audio_src(_node: &str) -> String {
-    system_audio_src()
+fn app_audio_src(node: &str) -> String {
+    match node.parse::<u32>() {
+        Ok(pid) => format!(
+            "wasapi2src loopback=true loopback-mode=include-process-tree loopback-target-pid={pid}"
+        ),
+        Err(_) => system_audio_src(),
+    }
 }
 #[cfg(not(target_os = "windows"))]
 fn app_audio_src(node: &str) -> String {
@@ -274,10 +296,12 @@ fn app_audio_src(node: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "windows"))]
     fn props(pid: u32, media_class: &str, virt: bool) -> NodeProps {
         NodeProps { pid, media_class: media_class.into(), virtual_node: virt }
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn excludes_own_process() {
         let f = NodeFilter::default();
@@ -286,6 +310,7 @@ mod tests {
         assert!(keep_node(&props(99, "Stream/Output/Audio", false), 42, &f));
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn excludes_inputs_and_virtual_when_requested() {
         let f = NodeFilter { ignore_input: true, ignore_virtual: true, ..Default::default() };
@@ -314,6 +339,16 @@ mod tests {
         assert!(app.contains("target-object=Firefox"));
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn app_chain_targets_pid_on_windows() {
+        let app = screen_audio_chain(&ShareAudio::App { node: "1234".into() }).unwrap();
+        assert!(app.contains("loopback-target-pid=1234"));
+        assert!(app.contains("loopback-mode=include-process-tree"));
+        assert!(app.contains("opusenc"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn parse_nodes_returns_app_output_stream_with_friendly_label() {
         // application.name is the base; a distinct media.name is appended so
@@ -344,6 +379,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn parse_nodes_labels_same_app_streams_distinctly() {
         // Two Firefox streams with the same application.name but different
         // media.name values (e.g. two tabs playing audio simultaneously).
@@ -395,6 +431,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "windows"))]
     fn parse_nodes_skips_non_node_entries() {
         // A realistic pw-dump array mixing a valid audio stream node with a
         // non-node entry (a Link interface). The non-node must not cause the
@@ -425,5 +462,12 @@ mod tests {
 
         assert!(!nodes.is_empty(), "non-node entry must not cause empty result");
         assert_eq!(nodes[0].node, "Firefox");
+    }
+
+    #[test]
+    #[ignore] // live: prints processes with an active audio session
+    fn lists_live_app_nodes() {
+        let nodes = list_app_nodes();
+        println!("{nodes:#?}");
     }
 }

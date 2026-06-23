@@ -1,4 +1,6 @@
 pub mod audio;
+#[cfg(target_os = "windows")]
+mod audio_win;
 pub mod backend;
 pub mod capture;
 pub mod source;
