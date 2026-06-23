@@ -276,14 +276,12 @@ fn with_opus_tail(src: &str) -> String {
 /// monitor; Windows uses a WASAPI render-endpoint loopback.
 #[cfg(target_os = "windows")]
 fn system_audio_src() -> String {
-    // Exclude our own process from the system mix so the shared audio doesn't
-    // include the peers' voice the app is already playing back — otherwise they
-    // hear themselves echoed. (Discord-style "system audio minus the call".)
-    format!(
-        "wasapi2src loopback=true low-latency=true \
-         loopback-mode=exclude-process-tree loopback-target-pid={}",
-        std::process::id()
-    )
+    // NOTE: ideally this would exclude our own process (so peers don't hear
+    // their own voice the app plays back), but `loopback-mode=exclude-process-tree`
+    // fails to open the device on the current GStreamer build, so we capture the
+    // full system mix. Self-exclusion is a follow-up (needs a working exclude
+    // loopback, or a software AEC referencing the voice output).
+    "wasapi2src loopback=true low-latency=true".to_string()
 }
 #[cfg(not(target_os = "windows"))]
 fn system_audio_src() -> String {

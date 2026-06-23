@@ -572,15 +572,16 @@ impl Session {
 
     /// Leave Voice: tear down every Voice flow, then tell the server.
     pub fn leave_voice(&mut self) {
-        let voice_peers: Vec<Uuid> = self
-            .peers
-            .keys()
-            .filter(|(_, f)| *f == Flow::Voice)
-            .map(|(p, _)| *p)
-            .collect();
+        // Leaving the call disconnects every media flow — voice AND any
+        // screenshare being watched (Discord-like). Chat/presence are untouched.
+        let all: Vec<(Uuid, Flow)> = self.peers.keys().copied().collect();
 
-        for p in voice_peers {
-            self.stop_flow(p, Flow::Voice);
+        for (peer, flow) in all {
+            // Clear the stage for a screenshare we were watching.
+            if flow == Flow::Screen {
+                self.emit(SessionEvent::ShareStopped { user: peer });
+            }
+            self.stop_flow(peer, flow);
         }
 
         self.voice_members.clear();
