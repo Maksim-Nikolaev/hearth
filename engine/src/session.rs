@@ -149,6 +149,10 @@ impl FlowPeer {
         let webrtc = gst::ElementFactory::make("webrtcbin")
             .name("wrtc")
             .property_from_str("stun-server", "stun://stun.l.google.com:19302")
+            // 40 ms jitter buffer (vs webrtcbin's 200 ms default) — the single
+            // biggest cut to end-to-end audio/video latency. Tunable via
+            // HEARTH_JITTER_MS. See crate::flow_peer::jitter_latency_ms.
+            .property("latency", crate::flow_peer::jitter_latency_ms())
             .build()?;
 
         if let Ok(turn) = std::env::var("HEARTH_TURN") {
@@ -811,6 +815,13 @@ impl Session {
     /// Change the voice activation mode (voice-activity / push-to-talk / always-on).
     pub fn set_activation(&self, mode: ActivationMode) {
         self.gate.lock().unwrap().set_mode(mode);
+    }
+
+    /// Set the `webrtcbin` jitter-buffer depth (ms) for connections established
+    /// afterwards. Lower = less latency, more sensitive to network jitter.
+    /// Reconnect a flow (e.g. leave/rejoin voice) to apply it.
+    pub fn set_jitter_latency_ms(&self, ms: u32) {
+        crate::flow_peer::set_jitter_latency_ms(ms);
     }
 
     /// Mute / unmute the mic via the shared gate.

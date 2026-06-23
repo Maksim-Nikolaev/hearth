@@ -20,6 +20,7 @@ pub enum SettingsOutput {
     InputSensitivity(f32),
     Activation(ActivationKind),
     PttKey(Option<String>),
+    JitterLatency(u32),
     MicTest(bool),
     ResetDefaults,
 }
@@ -64,6 +65,7 @@ pub struct SettingsWindowWidgets {
     vad_switch: gtk::Switch,
     activation_dropdown: gtk::DropDown,
     ptt_entry: gtk::Entry,
+    jitter_spin: gtk::SpinButton,
     mic_test_btn: gtk::ToggleButton,
     // Signal handler IDs – stored so programmatic updates can be blocked.
     mic_test_toggled_id: SignalHandlerId,
@@ -76,6 +78,7 @@ pub struct SettingsWindowWidgets {
     agc_active_id: SignalHandlerId,
     vad_active_id: SignalHandlerId,
     activation_selected_id: SignalHandlerId,
+    jitter_value_id: SignalHandlerId,
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -199,6 +202,15 @@ impl Component for SettingsWindow {
             .build();
         root_box.append(&hrow("PTT key", 140, &ptt_entry));
 
+        // Network section
+        root_box.append(&section_label("NETWORK"));
+
+        // Jitter buffer depth (ms). Lower = less latency, more sensitive to
+        // network jitter. Applies to calls connected after a change.
+        let jitter_spin = gtk::SpinButton::with_range(0.0, 500.0, 5.0);
+        jitter_spin.set_value(40.0);
+        root_box.append(&hrow("Jitter buffer (ms)", 180, &jitter_spin));
+
         // Reset section
         let reset_btn = gtk::Button::with_label("Reset to Default");
         reset_btn.set_halign(gtk::Align::End);
@@ -317,6 +329,13 @@ impl Component for SettingsWindow {
             });
         }
 
+        let jitter_value_id = {
+            let s = sender.clone();
+            jitter_spin.connect_value_changed(move |sb| {
+                let _ = s.output(SettingsOutput::JitterLatency(sb.value() as u32));
+            })
+        };
+
         {
             let s = sender.clone();
             reset_btn.connect_clicked(move |_| {
@@ -344,6 +363,7 @@ impl Component for SettingsWindow {
             vad_switch,
             activation_dropdown,
             ptt_entry,
+            jitter_spin,
             mic_test_btn,
             mic_test_toggled_id,
             mic_selected_id,
@@ -355,6 +375,7 @@ impl Component for SettingsWindow {
             agc_active_id,
             vad_active_id,
             activation_selected_id,
+            jitter_value_id,
         };
 
         ComponentParts { model, widgets }
@@ -462,8 +483,10 @@ impl SettingsWindow {
         widgets.agc_switch.block_signal(&widgets.agc_active_id);
         widgets.vad_switch.block_signal(&widgets.vad_active_id);
         widgets.activation_dropdown.block_signal(&widgets.activation_selected_id);
+        widgets.jitter_spin.block_signal(&widgets.jitter_value_id);
 
         widgets.input_vol_scale.set_value(s.input_volume);
+        widgets.jitter_spin.set_value(s.jitter_latency_ms as f64);
         widgets.output_vol_scale.set_value(s.output_volume);
 
         // Threshold is on the level bar, not a GTK signal – set silently.
@@ -497,6 +520,7 @@ impl SettingsWindow {
         widgets.agc_switch.unblock_signal(&widgets.agc_active_id);
         widgets.vad_switch.unblock_signal(&widgets.vad_active_id);
         widgets.activation_dropdown.unblock_signal(&widgets.activation_selected_id);
+        widgets.jitter_spin.unblock_signal(&widgets.jitter_value_id);
     }
 }
 

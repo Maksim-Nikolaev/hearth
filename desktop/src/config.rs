@@ -66,6 +66,15 @@ pub struct Settings {
     pub share_content: ContentKind,
     pub share_audio: ShareAudioKind,
     pub share_bitrate_kbps: u32,
+    /// webrtcbin jitter-buffer depth in ms (lower = less latency). Applied to
+    /// connections established after a change. `serde(default)` keeps older
+    /// saved settings loadable.
+    #[serde(default = "default_jitter_ms")]
+    pub jitter_latency_ms: u32,
+}
+
+fn default_jitter_ms() -> u32 {
+    40
 }
 
 impl Default for Settings {
@@ -88,6 +97,7 @@ impl Default for Settings {
             share_content: ContentKind::Smoothness,
             share_audio: ShareAudioKind::None,
             share_bitrate_kbps: 6000,
+            jitter_latency_ms: default_jitter_ms(),
         }
     }
 }

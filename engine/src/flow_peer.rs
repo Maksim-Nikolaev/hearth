@@ -39,6 +39,33 @@ struct State {
     flow: Flow,
 }
 
+/// Process-wide jitter-buffer depth in ms applied to each new `webrtcbin`.
+/// `u32::MAX` is the "not yet initialised" sentinel so an explicit 0 is allowed.
+static JITTER_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Jitter-buffer depth in ms for a newly created `webrtcbin`. Defaults to
+/// `HEARTH_JITTER_MS` (or 40) until overridden by [`set_jitter_latency_ms`].
+/// Changing it affects connections established afterwards, not live ones.
+pub(crate) fn jitter_latency_ms() -> u32 {
+    use std::sync::atomic::Ordering;
+    match JITTER_MS.load(Ordering::Relaxed) {
+        u32::MAX => {
+            let init = std::env::var("HEARTH_JITTER_MS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(40);
+            JITTER_MS.store(init, Ordering::Relaxed);
+            init
+        },
+        v => v,
+    }
+}
+
+/// Set the jitter-buffer depth used by subsequently created peer connections.
+pub fn set_jitter_latency_ms(ms: u32) {
+    JITTER_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> Result<()> {
     gst::init()?;
 
@@ -56,6 +83,11 @@ pub async fn run(cfg: PeerConfig<'_>, mut on_paintable: Option<PaintableCb>) -> 
     let webrtc = gst::ElementFactory::make("webrtcbin")
         .name("wrtc")
         .property_from_str("stun-server", "stun://stun.l.google.com:19302")
+        // Jitter-buffer depth. webrtcbin defaults to 200 ms, which dominates the
+        // end-to-end audio/video delay; 40 ms is a much better fit for a P2P
+        // close-friends mesh on a decent network. Raise HEARTH_JITTER_MS on a
+        // lossy/high-jitter path if audio starts dropping.
+        .property("latency", jitter_latency_ms())
         .build()?;
 
     // Optional TURN relay, e.g. HEARTH_TURN="turn://user:pass@host:3478".

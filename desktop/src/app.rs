@@ -463,6 +463,7 @@ impl AppModel {
             SettingsOutput::InputSensitivity(db) => settings.input_sensitivity = db,
             SettingsOutput::Activation(a) => settings.activation = a,
             SettingsOutput::PttKey(k) => settings.ptt_key = k,
+            SettingsOutput::JitterLatency(ms) => settings.jitter_latency_ms = ms,
             SettingsOutput::MicTest(on) => {
                 if let Some(s) = self.session.as_mut() {
                     if on {
@@ -526,6 +527,7 @@ impl AppModel {
         session.set_input_device(s.input_device.clone());
         session.set_output_device(s.output_device.clone());
         session.set_ptt_key(s.ptt_key.clone());
+        session.set_jitter_latency_ms(s.jitter_latency_ms);
     }
 }
 
