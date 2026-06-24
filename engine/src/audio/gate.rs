@@ -21,13 +21,27 @@ pub struct Gate {
     /// Debounced voice-activity state (hysteresis + hold), so the gate doesn't
     /// chatter when the level hovers near the threshold.
     voice_active: bool,
+    /// Frames left in the hold window; counts down once the level is below the
+    /// close threshold, and is refreshed to `hold_frames` while voice is present.
     hold_remaining: u32,
+    /// Configured hold length in frames (see `DEFAULT_HOLD_FRAMES`).
+    hold_frames: u32,
 }
 
-/// Stay open this many 5 ms frames after the level last cleared the threshold
-/// (~200 ms), so gaps between words don't close the gate and the boundary doesn't
-/// chatter — without holding the gate open *below* the threshold.
-const HOLD_FRAMES: u32 = 40;
+/// Default post-speech hold: after the level falls below the *close* threshold,
+/// stay fully open this many frames before the release fade is allowed to begin.
+/// Bridges the short gaps between words/syllables so a normal speech pause
+/// doesn't trip the gate. ~120 ms on the native path (5 ms frames). Settable
+/// per-session via [`Gate::set_hold_frames`]; 100–300 ms is the usual range.
+const DEFAULT_HOLD_FRAMES: u32 = 24;
+
+/// Hysteresis dead band (dB): once open, the level must fall this far below the
+/// open threshold before the gate begins to close — open at `sensitivity_db`,
+/// close at `sensitivity_db - HYSTERESIS_DB`. The dead band stops the open/close
+/// decision dithering (chattering) when the level rides on the threshold. Kept
+/// modest so the close threshold stays above a typical room-noise floor and the
+/// gate still shuts in a quiet room.
+const HYSTERESIS_DB: f32 = 6.0;
 
 impl Gate {
     pub fn new(mode: ActivationMode) -> Gate {
@@ -45,6 +59,7 @@ impl Gate {
             sensitivity_db,
             voice_active: false,
             hold_remaining: 0,
+            hold_frames: DEFAULT_HOLD_FRAMES,
         }
     }
 
@@ -60,6 +75,12 @@ impl Gate {
     /// the active mode — drives the mic-test monitor gating.
     pub fn set_sensitivity(&mut self, db: f32) {
         self.sensitivity_db = db;
+    }
+
+    /// Set the post-speech hold length in frames (0 = no hold). Live; the smooth
+    /// release fade in `ramp_gain` still applies once the hold elapses.
+    pub fn set_hold_frames(&mut self, frames: u32) {
+        self.hold_frames = frames;
     }
 
     pub fn set_muted(&mut self, muted: bool) {
@@ -78,17 +99,26 @@ impl Gate {
         self.last_rms_db = rms_db;
         self.last_vad = vad;
 
-        // Hold-gate: open the moment the level clears the threshold, then keep it
-        // open for HOLD_FRAMES after it last cleared. The hold both bridges word
-        // gaps and prevents boundary chatter (a single poke above re-arms it), but
-        // it never holds the gate open while the level sits below the threshold.
-        if rms_db >= self.sensitivity_db || vad {
+        // Hysteretic hold-gate — this is only the open/close *decision*; the
+        // smooth gain envelope (attack / exponential release / floor) is
+        // `ramp_gain`. Open at `sensitivity_db`, close at the lower `close_thresh`;
+        // the dead band between them is what stops edge chatter. Once open, hold
+        // full-open for `hold_frames` after the level drops below close (bridging
+        // word gaps), then let the release fade take over.
+        let open_thresh = self.sensitivity_db;
+        let close_thresh = self.sensitivity_db - HYSTERESIS_DB;
+
+        if self.voice_active {
+            if rms_db >= close_thresh || vad {
+                self.hold_remaining = self.hold_frames;
+            } else if self.hold_remaining > 0 {
+                self.hold_remaining -= 1;
+            } else {
+                self.voice_active = false;
+            }
+        } else if rms_db >= open_thresh || vad {
             self.voice_active = true;
-            self.hold_remaining = HOLD_FRAMES;
-        } else if self.hold_remaining > 0 {
-            self.hold_remaining -= 1;
-        } else {
-            self.voice_active = false;
+            self.hold_remaining = self.hold_frames;
         }
     }
 
@@ -144,8 +174,53 @@ mod tests {
         g.update_level(-60.0, false);
         assert!(!g.open(), "below threshold + no vad = closed");
         g.update_level(-30.0, false);
-        assert!(g.open(), "above threshold = open");
-        g.update_level(-60.0, true);
-        assert!(g.open(), "vad voice flag = open even if quiet");
+        assert!(g.open(), "above the open threshold = open");
+        g.update_level(-30.0, true);
+        assert!(g.open(), "vad voice flag keeps it open");
+    }
+
+    #[test]
+    fn vad_opens_when_quiet() {
+        let mut g = Gate::new(ActivationMode::Voice { threshold: -40.0 });
+        g.update_level(-55.0, true);
+        assert!(g.open(), "detected voice opens even below the threshold");
+    }
+
+    #[test]
+    fn hysteresis_dead_band_prevents_chatter() {
+        let mut g = Gate::new(ActivationMode::Voice { threshold: -40.0 });
+        g.update_level(-35.0, false); // clears the open threshold (-40)
+        assert!(g.open());
+        // Level then rides in the dead band: below open (-40) but above close
+        // (-46). It must stay open — this is what kills edge chatter (the buzz).
+        for _ in 0..(DEFAULT_HOLD_FRAMES * 4) {
+            g.update_level(-43.0, false);
+        }
+        assert!(g.open(), "rides the hysteresis band without dithering shut");
+    }
+
+    #[test]
+    fn closes_after_hold_below_close_threshold() {
+        let mut g = Gate::new(ActivationMode::Voice { threshold: -40.0 });
+        g.set_hold_frames(8);
+        g.update_level(-30.0, false);
+        assert!(g.open());
+        // Well below the close threshold (-46): bridges the hold, then shuts.
+        for _ in 0..8 {
+            g.update_level(-70.0, false);
+            assert!(g.open(), "held open across the hold window");
+        }
+        g.update_level(-70.0, false);
+        assert!(!g.open(), "closes once the hold elapses");
+    }
+
+    #[test]
+    fn hold_frames_zero_closes_at_once() {
+        let mut g = Gate::new(ActivationMode::Voice { threshold: -40.0 });
+        g.set_hold_frames(0);
+        g.update_level(-30.0, false);
+        assert!(g.open());
+        g.update_level(-70.0, false);
+        assert!(!g.open(), "with the hold off, dropping below close shuts immediately");
     }
 }

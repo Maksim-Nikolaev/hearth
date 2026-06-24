@@ -268,7 +268,7 @@ impl NativeVoice {
                 // doesn't click. (ignores mute / the Settings-open suspend.)
                 if self_monitor_cb.load(Ordering::Relaxed) {
                     let mut mon = frame.clone();
-                    ramp_gain(&mut mon, &mut mon_gain, if mon_open { 1.0 } else { 0.0 });
+                    ramp_gain(&mut mon, &mut mon_gain, if mon_open { 1.0 } else { FLOOR_GAIN });
                     mon_playback.push(SELF_MONITOR_LANE, &mon);
                 } else {
                     mon_gain = 0.0;
@@ -294,8 +294,8 @@ impl NativeVoice {
                 }
 
                 // Ramp the send gain in/out for a click-free open/close, then encode
-                // the (faded) frame — silence once fully closed.
-                ramp_gain(&mut frame, &mut send_gain, if open { 1.0 } else { 0.0 });
+                // the faded frame — resting at the gate floor once fully closed.
+                ramp_gain(&mut frame, &mut send_gain, if open { 1.0 } else { FLOOR_GAIN });
                 packet[..2].copy_from_slice(&seq.to_be_bytes());
                 let n = match encoder.encode_float(&frame, &mut packet[2..]) {
                     Ok(n) => n,
@@ -473,19 +473,29 @@ fn local_ip() -> String {
         .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
-/// Apply a per-sample gain to `buf`, ramping `gain` toward `target`. Asymmetric:
-/// a fast attack (~5 ms) so word onsets aren't clipped, and a gentle release
-/// (~80 ms) so closing the gate is a smooth fade, not a brick-wall cut.
-pub(crate) fn ramp_gain(buf: &mut [f32], gain: &mut f32, target: f32) {
-    const ATTACK: f32 = 1.0 / 240.0; // ~5 ms to fully open
-    const RELEASE: f32 = 1.0 / 3840.0; // ~80 ms to fully close
+/// Closed-gate gain floor (~-54 dBFS) — the gate's "range". Resting at a faint
+/// trace of room tone instead of slamming to 0 avoids the unnatural "dead air"
+/// drop and shrinks the gain step at the edge; quiet enough to be inaudible.
+pub(crate) const FLOOR_GAIN: f32 = 0.002;
+
+/// Gate gain envelope: a per-sample gain (`out = env*in`). `env` tracks `target`
+/// (1.0 open, [`FLOOR_GAIN`] closed) via a one-pole filter — fast attack, slow
+/// exponential release. The exponential trajectory has no derivative "corner", so
+/// neither edge inserts the broadband step a sharper gain change clicks on. `env`
+/// settles exactly on `target`, so steady speech passes at unity (the envelope
+/// only works at the transitions) and a closed gate rests at the floor.
+pub(crate) fn ramp_gain(buf: &mut [f32], env: &mut f32, target: f32) {
+    // One-pole coefficients, per sample @ 48 kHz: fast attack (τ ~3 ms), slow
+    // exponential release (τ ~35 ms, ~140 ms tail) for a smooth, click-free decay.
+    const ATTACK_COEF: f32 = 0.007;
+    const RELEASE_COEF: f32 = 0.0006;
     for s in buf.iter_mut() {
-        if *gain < target {
-            *gain = (*gain + ATTACK).min(target);
-        } else if *gain > target {
-            *gain = (*gain - RELEASE).max(target);
+        let coef = if target > *env { ATTACK_COEF } else { RELEASE_COEF };
+        *env += coef * (target - *env);
+        if (target - *env).abs() < 1.0e-4 {
+            *env = target; // settle exactly: unity when open, floor when closed
         }
-        *s *= *gain;
+        *s *= *env;
     }
 }
 

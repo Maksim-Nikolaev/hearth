@@ -313,7 +313,8 @@ impl NativeMonitor {
             };
             // Ramp in/out so crossing the threshold is click-free.
             let mut out = mono.to_vec();
-            super::native_voice::ramp_gain(&mut out, &mut mon_gain, if open { 1.0 } else { 0.0 });
+            let target = if open { 1.0 } else { super::native_voice::FLOOR_GAIN };
+            super::native_voice::ramp_gain(&mut out, &mut mon_gain, target);
             pb.push(0, &out);
         })?;
         Ok(Self { _capture: capture, _playback: playback })
