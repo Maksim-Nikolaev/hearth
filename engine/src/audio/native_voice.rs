@@ -163,6 +163,11 @@ impl NativeVoice {
         let mut aec = SendAec(Aec::new(AEC_FRAME, AEC_FILTER_LEN, 48000));
         let mut aec_in: Vec<f32> = Vec::with_capacity(AEC_FRAME * 2);
 
+        eprintln!(
+            "[native-voice] filters: ns_wet={} vad={vad} agc={agc} ec={ec}",
+            ns_wet.load(Ordering::Relaxed)
+        );
+
         let capture = NativeCapture::start(input_device, move |mono| {
             // AEC first (on the raw mic), so NS/AGC see echo-free audio. When off,
             // `src` is the mic untouched.
@@ -239,8 +244,12 @@ impl NativeVoice {
                 if agc_cb.load(Ordering::Relaxed) {
                     let r = (frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
                     if r > 0.005 {
-                        let desired = (0.1 / r).clamp(0.1, 8.0); // target ~ -20 dBFS
+                        let desired = (0.1 / r).clamp(0.1, 4.0); // target ~ -20 dBFS
                         agc_gain += 0.04 * (desired - agc_gain);
+                    } else {
+                        // Silence: relax toward unity so we don't crank up the noise
+                        // floor (was holding the last, possibly large, gain).
+                        agc_gain += 0.05 * (1.0 - agc_gain);
                     }
                     for s in frame.iter_mut() {
                         *s = (*s * agc_gain).clamp(-1.0, 1.0);

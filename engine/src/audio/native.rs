@@ -24,8 +24,9 @@ use windows::core::HSTRING;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient3, IAudioRenderClient,
-    IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT,
-    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
@@ -67,22 +68,49 @@ unsafe fn open_device(capture: bool, device: Option<&str>) -> Result<DeviceStrea
     };
     let client: IAudioClient3 = dev.Activate(CLSCTX_ALL, None)?;
     let fmt = client.GetMixFormat()?;
-
-    let (mut def, mut fund, mut min_p, mut max_p) = (0u32, 0u32, 0u32, 0u32);
-    client.GetSharedModeEnginePeriod(fmt, &mut def, &mut fund, &mut min_p, &mut max_p)?;
-
     let rate = (*fmt).nSamplesPerSec;
     let channels = (*fmt).nChannels as usize;
-    if rate != SAMPLE_RATE {
-        // Mix format is almost always 48 kHz; resampling is out of scope here.
-        bail!("native audio: device is {rate} Hz, expected {SAMPLE_RATE} Hz");
+
+    if rate == SAMPLE_RATE {
+        // Fast path: the device engine already runs at 48 kHz — use the minimum
+        // shared engine period (IAudioClient3) for the lowest latency.
+        let (mut def, mut fund, mut min_p, mut max_p) = (0u32, 0u32, 0u32, 0u32);
+        client.GetSharedModeEnginePeriod(fmt, &mut def, &mut fund, &mut min_p, &mut max_p)?;
+        client.InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, min_p, fmt, None)?;
+        let event = CreateEventW(None, false, false, None)?;
+        client.SetEventHandle(event)?;
+        return Ok(DeviceStream { client, event, channels, period_frames: min_p });
     }
 
-    client.InitializeSharedAudioStream(AUDCLNT_STREAMFLAGS_EVENTCALLBACK, min_p, fmt, None)?;
+    // The device runs at another rate (e.g. 44.1 kHz). Keep our 48 kHz pipeline
+    // and let the WASAPI shared engine resample, by initializing with an explicit
+    // 48 kHz float format + AUTOCONVERTPCM instead of the engine-period stream.
+    eprintln!("[native] device is {rate} Hz; using AUTOCONVERTPCM resampling to 48 kHz");
+    let nch = channels as u16;
+    let wfx = WAVEFORMATEX {
+        wFormatTag: 3, // WAVE_FORMAT_IEEE_FLOAT
+        nChannels: nch,
+        nSamplesPerSec: SAMPLE_RATE,
+        nAvgBytesPerSec: SAMPLE_RATE * nch as u32 * 4,
+        nBlockAlign: nch * 4,
+        wBitsPerSample: 32,
+        cbSize: 0,
+    };
+    let buf_dur: i64 = 200_000; // 20 ms (100-ns units)
+    client.Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+        buf_dur,
+        0,
+        &wfx,
+        None,
+    )?;
     let event = CreateEventW(None, false, false, None)?;
     client.SetEventHandle(event)?;
-
-    Ok(DeviceStream { client, event, channels, period_frames: min_p })
+    let period_frames = client.GetBufferSize()?;
+    Ok(DeviceStream { client, event, channels, period_frames })
 }
 
 // ── Capture ─────────────────────────────────────────────────────────────────
