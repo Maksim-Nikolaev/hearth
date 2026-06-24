@@ -975,6 +975,17 @@ impl Session {
         self.set_muted(on);
     }
 
+    /// Temporarily silence mic + output (e.g. while the Settings window is open),
+    /// without touching the user's mute/deafen state. Cleared with `false`, which
+    /// restores whatever the user had set.
+    pub fn set_io_suspended(&self, on: bool) {
+        self.gate.lock().unwrap().set_suspended(on);
+        #[cfg(target_os = "windows")]
+        if let Some(nv) = self.native_voice.as_ref() {
+            nv.set_suspended(on);
+        }
+    }
+
     /// Apply a new DSP config live (no pipeline rebuild).
     pub fn set_dsp(&mut self, cfg: DspConfig) {
         self.dsp_config = cfg.clone();

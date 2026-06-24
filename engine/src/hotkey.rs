@@ -283,28 +283,30 @@ mod win {
         if code == HC_ACTION as i32 {
             let ms = &*(lparam as *const MSLLHOOKSTRUCT);
             let msg = wparam as u32;
-            // HIWORD(mouseData): XBUTTON1 (1) = back/x11-8, XBUTTON2 (2) = fwd/x11-9.
-            let xbtn = || match (ms.mouseData >> 16) as u16 {
-                1 => 8u8,
-                2 => 9u8,
-                _ => 0u8,
-            };
-            let (btn, down): (u8, Option<bool>) = match msg {
-                WM_MBUTTONDOWN => (2, Some(true)),
-                WM_MBUTTONUP => (2, Some(false)),
-                WM_XBUTTONDOWN => (xbtn(), Some(true)),
-                WM_XBUTTONUP => (xbtn(), Some(false)),
-                WM_LBUTTONDOWN => (1, Some(true)),
-                WM_LBUTTONUP => (1, Some(false)),
-                WM_RBUTTONDOWN => (3, Some(true)),
-                WM_RBUTTONUP => (3, Some(false)),
-                _ => (0, None),
+            let down = match msg {
+                WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => Some(true),
+                WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => Some(false),
+                _ => None,
             };
             if let Some(down) = down {
                 STATE.with(|s| {
                     if let Some(st) = s.borrow_mut().as_mut() {
                         if let Target::Mouse(target) = st.target {
-                            if btn == target {
+                            // Side buttons: GTK may number them 4/5 or 8/9 depending
+                            // on the platform, so accept both for the same physical
+                            // XBUTTON1 (back) / XBUTTON2 (forward).
+                            let hit = match msg {
+                                WM_LBUTTONDOWN | WM_LBUTTONUP => target == 1,
+                                WM_MBUTTONDOWN | WM_MBUTTONUP => target == 2,
+                                WM_RBUTTONDOWN | WM_RBUTTONUP => target == 3,
+                                WM_XBUTTONDOWN | WM_XBUTTONUP => match (ms.mouseData >> 16) as u16 {
+                                    1 => target == 8 || target == 4, // XBUTTON1 = back
+                                    2 => target == 9 || target == 5, // XBUTTON2 = forward
+                                    _ => false,
+                                },
+                                _ => false,
+                            };
+                            if hit {
                                 edge(st, down);
                             }
                         }

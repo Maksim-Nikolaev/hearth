@@ -9,6 +9,9 @@ pub enum ActivationMode {
 pub struct Gate {
     mode: ActivationMode,
     muted: bool,
+    /// Temporary force-closed, independent of `muted` (e.g. while the Settings
+    /// window is open). Auto-restores the user's real state when cleared.
+    suspended: bool,
     ptt_held: bool,
     last_rms_db: f32,
     last_vad: bool,
@@ -16,7 +19,7 @@ pub struct Gate {
 
 impl Gate {
     pub fn new(mode: ActivationMode) -> Gate {
-        Gate { mode, muted: false, ptt_held: false, last_rms_db: -120.0, last_vad: false }
+        Gate { mode, muted: false, suspended: false, ptt_held: false, last_rms_db: -120.0, last_vad: false }
     }
 
     pub fn set_mode(&mut self, mode: ActivationMode) {
@@ -25,6 +28,10 @@ impl Gate {
 
     pub fn set_muted(&mut self, muted: bool) {
         self.muted = muted;
+    }
+
+    pub fn set_suspended(&mut self, suspended: bool) {
+        self.suspended = suspended;
     }
 
     pub fn set_ptt_held(&mut self, held: bool) {
@@ -36,9 +43,9 @@ impl Gate {
         self.last_vad = vad;
     }
 
-    /// True = transmit. Precedence: mute > ptt > voice-activity > always-on.
+    /// True = transmit. Precedence: suspend > mute > ptt > voice-activity > always-on.
     pub fn open(&self) -> bool {
-        if self.muted {
+        if self.suspended || self.muted {
             return false;
         }
 

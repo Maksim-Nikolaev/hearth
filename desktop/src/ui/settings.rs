@@ -121,6 +121,16 @@ impl Component for SettingsWindow {
 
         window.set_child(Some(&root_box));
 
+        // Closing via the window's X (hide_on_close handles the hide) still needs
+        // to resume audio — emit Close so the app restores mute/deafen.
+        {
+            let s = sender.clone();
+            window.connect_close_request(move |_| {
+                let _ = s.output(SettingsOutput::Close);
+                gtk::glib::Propagation::Proceed
+            });
+        }
+
         // Devices section
         root_box.append(&section_label("DEVICES"));
 
@@ -325,14 +335,18 @@ impl Component for SettingsWindow {
             })
         };
 
+        // The PTT bind field is only editable in Push-to-talk mode.
+        ptt_btn.set_sensitive(activation_dropdown.selected() == 1);
         let activation_selected_id = {
             let s = sender.clone();
+            let ptt = ptt_btn.clone();
             activation_dropdown.connect_selected_notify(move |dd| {
                 let kind = match dd.selected() {
                     0 => ActivationKind::Voice,
                     1 => ActivationKind::PushToTalk,
                     _ => ActivationKind::AlwaysOn,
                 };
+                ptt.set_sensitive(matches!(kind, ActivationKind::PushToTalk));
                 let _ = s.output(SettingsOutput::Activation(kind));
             })
         };
@@ -593,6 +607,7 @@ impl SettingsWindow {
             ActivationKind::AlwaysOn => 2,
         };
         widgets.activation_dropdown.set_selected(act_idx);
+        widgets.ptt_btn.set_sensitive(matches!(s.activation, ActivationKind::PushToTalk));
 
         widgets.ptt_btn.set_label(s.ptt_key.as_deref().unwrap_or("Click to bind"));
 

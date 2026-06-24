@@ -50,6 +50,9 @@ pub struct NativeVoice {
     targets: Arc<Mutex<Vec<Arc<SendTarget>>>>,
     peers: HashMap<Uuid, Peer>,
     deaf: Arc<AtomicBool>,
+    /// Temporary output silence (e.g. while Settings is open), independent of
+    /// the user's deafen state.
+    suspended: Arc<AtomicBool>,
     next_source: u64,
 }
 
@@ -109,6 +112,7 @@ impl NativeVoice {
             targets,
             peers: HashMap::new(),
             deaf,
+            suspended: Arc::new(AtomicBool::new(false)),
             next_source: 0,
         })
     }
@@ -129,6 +133,7 @@ impl NativeVoice {
 
         let playback = self.playback.clone();
         let deaf = self.deaf.clone();
+        let suspended = self.suspended.clone();
         let stop_thread = stop.clone();
         let handle = std::thread::Builder::new()
             .name(format!("native-voice-rx-{source_id}"))
@@ -151,7 +156,7 @@ impl NativeVoice {
                     };
                     let seq = u16::from_be_bytes([buf[0], buf[1]]);
                     let payload = &buf[2..n];
-                    let deaf_now = deaf.load(Ordering::Relaxed);
+                    let deaf_now = deaf.load(Ordering::Relaxed) || suspended.load(Ordering::Relaxed);
 
                     if let Some(exp) = expected {
                         let gap = seq.wrapping_sub(exp) as i16;
@@ -211,6 +216,11 @@ impl NativeVoice {
     /// Deafen: stop pushing received audio to playback.
     pub fn set_deaf(&self, on: bool) {
         self.deaf.store(on, Ordering::Relaxed);
+    }
+
+    /// Temporary output silence (e.g. Settings open), independent of deafen.
+    pub fn set_suspended(&self, on: bool) {
+        self.suspended.store(on, Ordering::Relaxed);
     }
 
     pub fn is_empty(&self) -> bool {
