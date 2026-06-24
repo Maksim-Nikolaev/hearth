@@ -8,6 +8,15 @@ use relm4::RelmApp;
 fn main() {
     install_panic_logger();
 
+    eprintln!(
+        "[hearth] voice backend: {}",
+        if std::env::var_os("HEARTH_NATIVE_AUDIO").is_some() {
+            "NATIVE (WASAPI IAudioClient3 + Opus)"
+        } else {
+            "GStreamer (set HEARTH_NATIVE_AUDIO=1 for native)"
+        }
+    );
+
     setup_portable_runtime();
     ensure_gst_plugin_path();
     ensure_inprocess_plugin_scan();
