@@ -1,4 +1,4 @@
-use crate::config::{ActivationKind, NsLevel, Settings};
+use crate::config::{ActivationKind, NsLevel, Settings, VoiceProfile};
 use crate::ui::meter::LevelBar;
 use engine::audio::devices::{AudioDevice, DeviceKind};
 use gtk::glib::SignalHandlerId;
@@ -27,6 +27,8 @@ pub enum SettingsOutput {
     Discard,
     /// Close (hide) the settings window. Settings already applied immediately.
     Close,
+    /// Voice processing profile changed (Custom / Headset / Speaker / Auto).
+    Profile(VoiceProfile),
 }
 
 // ── Input ─────────────────────────────────────────────────────────────────────
@@ -73,6 +75,10 @@ pub struct SettingsWindowWidgets {
     ptt_btn: gtk::Button,
     jitter_spin: gtk::SpinButton,
     mic_test_btn: gtk::ToggleButton,
+    profile_dropdown: gtk::DropDown,
+    // Kept alive so the closure can set its text; never accessed after init.
+    #[allow(dead_code)]
+    reprobe_label: gtk::Label,
     // Signal handler IDs – stored so programmatic updates can be blocked.
     mic_test_toggled_id: SignalHandlerId,
     mic_selected_id: SignalHandlerId,
@@ -85,6 +91,7 @@ pub struct SettingsWindowWidgets {
     vad_active_id: SignalHandlerId,
     activation_selected_id: SignalHandlerId,
     jitter_value_id: SignalHandlerId,
+    profile_selected_id: SignalHandlerId,
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -199,6 +206,16 @@ impl Component for SettingsWindow {
         // DSP section
         root_box.append(&section_label("AUDIO PROCESSING"));
 
+        // Profile selector: Custom = hand-tuned flags; presets are read-only views.
+        let profile_dropdown =
+            gtk::DropDown::from_strings(&["Custom", "Headset", "Speaker", "Auto"]);
+        profile_dropdown.set_hexpand(true);
+        profile_dropdown.set_tooltip_text(Some(
+            "Custom: use the switches below. Headset/Speaker: optimised presets. \
+             Auto: detects the output device and picks the right preset automatically.",
+        ));
+        root_box.append(&hrow("Voice profile", 180, &profile_dropdown));
+
         let ns_dropdown =
             gtk::DropDown::from_strings(&["Off", "Low", "Moderate", "High"]);
         ns_dropdown.set_selected(2); // Moderate default
@@ -227,6 +244,20 @@ impl Component for SettingsWindow {
             "Detects speech vs. noise to gate transmission in Voice-activity mode. May add a little latency.",
         ));
         root_box.append(&hrow("Voice activity det.", 180, &vad_switch));
+
+        // Re-probe row: refresh device list + classify output kind.
+        let reprobe_btn = gtk::Button::with_label("Re-probe audio");
+        let reprobe_label = gtk::Label::new(Some(""));
+        reprobe_label.set_xalign(0.0);
+        reprobe_label.set_hexpand(true);
+        reprobe_label.add_css_class("dim-label");
+        let reprobe_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .build();
+        reprobe_row.append(&reprobe_btn);
+        reprobe_row.append(&reprobe_label);
+        root_box.append(&reprobe_row);
 
         // Activation section
         root_box.append(&section_label("ACTIVATION"));
@@ -323,6 +354,22 @@ impl Component for SettingsWindow {
             let s = sender.clone();
             mic_test_btn.connect_toggled(move |b| {
                 let _ = s.output(SettingsOutput::MicTest(b.is_active()));
+            })
+        };
+
+        // Profile dropdown: on change, emit Profile output. The read-only preset
+        // display and toggle enable/disable happen in app.rs after the settings
+        // round-trip (SetSettings re-syncs the whole panel).
+        let profile_selected_id = {
+            let s = sender.clone();
+            profile_dropdown.connect_selected_notify(move |dd| {
+                let profile = match dd.selected() {
+                    0 => VoiceProfile::Custom,
+                    1 => VoiceProfile::Headset,
+                    2 => VoiceProfile::Speaker,
+                    _ => VoiceProfile::Auto,
+                };
+                let _ = s.output(SettingsOutput::Profile(profile));
             })
         };
 
@@ -465,6 +512,48 @@ impl Component for SettingsWindow {
             });
         }
 
+        // Re-probe: enumerate devices + classify + update the summary label, then
+        // re-send SetDevices so the dropdowns refresh. If the profile is Auto,
+        // also re-emit Profile(Auto) so the app re-applies the effective DSP.
+        {
+            let s = sender.clone();
+            let lbl = reprobe_label.clone();
+            reprobe_btn.connect_clicked(move |_| {
+                let devices = engine::audio::devices::list_devices();
+
+                // Read the currently saved output device id from the file so we
+                // can classify even when no session is active. Fall back to None
+                // (system default).
+                let saved_output: Option<String> = crate::config::Config::load()
+                    .load_settings()
+                    .output_device;
+                let kind =
+                    engine::audio::classify::classify_output(saved_output.as_deref());
+                let rt = engine::audio::rt::realtime_available();
+
+                let kind_str = match kind {
+                    engine::audio::profile::OutputKind::Headphones => "Headphones",
+                    engine::audio::profile::OutputKind::Speakers => "Speakers",
+                    engine::audio::profile::OutputKind::Unknown => "Unknown",
+                };
+                lbl.set_text(&format!(
+                    "Output: {kind_str} · realtime: {}",
+                    if rt { "yes" } else { "no" }
+                ));
+
+                let _ = s.input(SettingsInput::SetDevices(devices));
+
+                // Re-trigger effective DSP when on Auto so the new classification
+                // is immediately applied via the normal settings-apply path.
+                let profile = crate::config::Config::load()
+                    .load_settings()
+                    .profile;
+                if matches!(profile, VoiceProfile::Auto) {
+                    let _ = s.output(SettingsOutput::Profile(VoiceProfile::Auto));
+                }
+            });
+        }
+
         let model = SettingsWindow {
             settings: Settings::default(),
             mic_devices: Vec::new(),
@@ -487,6 +576,8 @@ impl Component for SettingsWindow {
             ptt_btn,
             jitter_spin,
             mic_test_btn,
+            profile_dropdown,
+            reprobe_label,
             mic_test_toggled_id,
             mic_selected_id,
             spk_selected_id,
@@ -498,6 +589,7 @@ impl Component for SettingsWindow {
             vad_active_id,
             activation_selected_id,
             jitter_value_id,
+            profile_selected_id,
         };
 
         ComponentParts { model, widgets }
@@ -612,6 +704,7 @@ impl SettingsWindow {
         widgets.vad_switch.block_signal(&widgets.vad_active_id);
         widgets.activation_dropdown.block_signal(&widgets.activation_selected_id);
         widgets.jitter_spin.block_signal(&widgets.jitter_value_id);
+        widgets.profile_dropdown.block_signal(&widgets.profile_selected_id);
 
         widgets.input_vol_scale.set_value(s.input_volume);
         widgets.jitter_spin.set_value(s.jitter_latency_ms as f64);
@@ -642,6 +735,46 @@ impl SettingsWindow {
 
         widgets.ptt_btn.set_label(s.ptt_key.as_deref().unwrap_or("Click to bind"));
 
+        // Profile selector: set the dropdown position.
+        let profile_idx = match s.profile {
+            VoiceProfile::Custom => 0,
+            VoiceProfile::Headset => 1,
+            VoiceProfile::Speaker => 2,
+            VoiceProfile::Auto => 3,
+        };
+        widgets.profile_dropdown.set_selected(profile_idx);
+
+        // When on a preset the advanced toggles are display-only: show the
+        // effective values and disable editing. Custom re-enables them.
+        let is_custom = matches!(s.profile, VoiceProfile::Custom);
+        let dsp_sensitive = is_custom;
+
+        if !is_custom {
+            // Resolve effective DSP for the current profile and show it.
+            let output_kind = if matches!(s.profile, VoiceProfile::Auto) {
+                engine::audio::classify::classify_output(s.output_device.as_deref())
+            } else {
+                engine::audio::profile::OutputKind::Unknown
+            };
+            let eff = crate::config::effective_dsp(s, output_kind);
+
+            let eff_ns_idx = match eff.noise_suppression {
+                engine::audio::dsp::NsLevel::Off => 0,
+                engine::audio::dsp::NsLevel::Low => 1,
+                engine::audio::dsp::NsLevel::Moderate => 2,
+                engine::audio::dsp::NsLevel::High => 3,
+            };
+            widgets.ns_dropdown.set_selected(eff_ns_idx);
+            widgets.ec_switch.set_active(eff.echo_cancel);
+            widgets.agc_switch.set_active(eff.agc);
+            widgets.vad_switch.set_active(eff.vad);
+        }
+
+        widgets.ns_dropdown.set_sensitive(dsp_sensitive);
+        widgets.ec_switch.set_sensitive(dsp_sensitive);
+        widgets.agc_switch.set_sensitive(dsp_sensitive);
+        widgets.vad_switch.set_sensitive(dsp_sensitive);
+
         widgets.input_vol_scale.unblock_signal(&widgets.input_vol_id);
         widgets.output_vol_scale.unblock_signal(&widgets.output_vol_id);
         widgets.ns_dropdown.unblock_signal(&widgets.ns_selected_id);
@@ -650,6 +783,7 @@ impl SettingsWindow {
         widgets.vad_switch.unblock_signal(&widgets.vad_active_id);
         widgets.activation_dropdown.unblock_signal(&widgets.activation_selected_id);
         widgets.jitter_spin.unblock_signal(&widgets.jitter_value_id);
+        widgets.profile_dropdown.unblock_signal(&widgets.profile_selected_id);
     }
 }
 

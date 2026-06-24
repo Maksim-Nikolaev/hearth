@@ -1,10 +1,9 @@
-use crate::config::{ActivationKind, Config, ContentKind, NsLevel, Settings};
+use crate::config::{ActivationKind, Config, ContentKind, Settings, VoiceProfile};
 use crate::ui::login::{LoginForm, LoginInput, LoginOutput};
 use crate::ui::screenshare_picker::{PickerInput, PickerOutput, ScreenSharePicker};
 use crate::ui::settings::{SettingsInput, SettingsOutput, SettingsWindow};
 use crate::ui::workspace::{Screens, Workspace, WorkspaceInput, WorkspaceOutput};
 use engine::audio::devices::list_devices;
-use engine::audio::dsp::{DspConfig, NsLevel as EngineNsLevel};
 use engine::audio::gate::ActivationMode;
 use engine::flow::VideoSink;
 use engine::screen::audio::ShareAudio;
@@ -481,16 +480,56 @@ impl AppModel {
     /// Persist a settings change and, if connected, apply it to the live session.
     fn apply_settings_output(&mut self, out: SettingsOutput) {
         let mut settings: Settings = self.config.load_settings();
+        let orig_profile = settings.profile;
 
         match out {
             SettingsOutput::InputDevice(id) => settings.input_device = id,
             SettingsOutput::OutputDevice(id) => settings.output_device = id,
             SettingsOutput::InputVolume(v) => settings.input_volume = v,
             SettingsOutput::OutputVolume(v) => settings.output_volume = v,
-            SettingsOutput::NoiseSuppression(ns) => settings.noise_suppression = ns,
-            SettingsOutput::EchoCancellation(b) => settings.echo_cancellation = b,
-            SettingsOutput::Agc(b) => settings.agc = b,
-            SettingsOutput::Vad(b) => settings.vad = b,
+            SettingsOutput::NoiseSuppression(ns) => {
+                // Editing a DSP flag while on a preset materializes the preset
+                // into the custom slot, then applies the user's change on top.
+                if !matches!(settings.profile, VoiceProfile::Custom) {
+                    let kind = output_kind_for(&settings);
+                    crate::config::demote_to_custom(&mut settings, kind);
+                }
+                settings.noise_suppression = ns;
+            }
+            SettingsOutput::EchoCancellation(b) => {
+                if !matches!(settings.profile, VoiceProfile::Custom) {
+                    let kind = output_kind_for(&settings);
+                    crate::config::demote_to_custom(&mut settings, kind);
+                }
+                settings.echo_cancellation = b;
+            }
+            SettingsOutput::Agc(b) => {
+                if !matches!(settings.profile, VoiceProfile::Custom) {
+                    let kind = output_kind_for(&settings);
+                    crate::config::demote_to_custom(&mut settings, kind);
+                }
+                settings.agc = b;
+            }
+            SettingsOutput::Vad(b) => {
+                if !matches!(settings.profile, VoiceProfile::Custom) {
+                    let kind = output_kind_for(&settings);
+                    crate::config::demote_to_custom(&mut settings, kind);
+                }
+                settings.vad = b;
+            }
+            SettingsOutput::Profile(p) => {
+                settings.profile = p;
+                // After persisting, re-send the full settings back to the panel
+                // so it shows the effective preset values and toggles the
+                // sensitivity of the DSP widgets.
+                self.config.save_settings(&settings);
+                if let Some(s) = self.session.as_mut() {
+                    Self::apply_settings_to_session(s, &settings);
+                }
+                let _ = self.settings_window.sender()
+                    .send(SettingsInput::SetSettings(settings));
+                return;
+            }
             SettingsOutput::InputSensitivity(db) => settings.input_sensitivity = db,
             SettingsOutput::Activation(a) => settings.activation = a,
             SettingsOutput::PttKey(k) => settings.ptt_key = k,
@@ -544,10 +583,21 @@ impl AppModel {
             }
         }
 
+        let was_demoted = !matches!(orig_profile, VoiceProfile::Custom)
+            && matches!(settings.profile, VoiceProfile::Custom);
+
         self.config.save_settings(&settings);
 
         if let Some(s) = self.session.as_mut() {
             Self::apply_settings_to_session(s, &settings);
+        }
+
+        // When a DSP-flag edit demoted the profile from a preset to Custom,
+        // re-sync the full panel so the profile dropdown and toggle sensitivity
+        // reflect the new Custom state immediately.
+        if was_demoted {
+            let _ = self.settings_window.sender()
+                .send(SettingsInput::SetSettings(settings));
         }
     }
 
@@ -573,6 +623,16 @@ impl AppModel {
         session.set_output_device(s.output_device.clone());
         session.set_ptt_key(s.ptt_key.clone());
         session.set_jitter_latency_ms(s.jitter_latency_ms);
+    }
+}
+
+/// Resolve the output device classification for the current settings.
+/// Used for demote-on-edit and profile apply; mirrors `apply_settings_to_session`.
+fn output_kind_for(s: &Settings) -> engine::audio::profile::OutputKind {
+    if matches!(s.profile, VoiceProfile::Auto) {
+        engine::audio::classify::classify_output(s.output_device.as_deref())
+    } else {
+        engine::audio::profile::OutputKind::Unknown
     }
 }
 
