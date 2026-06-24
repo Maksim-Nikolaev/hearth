@@ -8,14 +8,19 @@ use relm4::RelmApp;
 fn main() {
     install_panic_logger();
 
-    eprintln!(
-        "[hearth] voice backend: {}",
-        if std::env::var_os("HEARTH_GSTREAMER_VOICE").is_some() {
-            "GStreamer (HEARTH_GSTREAMER_VOICE set)"
-        } else {
-            "NATIVE (WASAPI IAudioClient3 + Opus) — default; set HEARTH_GSTREAMER_VOICE=1 to revert"
-        }
-    );
+    // The native low-latency backend (WASAPI IAudioClient3) exists only on
+    // Windows; everywhere else voice always runs the GStreamer `voice_udp` path
+    // (pulsesrc + Opus/RTP/UDP), and `HEARTH_GSTREAMER_VOICE` is a no-op.
+    #[cfg(target_os = "windows")]
+    let backend = if std::env::var_os("HEARTH_GSTREAMER_VOICE").is_some() {
+        "GStreamer voice_udp (HEARTH_GSTREAMER_VOICE set)"
+    } else {
+        "native WASAPI IAudioClient3 + Opus (set HEARTH_GSTREAMER_VOICE=1 to revert)"
+    };
+    #[cfg(not(target_os = "windows"))]
+    let backend = "GStreamer voice_udp (pulsesrc + Opus/RTP/UDP)";
+
+    eprintln!("[hearth] voice backend: {backend}");
 
     setup_portable_runtime();
     ensure_gst_plugin_path();

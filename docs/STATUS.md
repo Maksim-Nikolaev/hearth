@@ -178,6 +178,34 @@ GStreamer voice path remains as a fallback (`HEARTH_GSTREAMER_VOICE`). **Screens
 still on webrtcbin** — the next major workstream (mirror this rewrite: HW-encode →
 RTP/UDP, ~20–30 ms).
 
+## Linux/Wayland voice verified (2026-06-24, Kubuntu)
+
+Re-verified the voice channel after the Mint→Kubuntu (X11→Wayland) move. Two
+live desktop instances (alice/bob) through the backend: **voice connects and is
+audible both ways on Wayland**, clean quality. OBS-measured mouth→system acoustic
+**~74 ms** (beats the Windows 36–50 ms floor only at the device layer; see below).
+
+- **Path on Linux = GStreamer `voice_udp`** (raw RTP/Opus/UDP), `pulsesrc` capture
+  + `webrtc-audio-processing` DSP + `autoaudiosink`. The Phase-2 native I/O
+  (WASAPI IAudioClient3) is Windows-only; **native PipeWire small-quantum is still
+  TODO** and is the next Linux latency win (current ~16.5 ms send hop is the
+  PulseAudio-compat buffer).
+- Probe breakdown: send (mic→wire) ~16.5 ms, jitter buffer 20 ms, recv
+  (wire→speaker) ~2.4 ms.
+- **Fixes landed:** (1) the desktop startup banner no longer claims "NATIVE WASAPI"
+  on Linux — it now prints the true per-platform backend. (2) In-call **mic-test
+  self-monitor on Linux**: `VoiceCapture` gained `set_self_monitor`, feeding the
+  post-DSP (pre-gate) mic into a local `autoaudiosink`/`pulsesink` branch, so you
+  hear yourself during a call without a second capture (parity with the native
+  path). Previously the GStreamer path refused mic-test during a call. **Live
+  human verification of the self-monitor still pending.**
+- **Build env (Kubuntu):** needs `libgstreamer1.0-dev`, `libgstreamer-plugins-base/
+  bad1.0-dev`, `libgtk-4-dev`, `libspeexdsp-dev`, autotools. `aec-rs-sys` only
+  builds with the speex include dir on the compiler path — committed in
+  `.cargo/config.toml` (`BINDGEN_EXTRA_CLANG_ARGS`/`CFLAGS`/`CXXFLAGS=-I/usr/include/speex`).
+  The home migration also left a partially-copied Cargo registry (corrupt `cc`
+  crate); fixed by wiping `~/.cargo/registry/src` to force re-extraction.
+
 ## Next candidates
 
 - **M4 Task 5** – cross-machine Windows↔Linux measurement (user-run; see

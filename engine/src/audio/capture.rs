@@ -61,6 +61,13 @@ pub struct VoiceCapture {
     ref_pipeline: Option<gst::Pipeline>,
     peers: Arc<Mutex<Vec<gst_app::AppSrc>>>,
     pending_config: Arc<Mutex<Option<DspConfig>>>,
+    /// In-call self-monitor: when `Some`, the `cap` callback also pushes the
+    /// post-DSP (pre-gate) mic frame here so you hear yourself during a mic test
+    /// without opening a second capture. `None` = monitor off.
+    self_monitor: Arc<Mutex<Option<gst_app::AppSrc>>>,
+    monitor_pipeline: Mutex<Option<gst::Pipeline>>,
+    /// Output device id for the self-monitor sink (the chosen speaker).
+    output: Option<String>,
 }
 
 impl VoiceCapture {
@@ -75,6 +82,11 @@ impl VoiceCapture {
 
         let peers: Arc<Mutex<Vec<gst_app::AppSrc>>> = Arc::new(Mutex::new(Vec::new()));
         let pending_config: Arc<Mutex<Option<DspConfig>>> = Arc::new(Mutex::new(None));
+        let self_monitor: Arc<Mutex<Option<gst_app::AppSrc>>> = Arc::new(Mutex::new(None));
+
+        // The self-monitor sink plays on the chosen speaker; keep the id since
+        // `output` is consumed building the AEC reference below.
+        let monitor_output = output.clone();
 
         // Render-reference: the output sink's monitor IS the played speaker mix,
         // so AEC needs no cross-pipeline far-end collection. Missing monitor =>
@@ -101,6 +113,7 @@ impl VoiceCapture {
             gate,
             peers.clone(),
             pending_config.clone(),
+            self_monitor.clone(),
             ref_rx,
             evt,
         )?;
@@ -110,7 +123,42 @@ impl VoiceCapture {
         }
         mic_pipeline.set_state(gst::State::Playing)?;
 
-        Ok(VoiceCapture { mic_pipeline, ref_pipeline, peers, pending_config })
+        Ok(VoiceCapture {
+            mic_pipeline,
+            ref_pipeline,
+            peers,
+            pending_config,
+            self_monitor,
+            monitor_pipeline: Mutex::new(None),
+            output: monitor_output,
+        })
+    }
+
+    /// Toggle the in-call self-monitor (hear yourself through the live capture).
+    /// Idempotent; building the playback pipeline lazily on first enable.
+    pub fn set_self_monitor(&self, on: bool) {
+        let mut src = self.self_monitor.lock().unwrap();
+
+        if on {
+            if src.is_some() {
+                return;
+            }
+            match build_self_monitor(self.output.clone()) {
+                Ok((pipeline, appsrc)) => {
+                    let _ = pipeline.set_state(gst::State::Playing);
+                    *self.monitor_pipeline.lock().unwrap() = Some(pipeline);
+                    *src = Some(appsrc);
+                }
+                Err(e) => eprintln!("audio/capture: self-monitor start failed: {e}"),
+            }
+        } else {
+            // Drop the appsrc first so the cap callback stops pushing, then tear
+            // down the playback pipeline.
+            *src = None;
+            if let Some(p) = self.monitor_pipeline.lock().unwrap().take() {
+                let _ = p.set_state(gst::State::Null);
+            }
+        }
     }
 
     /// Register a peer's voice send `appsrc`; the next processed frame reaches it.
@@ -133,6 +181,9 @@ impl Drop for VoiceCapture {
     fn drop(&mut self) {
         if let Some(rp) = self.ref_pipeline.as_ref() {
             let _ = rp.set_state(gst::State::Null);
+        }
+        if let Some(mp) = self.monitor_pipeline.lock().unwrap().take() {
+            let _ = mp.set_state(gst::State::Null);
         }
         let _ = self.mic_pipeline.set_state(gst::State::Null);
     }
@@ -191,6 +242,7 @@ fn build_mic_pipeline(
     gate: Arc<Mutex<Gate>>,
     peers: Arc<Mutex<Vec<gst_app::AppSrc>>>,
     pending_config: Arc<Mutex<Option<DspConfig>>>,
+    self_monitor: Arc<Mutex<Option<gst_app::AppSrc>>>,
     ref_rx: mpsc::Receiver<Vec<f32>>,
     evt: UnboundedSender<SessionEvent>,
 ) -> Result<gst::Pipeline> {
@@ -283,6 +335,14 @@ fn build_mic_pipeline(
                 let frame = if open { &mic[..] } else { &silence[..] };
                 push_to_peers(&peers, frame, pts, frame_duration);
 
+                // Self-monitor hears the processed mic regardless of the gate, so
+                // a mic test is audible even while the call is suspended/muted.
+                if let Some(src) = self_monitor.lock().unwrap().as_ref() {
+                    if let Some(buf) = make_pcm_buffer(&mic, pts, frame_duration) {
+                        let _ = src.push_buffer(buf);
+                    }
+                }
+
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
@@ -329,31 +389,15 @@ pub(super) fn sample_to_f32(sample: &gst::Sample) -> Option<Vec<f32>> {
 /// an explicit PTS and duration, then push it into every registered peer appsrc.
 /// PTS is frame-derived so Opus/RTP timing stays stable regardless of callback
 /// jitter — measurably tighter than letting the appsrc timestamp on push.
-fn push_to_peers(
-    peers: &Arc<Mutex<Vec<gst_app::AppSrc>>>,
-    frame: &[f32],
-    pts: gst::ClockTime,
-    duration: gst::ClockTime,
-) {
+fn make_pcm_buffer(frame: &[f32], pts: gst::ClockTime, duration: gst::ClockTime) -> Option<gst::Buffer> {
     let byte_len = frame.len() * 2;
-
-    let Some(mut buffer) = gst::Buffer::with_size(byte_len).ok() else {
-        eprintln!("audio/capture: failed to allocate pcm buffer – skipping frame");
-        return;
-    };
+    let mut buffer = gst::Buffer::with_size(byte_len).ok()?;
 
     {
-        let Some(buffer_mut) = buffer.get_mut() else {
-            eprintln!("audio/capture: buffer not uniquely owned – skipping frame");
-            return;
-        };
+        let buffer_mut = buffer.get_mut()?;
 
         {
-            let Ok(mut map) = buffer_mut.map_writable() else {
-                eprintln!("audio/capture: failed to map pcm buffer – skipping frame");
-                return;
-            };
-
+            let mut map = buffer_mut.map_writable().ok()?;
             f32_to_bytes(frame, map.as_mut_slice());
         }
 
@@ -361,10 +405,55 @@ fn push_to_peers(
         buffer_mut.set_duration(duration);
     }
 
+    Some(buffer)
+}
+
+fn push_to_peers(
+    peers: &Arc<Mutex<Vec<gst_app::AppSrc>>>,
+    frame: &[f32],
+    pts: gst::ClockTime,
+    duration: gst::ClockTime,
+) {
+    let Some(buffer) = make_pcm_buffer(frame, pts, duration) else {
+        eprintln!("audio/capture: failed to build pcm buffer – skipping frame");
+        return;
+    };
+
     let peers = peers.lock().unwrap();
     for appsrc in peers.iter() {
         let _ = appsrc.push_buffer(buffer.clone());
     }
+}
+
+/// `appsrc ! audioconvert ! audioresample ! <platform sink>` for the in-call
+/// self-monitor. `do-timestamp` + `sync=false` play frames on arrival, so the
+/// frame-derived capture PTS (far into the stream) never wedges the sink.
+fn build_self_monitor(output: Option<String>) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
+    let pipeline = gst::Pipeline::new();
+
+    let appsrc = gst_app::AppSrc::builder()
+        .name("selfmon")
+        .caps(&pcm_caps())
+        .is_live(true)
+        .do_timestamp(true)
+        .format(gst::Format::Time)
+        .build();
+
+    let convert = gst::ElementFactory::make("audioconvert").build()?;
+    let resample = gst::ElementFactory::make("audioresample").build()?;
+
+    let sink = gst::ElementFactory::make(crate::audio::playback_sink_factory());
+    let sink = match output {
+        Some(dev) => sink.property("device", dev),
+        None => sink,
+    }
+    .property("sync", false)
+    .build()?;
+
+    pipeline.add_many([appsrc.upcast_ref(), &convert, &resample, &sink])?;
+    gst::Element::link_many([appsrc.upcast_ref(), &convert, &resample, &sink])?;
+
+    Ok((pipeline, appsrc))
 }
 
 #[cfg(test)]

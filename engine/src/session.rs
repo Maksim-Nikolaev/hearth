@@ -1289,10 +1289,10 @@ impl Session {
     /// Start the standalone mic loopback for the Settings mic-test panel.
     ///
     /// Captures the mic, runs DSP, plays it back on the output device, and
-    /// emits `SessionEvent::InputLevel`. Refuses silently (with an error
-    /// event) when a voice call is active – the engine itself enforces this
-    /// to prevent a second concurrent capture + AEC-reference corruption.
-    /// Calling while the monitor is already running replaces the previous one.
+    /// emits `SessionEvent::InputLevel`. During a voice call it reuses the live
+    /// shared capture (self-monitor) instead of opening a second one; outside a
+    /// call it runs a standalone monitor pipeline. Calling while a monitor is
+    /// already running replaces the previous one.
     pub fn start_mic_test(&mut self) {
         self.mic_monitor = None;
         self.mic_testing = true;
@@ -1325,9 +1325,11 @@ impl Session {
             }
         }
 
-        // GStreamer fallback can't share the call's capture — refuse during a call.
-        if self.in_voice() {
-            self.emit(SessionEvent::Error("mic test unavailable during a call".into()));
+        // In a call the shared capture is already open; route its post-DSP mic
+        // into a self-monitor so you hear yourself without a second mic (parity
+        // with the native path). Outside a call, run the standalone monitor.
+        if let Some(vc) = self.voice_capture.as_ref() {
+            vc.set_self_monitor(true);
             return;
         }
         match Monitor::start(
@@ -1344,6 +1346,9 @@ impl Session {
     /// Stop the mic-test loopback. No-op if not running.
     pub fn stop_mic_test(&mut self) {
         self.mic_monitor = None;
+        if let Some(vc) = self.voice_capture.as_ref() {
+            vc.set_self_monitor(false);
+        }
         self.mic_testing = false;
         self.set_io_suspended(false);       // restore the user's real mute/deafen
         self.voice_status.set_testing(false); // re-broadcast real status
@@ -1384,6 +1389,12 @@ impl Session {
             Ok(vc) => {
                 for appsrc in appsrcs {
                     vc.add_peer(appsrc);
+                }
+
+                // A device swap mid mic-test rebuilds the capture; restore the
+                // self-monitor so the test stays audible on the new device.
+                if self.mic_testing {
+                    vc.set_self_monitor(true);
                 }
 
                 self.voice_capture = Some(vc);

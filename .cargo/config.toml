@@ -1,0 +1,13 @@
+# Build environment for the workspace.
+#
+# `aec-rs-sys` bundles speexdsp but ships only `speexdsp_config_types.h.in`; its
+# `speexdsp_types.h` includes the generated header by bare name. Neither bindgen
+# nor the cmake C build can find it unless the system speex include dir is on the
+# search path. `libspeexdsp-dev` provides `/usr/include/speex/speexdsp_config_types.h`.
+#
+# The path only exists on Linux; on Windows/macOS these args reference a missing
+# directory, which the compilers ignore harmlessly.
+[env]
+BINDGEN_EXTRA_CLANG_ARGS = "-I/usr/include/speex"
+CFLAGS = "-I/usr/include/speex"
+CXXFLAGS = "-I/usr/include/speex"
