@@ -32,6 +32,7 @@ struct Stream {
     event: HANDLE,
     rate: u32,
     channels: usize,
+    period_frames: u32,
 }
 
 /// Open the default endpoint for `dataflow` at its minimum shared engine period,
@@ -59,7 +60,7 @@ unsafe fn open_stream(enumerator: &IMMDeviceEnumerator, capture: bool) -> Result
 
     // GetMixFormat allocates via CoTaskMemAlloc; we intentionally leak it (the
     // spike runs briefly), keeping the format alive through Initialize.
-    Ok(Stream { client, event, rate, channels })
+    Ok(Stream { client, event, rate, channels, period_frames: min_p })
 }
 
 /// Run the mic → speaker passthrough for `seconds`.
@@ -122,17 +123,21 @@ unsafe fn run_loopback_inner(seconds: u64) -> Result<()> {
             cap_svc.ReleaseBuffer(frames)?;
         }
 
-        // 2) Fill the render's free space from the ring (silence on underrun).
-        let free = ren_buf_frames - render.client.GetCurrentPadding()?;
-        if free == 0 {
+        // 2) Top the render buffer up to a tight target (~2 periods queued)
+        //    rather than filling the whole 22 ms buffer — keeping it less full is
+        //    what drops the render latency toward the OS floor.
+        let padding = render.client.GetCurrentPadding()?;
+        let target_ahead = (2 * render.period_frames).min(ren_buf_frames);
+        if padding >= target_ahead {
             continue;
         }
-        let data = ren_svc.GetBuffer(free)?;
-        let out = std::slice::from_raw_parts_mut(data as *mut f32, free as usize * ren_ch);
+        let to_write = target_ahead - padding;
+        let data = ren_svc.GetBuffer(to_write)?;
+        let out = std::slice::from_raw_parts_mut(data as *mut f32, to_write as usize * ren_ch);
         for s in out.iter_mut() {
             *s = ring.pop_front().unwrap_or(0.0);
         }
-        ren_svc.ReleaseBuffer(free, 0)?;
+        ren_svc.ReleaseBuffer(to_write, 0)?;
     }
 
     render.client.Stop()?;
