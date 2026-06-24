@@ -103,7 +103,10 @@ impl NativeVoice {
         ec: bool,
         voice_status: crate::session::VoiceStatus,
     ) -> Result<Self> {
+        #[cfg(windows)]
         eprintln!("[native-voice] active — WASAPI IAudioClient3 capture/playback + Opus + UDP");
+        #[cfg(target_os = "linux")]
+        eprintln!("[native-voice] active — PipeWire capture/playback + Opus + UDP");
         let playback = Arc::new(NativePlayback::start(output_device)?);
         let targets: Arc<Mutex<Vec<Arc<SendTarget>>>> = Arc::new(Mutex::new(Vec::new()));
         let deaf = Arc::new(AtomicBool::new(false));
