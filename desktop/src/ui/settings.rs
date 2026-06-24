@@ -45,6 +45,8 @@ pub enum SettingsInput {
     SetTransmitting(bool),
     /// Programmatically set the Mic Test toggle without re-emitting its handler.
     SetMicTestActive(bool),
+    /// Display which voice backend went live (e.g. "Native (PipeWire)").
+    SetVoiceBackend(String),
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -79,6 +81,8 @@ pub struct SettingsWindowWidgets {
     // Kept alive so the closure can set its text; never accessed after init.
     #[allow(dead_code)]
     reprobe_label: gtk::Label,
+    // Shows the live voice backend (native vs generic), updated on VoiceBackend.
+    engine_label: gtk::Label,
     // Signal handler IDs – stored so programmatic updates can be blocked.
     mic_test_toggled_id: SignalHandlerId,
     mic_selected_id: SignalHandlerId,
@@ -161,6 +165,13 @@ impl Component for SettingsWindow {
         device_hint.set_margin_top(4);
         device_hint.set_margin_bottom(4);
         root_box.append(&device_hint);
+
+        // Live voice backend indicator (filled by SetVoiceBackend once a call
+        // starts; shows the best-driver/auto-fallback result).
+        let engine_label = gtk::Label::new(Some("Audio engine: —"));
+        engine_label.set_xalign(0.0);
+        engine_label.add_css_class("dim-label");
+        root_box.append(&engine_label);
 
         // Volume section
         root_box.append(&section_label("VOLUME"));
@@ -578,6 +589,7 @@ impl Component for SettingsWindow {
             mic_test_btn,
             profile_dropdown,
             reprobe_label,
+            engine_label,
             mic_test_toggled_id,
             mic_selected_id,
             spk_selected_id,
@@ -636,6 +648,10 @@ impl Component for SettingsWindow {
                 widgets.mic_test_btn.block_signal(&widgets.mic_test_toggled_id);
                 widgets.mic_test_btn.set_active(active);
                 widgets.mic_test_btn.unblock_signal(&widgets.mic_test_toggled_id);
+            }
+
+            SettingsInput::SetVoiceBackend(label) => {
+                widgets.engine_label.set_text(&format!("Audio engine: {label}"));
             }
         }
     }

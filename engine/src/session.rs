@@ -58,6 +58,9 @@ pub enum SessionEvent {
     /// Non-fatal diagnostic surfaced to the UI/log (e.g. realtime scheduling
     /// unavailable, so latency may be unstable).
     Warning(String),
+    /// Which voice device backend went live this session (native vs generic), so
+    /// the UI can show the auto-fallback result instead of it being silent.
+    VoiceBackend(VoiceBackendKind),
 }
 
 /// Shared voice presence (mute / deafen / speaking) broadcast to the room on
@@ -592,6 +595,10 @@ pub struct Session {
     native_monitor: Option<crate::audio::native::NativeMonitor>,
     /// Mic test in progress — survives a device-change rebuild.
     mic_testing: bool,
+    /// Whether we've already told the UI which voice backend is live this call.
+    /// Reset on leave/rebuild so the next call re-announces (possibly a different
+    /// backend after an auto-fallback).
+    voice_backend_announced: bool,
     /// Software activation gate, shared with the capture callback thread.
     gate: Arc<Mutex<Gate>>,
     dsp_config: DspConfig,
@@ -706,6 +713,7 @@ impl Session {
             #[cfg(any(target_os = "windows", target_os = "linux"))]
             native_monitor: None,
             mic_testing: false,
+            voice_backend_announced: false,
             gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
             dsp_config: default_dsp_config(),
             input_device: None,
@@ -756,6 +764,7 @@ impl Session {
         self.voice_status.set_active(false); // stop broadcasting our status
         self.voice_peers.clear();
         self.voice_capture = None;
+        self.voice_backend_announced = false; // next call re-announces its backend
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             // Dropping it stops the native capture/playback + joins recv threads.
@@ -843,6 +852,15 @@ impl Session {
         self.native_voice.as_mut()
     }
 
+    /// Tell the UI once which voice backend went live this call. Idempotent until
+    /// the next leave/rebuild resets `voice_backend_announced`.
+    fn announce_backend(&mut self, kind: VoiceBackendKind) {
+        if !self.voice_backend_announced {
+            self.voice_backend_announced = true;
+            self.emit(SessionEvent::VoiceBackend(kind));
+        }
+    }
+
     fn voice_offer(&mut self, peer: Uuid) -> Result<()> {
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         if native_voice_selected() && !self.native_voice_failed {
@@ -851,6 +869,7 @@ impl Session {
                 None => None,
             };
             if let Some(endpoint) = endpoint {
+                self.announce_backend(VoiceBackendKind::Native);
                 let _ = self.out_tx.send(ClientMessage::Offer { to: peer, flow: Flow::Voice, sdp: endpoint });
                 return Ok(());
             }
@@ -861,6 +880,7 @@ impl Session {
         let endpoint = p.local_endpoint();
         self.voice_peers.insert(peer, p);
         self.register_voice_send(peer);
+        self.announce_backend(VoiceBackendKind::Generic);
         let _ = self.out_tx.send(ClientMessage::Offer {
             to: peer,
             flow: Flow::Voice,
@@ -890,6 +910,7 @@ impl Session {
             if let Some(result) = result {
                 match result {
                     Ok(my_endpoint) => {
+                        self.announce_backend(VoiceBackendKind::Native);
                         let _ = self.out_tx.send(ClientMessage::Answer { to: from, flow: Flow::Voice, sdp: my_endpoint });
                     }
                     Err(e) => self.emit(SessionEvent::Error(format!("native voice answer: {e}"))),
@@ -908,6 +929,7 @@ impl Session {
                 let my_endpoint = p.local_endpoint();
                 self.voice_peers.insert(from, p);
                 self.register_voice_send(from);
+                self.announce_backend(VoiceBackendKind::Generic);
                 let _ = self.out_tx.send(ClientMessage::Answer {
                     to: from,
                     flow: Flow::Voice,
@@ -1276,6 +1298,7 @@ impl Session {
             return;
         }
         self.native_voice = None; // dropped; recreated with new devices by the re-offers
+        self.voice_backend_announced = false; // a rebuild may land on a different backend
         let members: Vec<Uuid> = self
             .voice_members
             .iter()
@@ -1601,6 +1624,7 @@ mod tests {
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
                 native_monitor: None,
                 mic_testing: false,
+            voice_backend_announced: false,
                 gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
                 dsp_config: default_dsp_config(),
                 input_device: None,

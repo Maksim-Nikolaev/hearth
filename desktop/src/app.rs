@@ -9,7 +9,7 @@ use engine::flow::VideoSink;
 use engine::screen::audio::ShareAudio;
 use engine::screen::audio::list_app_nodes;
 use engine::screen::sources::{list_windows, ContentType, ShareConfig, ShareSource};
-use engine::session::{Connection, Presence, Session, SessionEvent};
+use engine::session::{Connection, Presence, Session, SessionEvent, VoiceBackendKind};
 use gtk::prelude::*;
 use hearth_protocol::ServerMessage;
 use relm4::prelude::*;
@@ -399,6 +399,19 @@ impl AppModel {
             }
             SessionEvent::Warning(msg) => {
                 eprintln!("[hearth] warning: {msg}");
+            }
+            SessionEvent::VoiceBackend(kind) => {
+                let label = match kind {
+                    VoiceBackendKind::Native if cfg!(target_os = "linux") => "Native (PipeWire)",
+                    VoiceBackendKind::Native if cfg!(target_os = "windows") => "Native (WASAPI)",
+                    VoiceBackendKind::Native => "Native",
+                    VoiceBackendKind::Generic => "Generic (GStreamer)",
+                };
+                eprintln!("[hearth] voice backend: {label}");
+                let _ = self
+                    .settings_window
+                    .sender()
+                    .send(SettingsInput::SetVoiceBackend(label.to_string()));
             }
             SessionEvent::FlowState { .. } | SessionEvent::Error(_) => {}
         }
