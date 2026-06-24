@@ -140,8 +140,10 @@ impl NativeVoice {
                 };
                 let _ = evt_tx.send(SessionEvent::InputLevel(rms_db));
 
-                // Broadcast speaking transitions (with hangover) to the room.
-                if open {
+                // Broadcast speaking transitions (with hangover). "Speaking" =
+                // actually transmitting voice: the gate is open AND there's real
+                // signal (so Always-on / held-PTT don't show talking while silent).
+                if open && rms_db > -50.0 {
                     silent_frames = 0;
                     if !speaking {
                         speaking = true;
