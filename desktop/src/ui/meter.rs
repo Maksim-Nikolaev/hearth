@@ -12,6 +12,8 @@ pub struct LevelBar {
     pub level_db: Rc<Cell<f32>>,
     /// Sensitivity threshold, dBFS (-60..0).
     pub threshold_db: Rc<Cell<f32>>,
+    /// True when the gate is actually transmitting (VAD/PTT/threshold open).
+    pub transmitting: Rc<Cell<bool>>,
 }
 
 impl LevelBar {
@@ -29,11 +31,13 @@ impl LevelBar {
 
         let level_db = Rc::new(Cell::new(-60.0f32));
         let threshold_db = Rc::new(Cell::new(threshold_db_init));
+        let transmitting = Rc::new(Cell::new(false));
 
         // Draw function – captures shared state by Rc clone.
         {
             let level = level_db.clone();
             let thresh = threshold_db.clone();
+            let tx = transmitting.clone();
 
             area.set_draw_func(move |_area, cr, width, height| {
                 let w = width as f64;
@@ -74,6 +78,15 @@ impl LevelBar {
                 cr.set_source_rgb(1.0, 1.0, 1.0);
                 cr.rectangle((thresh_x - handle_w / 2.0).max(0.0), 0.0, handle_w, h);
                 let _ = cr.fill();
+
+                // Transmitting glow: bright green border when the gate is open, so
+                // you can see VAD/PTT/threshold actually keying the mic.
+                if tx.get() {
+                    cr.set_source_rgb(0.231, 0.808, 0.365); // bright green
+                    cr.set_line_width(2.0);
+                    cr.rectangle(1.0, 1.0, w - 2.0, h - 2.0);
+                    let _ = cr.stroke();
+                }
             });
         }
 
@@ -139,12 +152,19 @@ impl LevelBar {
             drawing_area: area,
             level_db,
             threshold_db,
+            transmitting,
         }
     }
 
     /// Update the live level fill. Queues a redraw.
     pub fn set_level(&self, db: f32) {
         self.level_db.set(db.clamp(-60.0, 0.0));
+        self.drawing_area.queue_draw();
+    }
+
+    /// Set whether the gate is transmitting (draws the green glow).
+    pub fn set_transmitting(&self, on: bool) {
+        self.transmitting.set(on);
         self.drawing_area.queue_draw();
     }
 

@@ -39,6 +39,8 @@ pub enum SettingsInput {
     SetSettings(Settings),
     /// Forward a live input level reading to the embedded level bar.
     SetLevel(f32),
+    /// Gate transmitting state — draws the mic-test "transmitting" glow.
+    SetTransmitting(bool),
     /// Programmatically set the Mic Test toggle without re-emitting its handler.
     SetMicTestActive(bool),
 }
@@ -519,6 +521,9 @@ impl Component for SettingsWindow {
 
             SettingsInput::SetLevel(db) => {
                 self.level_bar.set_level(db);
+            }
+            SettingsInput::SetTransmitting(on) => {
+                self.level_bar.set_transmitting(on);
             }
 
             SettingsInput::SetMicTestActive(active) => {

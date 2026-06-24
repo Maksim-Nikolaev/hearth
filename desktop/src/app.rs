@@ -372,6 +372,8 @@ impl AppModel {
             }
             SessionEvent::SelfSpeaking(on) => {
                 let _ = w.send(WorkspaceInput::SelfSpeaking(on));
+                // Also drive the mic-test "transmitting" glow.
+                let _ = self.settings_window.sender().send(SettingsInput::SetTransmitting(on));
             }
             SessionEvent::ShareStarted { user } => {
                 let _ = w.send(WorkspaceInput::ShareStarted { user });
