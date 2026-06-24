@@ -204,7 +204,14 @@ impl Component for SettingsWindow {
             .placeholder_text("e.g. F12")
             .hexpand(true)
             .build();
-        root_box.append(&hrow("PTT key", 140, &ptt_entry));
+        let ptt_record_btn = gtk::Button::with_label("Record");
+        ptt_record_btn.set_tooltip_text(Some(
+            "Click, then press the key to bind (Space, F1–F12, Ctrl/Alt/Shift, letters, digits)",
+        ));
+        let ptt_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        ptt_box.append(&ptt_entry);
+        ptt_box.append(&ptt_record_btn);
+        root_box.append(&hrow("PTT key", 140, &ptt_box));
 
         // Network section
         root_box.append(&section_label("NETWORK"));
@@ -340,6 +347,39 @@ impl Component for SettingsWindow {
                 let text = e.text().to_string();
                 let key = if text.is_empty() { None } else { Some(text) };
                 let _ = s.output(SettingsOutput::PttKey(key));
+            });
+        }
+
+        // PTT key capture: "Record" arms a one-shot listener; the next keypress
+        // (caught in the capture phase, before any widget) becomes the bind.
+        // `keyval.name()` is the X11/GDK key name the engine maps to a keysym —
+        // identical across X11/Wayland/Windows, so recording is cross-platform.
+        {
+            let armed = std::rc::Rc::new(std::cell::Cell::new(false));
+            let key_ctl = gtk::EventControllerKey::new();
+            key_ctl.set_propagation_phase(gtk::PropagationPhase::Capture);
+            {
+                let armed = armed.clone();
+                let entry = ptt_entry.clone();
+                let btn = ptt_record_btn.clone();
+                key_ctl.connect_key_pressed(move |_, keyval, _, _| {
+                    if !armed.get() {
+                        return gtk::glib::Propagation::Proceed;
+                    }
+                    if let Some(name) = keyval.name() {
+                        entry.set_text(name.as_str()); // emits PttKey via connect_changed
+                    }
+                    armed.set(false);
+                    btn.set_label("Record");
+                    gtk::glib::Propagation::Stop
+                });
+            }
+            root_box.add_controller(key_ctl);
+
+            let btn = ptt_record_btn.clone();
+            ptt_record_btn.connect_clicked(move |_| {
+                armed.set(true);
+                btn.set_label("Press a key…");
             });
         }
 

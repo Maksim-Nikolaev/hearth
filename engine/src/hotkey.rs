@@ -5,6 +5,14 @@ use anyhow::Result;
 /// Covers the keys commonly chosen for push-to-talk. Returns `None` for
 /// anything not in the table.
 pub fn keysym_from_name(name: &str) -> Option<u32> {
+    // Single ASCII letter/digit: GDK's key name is the character itself, and its
+    // keysym is the ASCII codepoint (e.g. "g" -> 0x67, "A" -> 0x41, "5" -> 0x35).
+    if name.len() == 1 {
+        let c = name.as_bytes()[0];
+        if c.is_ascii_alphanumeric() {
+            return Some(c as u32);
+        }
+    }
     Some(match name {
         "space" => 0x0020,
         "F1" => 0xFFBE,
@@ -50,6 +58,9 @@ fn vk_from_keysym(keysym: u32) -> Option<u32> {
         0xFFEA => 0xA5,                              // Alt_R -> VK_RMENU
         0xFFE1 => 0xA0,                              // Shift_L -> VK_LSHIFT
         0xFFE2 => 0xA1,                              // Shift_R -> VK_RSHIFT
+        0x0041..=0x005A => keysym,                   // A-Z -> VK_A..VK_Z
+        0x0061..=0x007A => keysym - 0x20,            // a-z -> VK_A..VK_Z (uppercase)
+        0x0030..=0x0039 => keysym,                   // 0-9 -> VK_0..VK_9
         _ => return None,
     })
 }
