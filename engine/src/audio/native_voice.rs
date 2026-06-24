@@ -16,9 +16,25 @@ use super::gate::Gate;
 use super::native::{NativeCapture, NativePlayback};
 use crate::session::SessionEvent;
 use anyhow::{anyhow, Result};
+use aec_rs::Aec;
 use audiopus::{coder::Decoder, coder::Encoder, Application, Channels, SampleRate};
 use earshot::{VoiceActivityDetector, VoiceActivityProfile};
 use nnnoiseless::DenoiseState;
+
+/// speexdsp's `Aec` holds raw pointers; it lives entirely on the capture thread,
+/// so wrap it to move into that thread's closure. The method (rather than field
+/// access) keeps closures capturing the whole wrapper, not the inner `Aec`.
+struct SendAec(Aec);
+unsafe impl Send for SendAec {}
+impl SendAec {
+    fn cancel(&mut self, mic: &[i16], far: &[i16], out: &mut [i16]) {
+        self.0.cancel_echo(mic, far, out);
+    }
+}
+
+/// AEC frame (10 ms) and adaptive-filter tail (~100 ms of room echo) at 48 kHz.
+const AEC_FRAME: usize = 480;
+const AEC_FILTER_LEN: i32 = 4800;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -68,6 +84,8 @@ pub struct NativeVoice {
     /// earshot VAD on/off, and AGC on/off (toggled from Settings).
     vad: Arc<AtomicBool>,
     agc: Arc<AtomicBool>,
+    /// speexdsp AEC on/off.
+    ec: Arc<AtomicBool>,
     next_source: u64,
 }
 
@@ -82,6 +100,7 @@ impl NativeVoice {
         ns_wet: u32,
         vad: bool,
         agc: bool,
+        ec: bool,
         voice_status: crate::session::VoiceStatus,
     ) -> Result<Self> {
         eprintln!("[native-voice] active — WASAPI IAudioClient3 capture/playback + Opus + UDP");
@@ -136,7 +155,43 @@ impl NativeVoice {
         let mut send_gain = 0.0f32;
         let mut mon_gain = 0.0f32;
 
+        // AEC: cancel the speaker mix (far-end, tapped from playback) out of the
+        // mic. speexdsp processes fixed 480-sample i16 frames; buffer to that.
+        let ec_enabled = Arc::new(AtomicBool::new(ec));
+        let ec_cb = ec_enabled.clone();
+        let far_ring = playback.far_end();
+        let mut aec = SendAec(Aec::new(AEC_FRAME, AEC_FILTER_LEN, 48000));
+        let mut aec_in: Vec<f32> = Vec::with_capacity(AEC_FRAME * 2);
+
         let capture = NativeCapture::start(input_device, move |mono| {
+            // AEC first (on the raw mic), so NS/AGC see echo-free audio. When off,
+            // `src` is the mic untouched.
+            let ec_on = ec_cb.load(Ordering::Relaxed);
+            let cleaned: Vec<f32> = if ec_on {
+                aec_in.extend_from_slice(mono);
+                let mut out = Vec::with_capacity(aec_in.len());
+                while aec_in.len() >= AEC_FRAME {
+                    let mic_f: Vec<f32> = aec_in.drain(..AEC_FRAME).collect();
+                    let mut far = [0i16; AEC_FRAME];
+                    {
+                        let mut fr = far_ring.lock().unwrap();
+                        for d in far.iter_mut() {
+                            *d = fr.pop_front().map_or(0, |v: f32| (v.clamp(-1.0, 1.0) * 32767.0) as i16);
+                        }
+                    }
+                    let mic_i: Vec<i16> =
+                        mic_f.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16).collect();
+                    let mut out_i = [0i16; AEC_FRAME];
+                    aec.cancel(&mic_i, &far, &mut out_i);
+                    out.extend(out_i.iter().map(|s| *s as f32 / 32768.0));
+                }
+                out
+            } else {
+                aec_in.clear();
+                Vec::new()
+            };
+            let mono: &[f32] = if ec_on { &cleaned } else { mono };
+
             // Voice activity detection on the raw mic (10 ms / 480-sample frames).
             if vad_cb.load(Ordering::Relaxed) {
                 vad_acc.extend(mono.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16));
@@ -257,8 +312,14 @@ impl NativeVoice {
             self_monitor,
             vad: vad_enabled,
             agc: agc_enabled,
+            ec: ec_enabled,
             next_source: 0,
         })
+    }
+
+    /// Toggle acoustic echo cancellation. Live.
+    pub fn set_echo_cancel(&self, on: bool) {
+        self.ec.store(on, Ordering::Relaxed);
     }
 
     /// Toggle earshot VAD (Voice-activity gating + speaking detection). Live.

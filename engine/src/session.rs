@@ -760,6 +760,7 @@ impl Session {
                 ns_wet,
                 self.dsp_config.vad,
                 self.dsp_config.agc,
+                self.dsp_config.echo_cancel,
                 self.voice_status.clone(),
             ) {
                 Ok(nv) => self.native_voice = Some(nv),
@@ -1113,6 +1114,7 @@ impl Session {
             nv.set_noise_wet(ns_wet_permille(cfg.noise_suppression));
             nv.set_vad(cfg.vad);
             nv.set_agc(cfg.agc);
+            nv.set_echo_cancel(cfg.echo_cancel);
         }
 
         if let Some(vc) = self.voice_capture.as_ref() {

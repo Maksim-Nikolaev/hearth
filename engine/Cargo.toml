@@ -24,9 +24,9 @@ audiopus = "0.2"
 nnnoiseless = { version = "0.5", default-features = false }
 # Pure-Rust voice activity detection (fast, tiny NN). 16 kHz / 256-sample frames.
 earshot = "0.1"
-# Acoustic echo cancellation: aec-rs (speexdsp) is build-de-risked on Windows
-# (cmake + libclang via win-env, /D_USE_MATH_DEFINES). Re-add when wiring the
-# far-end reference path:  aec-rs = "0.1"
+# Acoustic echo cancellation (speexdsp). Build needs cmake + libclang +
+# /D_USE_MATH_DEFINES — win-env.ps1 sets all three.
+aec-rs = "0.1"
 hearth-protocol = { path = "../protocol" }
 
 # Voice DSP (AEC/NS/AGC/VAD). The `bundled` build uses autotools and only links

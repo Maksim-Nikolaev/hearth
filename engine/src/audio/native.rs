@@ -192,31 +192,47 @@ where
 pub struct NativePlayback {
     stop: Arc<AtomicBool>,
     sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>>,
+    /// Rendered mono mix (the speaker signal) — the AEC far-end reference.
+    far_end: Arc<Mutex<VecDeque<f32>>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
+
+/// Cap the far-end ring at ~200 ms so it can't grow unbounded when no AEC is
+/// consuming it (drop oldest).
+const FAR_END_CAP: usize = SAMPLE_RATE as usize / 5;
 
 impl NativePlayback {
     pub fn start(device: Option<String>) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let far_end: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
         let stop_thread = stop.clone();
         let sources_thread = sources.clone();
+        let far_thread = far_end.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
 
         let handle = std::thread::Builder::new()
             .name("native-playback".into())
             .spawn(move || {
-                let r = unsafe { playback_loop(&stop_thread, device.as_deref(), &sources_thread, &ready_tx) };
+                let r = unsafe {
+                    playback_loop(&stop_thread, device.as_deref(), &sources_thread, &far_thread, &ready_tx)
+                };
                 if let Err(e) = r {
                     let _ = ready_tx.send(Err(e.to_string()));
                 }
             })?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { stop, sources, handle: Some(handle) }),
+            Ok(Ok(())) => Ok(Self { stop, sources, far_end, handle: Some(handle) }),
             Ok(Err(e)) => bail!("native playback init: {e}"),
             Err(_) => bail!("native playback thread exited before init"),
         }
+    }
+
+    /// The rendered speaker mix (AEC far-end reference). The capture thread pulls
+    /// from this in lock-step with the mic to cancel echo.
+    pub fn far_end(&self) -> Arc<Mutex<VecDeque<f32>>> {
+        self.far_end.clone()
     }
 
     /// Queue mono f32 @ 48 kHz for `source`'s lane, trimmed to a tight target so
@@ -301,6 +317,7 @@ unsafe fn playback_loop(
     stop: &AtomicBool,
     device: Option<&str>,
     sources: &Mutex<HashMap<u64, VecDeque<f32>>>,
+    far_end: &Mutex<VecDeque<f32>>,
     ready: &mpsc::Sender<Result<(), String>>,
 ) -> Result<()> {
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -336,6 +353,7 @@ unsafe fn playback_loop(
         let out = std::slice::from_raw_parts_mut(data as *mut f32, to_write as usize * ch);
         {
             let mut sources = sources.lock().unwrap();
+            let mut far = far_end.lock().unwrap();
             for f in 0..to_write as usize {
                 // mix: sum one sample from every source lane (silence on underrun)
                 let mut v = 0.0f32;
@@ -348,6 +366,11 @@ unsafe fn playback_loop(
                 for c in 0..ch {
                     out[f * ch + c] = v; // mono -> all channels
                 }
+                // Tap the rendered mono as the AEC far-end reference.
+                far.push_back(v);
+            }
+            while far.len() > FAR_END_CAP {
+                far.pop_front();
             }
         }
         svc.ReleaseBuffer(to_write, 0)?;
