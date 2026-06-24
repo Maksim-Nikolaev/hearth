@@ -197,7 +197,7 @@ impl Component for SettingsWindow {
         let ec_switch = gtk::Switch::new();
         ec_switch.set_active(true);
         ec_switch.set_tooltip_text(Some(
-            "Cancels speaker echo picked up by the mic (not needed with a headset). May add ~10 ms latency.",
+            "Cancels speaker echo picked up by the mic — not needed with a headset, and not yet implemented on the native path.",
         ));
         root_box.append(&hrow("Echo cancellation", 180, &ec_switch));
 

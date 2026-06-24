@@ -758,6 +758,8 @@ impl Session {
                 self.input_device.clone(),
                 self.output_device.clone(),
                 ns_wet,
+                self.dsp_config.vad,
+                self.dsp_config.agc,
                 self.voice_status.clone(),
             ) {
                 Ok(nv) => self.native_voice = Some(nv),
@@ -1109,6 +1111,8 @@ impl Session {
         #[cfg(target_os = "windows")]
         if let Some(nv) = self.native_voice.as_ref() {
             nv.set_noise_wet(ns_wet_permille(cfg.noise_suppression));
+            nv.set_vad(cfg.vad);
+            nv.set_agc(cfg.agc);
         }
 
         if let Some(vc) = self.voice_capture.as_ref() {

@@ -17,6 +17,7 @@ use super::native::{NativeCapture, NativePlayback};
 use crate::session::SessionEvent;
 use anyhow::{anyhow, Result};
 use audiopus::{coder::Decoder, coder::Encoder, Application, Channels, SampleRate};
+use earshot::{VoiceActivityDetector, VoiceActivityProfile};
 use nnnoiseless::DenoiseState;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
@@ -64,6 +65,9 @@ pub struct NativeVoice {
     ns_wet: Arc<AtomicU32>,
     /// Mic-test self-monitor (loop your own audio back to your speakers).
     self_monitor: Arc<AtomicBool>,
+    /// earshot VAD on/off, and AGC on/off (toggled from Settings).
+    vad: Arc<AtomicBool>,
+    agc: Arc<AtomicBool>,
     next_source: u64,
 }
 
@@ -76,6 +80,8 @@ impl NativeVoice {
         input_device: Option<String>,
         output_device: Option<String>,
         ns_wet: u32,
+        vad: bool,
+        agc: bool,
         voice_status: crate::session::VoiceStatus,
     ) -> Result<Self> {
         eprintln!("[native-voice] active — WASAPI IAudioClient3 capture/playback + Opus + UDP");
@@ -111,7 +117,33 @@ impl NativeVoice {
         let self_monitor_cb = self_monitor.clone();
         let mon_playback = playback.clone();
 
+        // VAD (earshot): real speech detection feeding the gate's Voice-activity
+        // mode + the speaking indicator. Processes 480-sample (10 ms) 48 kHz i16
+        // frames; QUALITY profile preserves quiet speech.
+        let vad_enabled = Arc::new(AtomicBool::new(vad));
+        let vad_cb = vad_enabled.clone();
+        let mut detector = VoiceActivityDetector::new(VoiceActivityProfile::QUALITY);
+        let mut vad_acc: Vec<i16> = Vec::with_capacity(960);
+        let mut last_vad = false;
+
+        // AGC: simple envelope-follower bringing speech toward a target level.
+        let agc_enabled = Arc::new(AtomicBool::new(agc));
+        let agc_cb = agc_enabled.clone();
+        let mut agc_gain = 1.0f32;
+
         let capture = NativeCapture::start(input_device, move |mono| {
+            // Voice activity detection on the raw mic (10 ms / 480-sample frames).
+            if vad_cb.load(Ordering::Relaxed) {
+                vad_acc.extend(mono.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16));
+                while vad_acc.len() >= 480 {
+                    let chunk: Vec<i16> = vad_acc.drain(..480).collect();
+                    last_vad = detector.predict_48khz(&chunk).unwrap_or(false);
+                }
+            } else {
+                last_vad = false;
+                vad_acc.clear();
+            }
+
             // Optional noise suppression before the Opus path. RNNoise expects
             // f32 in i16 amplitude range and fixed 480-sample frames; buffer to
             // that, denoise, and blend denoised vs original by the wet level.
@@ -140,11 +172,25 @@ impl NativeVoice {
 
             acc.extend_from_slice(feed);
             while acc.len() >= FRAME {
-                let frame: Vec<f32> = acc.drain(..FRAME).collect();
+                let mut frame: Vec<f32> = acc.drain(..FRAME).collect();
+
+                // AGC: adapt a smoothed gain toward a target level (only on real
+                // signal, so it doesn't pump up the noise floor), then apply.
+                if agc_cb.load(Ordering::Relaxed) {
+                    let r = (frame.iter().map(|s| s * s).sum::<f32>() / FRAME as f32).sqrt();
+                    if r > 0.005 {
+                        let desired = (0.1 / r).clamp(0.1, 8.0); // target ~ -20 dBFS
+                        agc_gain += 0.04 * (desired - agc_gain);
+                    }
+                    for s in frame.iter_mut() {
+                        *s = (*s * agc_gain).clamp(-1.0, 1.0);
+                    }
+                }
+
                 let rms_db = rms_dbfs(&frame);
                 let (open, mon_open) = {
                     let mut g = gate.lock().unwrap();
-                    g.update_level(rms_db, rms_db > -60.0);
+                    g.update_level(rms_db, last_vad);
                     (g.open(), g.monitor_open())
                 };
                 let _ = evt_tx.send(SessionEvent::InputLevel(rms_db));
@@ -198,8 +244,20 @@ impl NativeVoice {
             suspended: Arc::new(AtomicBool::new(false)),
             ns_wet,
             self_monitor,
+            vad: vad_enabled,
+            agc: agc_enabled,
             next_source: 0,
         })
+    }
+
+    /// Toggle earshot VAD (Voice-activity gating + speaking detection). Live.
+    pub fn set_vad(&self, on: bool) {
+        self.vad.store(on, Ordering::Relaxed);
+    }
+
+    /// Toggle AGC (auto gain). Live.
+    pub fn set_agc(&self, on: bool) {
+        self.agc.store(on, Ordering::Relaxed);
     }
 
     /// Set the RNNoise wet/dry mix in permille (0 = off, 1000 = full). Live.

@@ -524,6 +524,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aaf95b3e5c8f23aa320147307562d361db0ae0d51242340f558153b4eb2439b"
 
 [[package]]
+name = "earshot"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "88d6e21bffead7abb6d9202cfb3285b34b2e750335d8cf3460b004f886c6f6db"
+
+[[package]]
 name = "easyfft"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -552,6 +558,7 @@ dependencies = [
  "anyhow",
  "audiopus",
  "base64",
+ "earshot",
  "futures",
  "gstreamer",
  "gstreamer-allocators",
