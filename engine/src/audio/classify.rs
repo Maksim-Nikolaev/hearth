@@ -53,10 +53,16 @@ pub fn classify_output(output_id: Option<&str>) -> OutputKind {
         if !matches {
             continue;
         }
-        let form_factor = d
-            .properties()
-            .and_then(|p| p.get::<String>("device.form_factor").ok());
-        return kind_from(form_factor.as_deref(), &d.display_name());
+        // `device.form_factor` is the strongest signal but is often absent for
+        // generic USB DACs; `device.icon_name` (audio-headphones / audio-speakers
+        // / audio-headset) is the next-best hint and shares the same substrings
+        // `kind_from` already matches ("head", "speaker").
+        let props = d.properties();
+        let hint = props
+            .as_ref()
+            .and_then(|p| p.get::<String>("device.form_factor").ok())
+            .or_else(|| props.as_ref().and_then(|p| p.get::<String>("device.icon_name").ok()));
+        return kind_from(hint.as_deref(), &d.display_name());
     }
     OutputKind::Unknown
 }
@@ -84,5 +90,16 @@ mod tests {
     fn unknown_form_factor_falls_through_to_label() {
         assert_eq!(kind_from(Some("car"), "USB Headset"), OutputKind::Headphones);
         assert_eq!(kind_from(Some("car"), "Mystery Box"), OutputKind::Unknown);
+    }
+
+    #[test]
+    fn icon_name_hints_classify() {
+        // `classify_output` passes `device.icon_name` through `kind_from` when no
+        // form factor exists; the standard icon strings must resolve.
+        assert_eq!(kind_from(Some("audio-headphones"), "x"), OutputKind::Headphones);
+        assert_eq!(kind_from(Some("audio-headset"), "x"), OutputKind::Headphones);
+        assert_eq!(kind_from(Some("audio-speakers"), "x"), OutputKind::Speakers);
+        // A generic analog-card icon carries no hint -> Unknown (falls to label).
+        assert_eq!(kind_from(Some("audio-card-analog"), "Mystery"), OutputKind::Unknown);
     }
 }

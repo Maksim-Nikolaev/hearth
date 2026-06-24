@@ -744,10 +744,11 @@ impl SettingsWindow {
         };
         widgets.profile_dropdown.set_selected(profile_idx);
 
-        // When on a preset the advanced toggles are display-only: show the
-        // effective values and disable editing. Custom re-enables them.
+        // On a preset the toggles SHOW the effective values but stay editable:
+        // editing one demotes to Custom (handled in app.rs) while preserving the
+        // other preset values. So they are always sensitive.
         let is_custom = matches!(s.profile, VoiceProfile::Custom);
-        let dsp_sensitive = is_custom;
+        let dsp_sensitive = true;
 
         if !is_custom {
             // Resolve effective DSP for the current profile and show it.

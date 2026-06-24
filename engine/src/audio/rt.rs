@@ -8,15 +8,34 @@ pub(crate) fn parse_rtprio_limit(proc_limits: &str) -> Option<u64> {
     line.split_whitespace().nth(3).and_then(|s| s.parse().ok())
 }
 
-/// Whether the audio path can obtain realtime scheduling. On Linux this means
-/// the user is permitted a non-zero RT priority (PAM limits / rtkit); PipeWire
-/// then runs RT. Windows/macOS assume MMCSS/equivalent for now.
+/// True when RealtimeKit is installed. rtkit grants RT priority dynamically over
+/// D-Bus, bypassing `RLIMIT_RTPRIO` — which is how PipeWire gets realtime on most
+/// desktops even though the rlimit reads 0. Presence of its service file (or the
+/// daemon binary) means RT is obtainable on request.
+#[cfg(target_os = "linux")]
+fn rtkit_present() -> bool {
+    [
+        "/usr/share/dbus-1/system-services/org.freedesktop.RealtimeKit1.service",
+        "/usr/libexec/rtkit-daemon",
+        "/usr/lib/rtkit/rtkit-daemon",
+        "/usr/lib/rtkit-daemon",
+    ]
+    .iter()
+    .any(|p| std::path::Path::new(p).exists())
+}
+
+/// Whether the audio path can obtain realtime scheduling. On Linux that is true
+/// if the user has a non-zero RT priority limit (PAM limits) OR rtkit can grant
+/// it on demand; PipeWire then runs RT. Windows/macOS assume MMCSS/equivalent.
 #[cfg(target_os = "linux")]
 pub fn realtime_available() -> bool {
-    match std::fs::read_to_string("/proc/self/limits") {
-        Ok(s) => parse_rtprio_limit(&s).map(|n| n > 0).unwrap_or(false),
-        Err(_) => false,
-    }
+    let rlimit_ok = std::fs::read_to_string("/proc/self/limits")
+        .ok()
+        .and_then(|s| parse_rtprio_limit(&s))
+        .map(|n| n > 0)
+        .unwrap_or(false);
+
+    rlimit_ok || rtkit_present()
 }
 
 #[cfg(not(target_os = "linux"))]
