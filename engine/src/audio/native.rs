@@ -243,7 +243,6 @@ unsafe fn playback_loop(
     let svc: IAudioRenderClient = dev.client.GetService()?;
     let ch = dev.channels;
     let buf_frames = dev.client.GetBufferSize()?;
-    let target_ahead = (2 * dev.period_frames).min(buf_frames);
     dev.client.Start()?;
     let _ = ready.send(Ok(()));
 
@@ -260,6 +259,9 @@ unsafe fn playback_loop(
                 eprintln!("[native] playback lane backlog: {:.1} ms", max as f64 / SAMPLE_RATE as f64 * 1000.0);
             }
         }
+        // Keep ~1 period queued (not 2): the stream buffer is ~2 periods, so one
+        // period of slack remains for scheduling — tighter render latency.
+        let target_ahead = dev.period_frames.min(buf_frames);
         let padding = dev.client.GetCurrentPadding()?;
         if padding >= target_ahead {
             continue;

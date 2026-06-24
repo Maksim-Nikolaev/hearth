@@ -25,8 +25,9 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
-/// Opus frame: 10 ms @ 48 kHz mono.
-const FRAME: usize = 480;
+/// Opus frame: 5 ms @ 48 kHz mono. Smaller frame = less packetization delay and
+/// a shallower playback lane (one frame) than the 10 ms default.
+const FRAME: usize = 240;
 
 /// A send destination, shared between the capture/encode thread and the session.
 /// The remote is filled in once the peer's endpoint arrives over signaling.
