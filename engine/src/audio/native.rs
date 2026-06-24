@@ -316,7 +316,7 @@ mod tests {
     // (10 ms mono @ 48 kHz, low-delay) — the codec the native voice path uses.
     #[test]
     fn opus_lowdelay_roundtrip() {
-        let mut enc = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::LowDelay).unwrap();
+        let enc = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::LowDelay).unwrap();
         let mut dec = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
 
         let pcm: Vec<f32> = (0..480).map(|i| (i as f32 * 0.05).sin() * 0.25).collect();

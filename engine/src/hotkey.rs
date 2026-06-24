@@ -445,13 +445,22 @@ mod tests {
     #[test]
     fn windows_ptt_installs_and_drops_cleanly() {
         let keysym = keysym_from_name("F12").unwrap();
-        let grab = PttGrab::grab(keysym, |_held| {}).expect("install hook");
+        let grab = PttGrab::grab(PttBind::Key(keysym), |_held| {}).expect("install hook");
         drop(grab); // must not hang
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_ptt_rejects_unmappable_keysym() {
-        assert!(PttGrab::grab(0xFFFF, |_| {}).is_err());
+        assert!(PttGrab::grab(PttBind::Key(0xFFFF), |_| {}).is_err());
+    }
+
+    #[test]
+    fn parses_key_and_mouse_binds() {
+        assert!(matches!(parse_bind("F12"), Some(PttBind::Key(_))));
+        assert!(matches!(parse_bind("g"), Some(PttBind::Key(0x67))));
+        assert!(matches!(parse_bind("Mouse8"), Some(PttBind::Mouse(8))));
+        assert!(matches!(parse_bind("Mouse9"), Some(PttBind::Mouse(9))));
+        assert!(parse_bind("nonsense!").is_none());
     }
 }
