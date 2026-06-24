@@ -54,6 +54,7 @@ pub(crate) struct VoiceUdpPeer {
     target: Uuid,
     local_port: u16,
     udpsink: gst::Element,
+    send_valve: gst::Element,
     voice_appsrc: gst_app::AppSrc,
     spk_valve: gst::Element,
 }
@@ -113,17 +114,24 @@ impl VoiceUdpPeer {
         let pay = gst::ElementFactory::make("rtpopuspay")
             .property("pt", VOICE_PT as u32)
             .build()?;
+        // Gate the sender shut until we know the peer's endpoint. Otherwise
+        // packets would fire at the placeholder address — and on Windows a UDP
+        // send to a dead local port returns WSAECONNRESET, which errors the sink.
+        let send_valve = gst::ElementFactory::make("valve")
+            .name("send_valve")
+            .property("drop", true)
+            .build()?;
         // host/port are placeholders until set_remote(); sync/async off so the
         // live send branch never waits on a clock or preroll.
         let udpsink = gst::ElementFactory::make("udpsink")
             .property("host", "127.0.0.1")
-            .property("port", 1i32)
+            .property("port", 9i32) // discard port; nothing flows until the valve opens
             .property("sync", false)
             .property("async", false)
             .build()?;
 
-        pipeline.add_many([appsrc.upcast_ref(), &sconv, &sresample, &enc, &pay, &udpsink])?;
-        gst::Element::link_many([appsrc.upcast_ref(), &sconv, &sresample, &enc, &pay, &udpsink])?;
+        pipeline.add_many([appsrc.upcast_ref(), &sconv, &sresample, &enc, &pay, &send_valve, &udpsink])?;
+        gst::Element::link_many([appsrc.upcast_ref(), &sconv, &sresample, &enc, &pay, &send_valve, &udpsink])?;
 
         // Surface pipeline errors instead of a silent stall.
         if let Some(bus) = pipeline.bus() {
@@ -143,11 +151,30 @@ impl VoiceUdpPeer {
             }
         }
 
-        // Go live so udpsrc binds; then read the actual port to advertise.
-        pipeline.set_state(gst::State::Playing)?;
+        // Go live so udpsrc binds; then read the actual port to advertise. On
+        // failure, set NULL first — a `udpsrc` left attached to the main context
+        // and then finalized aborts the process (GSocket finalize assertion).
+        if let Err(e) = pipeline.set_state(gst::State::Playing) {
+            let _ = pipeline.set_state(gst::State::Null);
+            let _ = pipeline.state(gst::ClockTime::from_seconds(2));
+            return Err(anyhow!("voice pipeline failed to start: {e:?}"));
+        }
         let local_port = udpsrc.property::<i32>("used-port") as u16;
+        if local_port == 0 {
+            let _ = pipeline.set_state(gst::State::Null);
+            let _ = pipeline.state(gst::ClockTime::from_seconds(2));
+            return Err(anyhow!("voice udpsrc did not bind a port"));
+        }
 
-        Ok(Self { pipeline, target, local_port, udpsink, voice_appsrc: appsrc, spk_valve })
+        Ok(Self {
+            pipeline,
+            target,
+            local_port,
+            udpsink,
+            send_valve,
+            voice_appsrc: appsrc,
+            spk_valve,
+        })
     }
 
     /// The `ip:port` we receive on — carried to the peer in the Offer/Answer.
@@ -163,6 +190,8 @@ impl VoiceUdpPeer {
         let port: i32 = port.parse()?;
         self.udpsink.set_property("host", host);
         self.udpsink.set_property("port", port);
+        // Endpoint known — let the sender flow.
+        self.send_valve.set_property("drop", false);
         Ok(())
     }
 
@@ -179,6 +208,10 @@ impl VoiceUdpPeer {
 
 impl Drop for VoiceUdpPeer {
     fn drop(&mut self) {
+        // Block until NULL is actually reached so `udpsrc` removes its socket
+        // source before the pipeline is finalized — otherwise GSocket finalize
+        // asserts and aborts the process.
         let _ = self.pipeline.set_state(gst::State::Null);
+        let _ = self.pipeline.state(gst::ClockTime::from_seconds(2));
     }
 }
