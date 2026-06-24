@@ -1043,8 +1043,36 @@ impl Session {
     }
 
     /// Select the mic input device; restarts the running capture (brief blip).
+    /// Rebuild the native voice transport with the current devices, keeping the
+    /// call up by re-offering to every voice member (each peer's `voice_on_offer`
+    /// rebuilds its side). No-op if native voice isn't active. Applies a device
+    /// change mid-call without a manual rejoin.
+    #[cfg(target_os = "windows")]
+    fn rebuild_native_voice(&mut self) {
+        if self.native_voice.is_none() {
+            return;
+        }
+        self.native_voice = None; // dropped; recreated with new devices by the re-offers
+        let members: Vec<Uuid> = self
+            .voice_members
+            .iter()
+            .copied()
+            .filter(|m| *m != self.self_id)
+            .collect();
+        for m in members {
+            if let Err(e) = self.voice_offer(m) {
+                self.emit(SessionEvent::Error(format!("native voice rebuild: {e}")));
+            }
+        }
+    }
+
     pub fn set_input_device(&mut self, dev: Option<String>) {
         self.input_device = dev;
+        #[cfg(target_os = "windows")]
+        if self.native_voice.is_some() {
+            self.rebuild_native_voice();
+            return;
+        }
         self.restart_voice_capture();
     }
 
@@ -1052,6 +1080,11 @@ impl Session {
     /// the new sink's monitor (brief blip).
     pub fn set_output_device(&mut self, dev: Option<String>) {
         self.output_device = dev;
+        #[cfg(target_os = "windows")]
+        if self.native_voice.is_some() {
+            self.rebuild_native_voice();
+            return;
+        }
         self.restart_voice_capture();
     }
 
