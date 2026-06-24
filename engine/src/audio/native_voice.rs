@@ -62,6 +62,8 @@ pub struct NativeVoice {
     /// binary, so the Off/Low/Moderate/High level blends denoised vs original to
     /// give "how much to reduce".
     ns_wet: Arc<AtomicU32>,
+    /// Mic-test self-monitor (loop your own audio back to your speakers).
+    self_monitor: Arc<AtomicBool>,
     next_source: u64,
 }
 
@@ -102,6 +104,13 @@ impl NativeVoice {
         let mut silent_frames = 0usize;
         const SPEAKING_HANGOVER: usize = 40; // 40 × 5 ms = 200 ms
 
+        // Self-monitor (mic test): loop our own captured audio back to playback so
+        // you can hear yourself with the real processing chain, even in a call.
+        const SELF_MONITOR_LANE: u64 = u64::MAX;
+        let self_monitor = Arc::new(AtomicBool::new(false));
+        let self_monitor_cb = self_monitor.clone();
+        let mon_playback = playback.clone();
+
         let capture = NativeCapture::start(input_device, move |mono| {
             // Optional noise suppression before the Opus path. RNNoise expects
             // f32 in i16 amplitude range and fixed 480-sample frames; buffer to
@@ -133,12 +142,18 @@ impl NativeVoice {
             while acc.len() >= FRAME {
                 let frame: Vec<f32> = acc.drain(..FRAME).collect();
                 let rms_db = rms_dbfs(&frame);
-                let open = {
+                let (open, mon_open) = {
                     let mut g = gate.lock().unwrap();
                     g.update_level(rms_db, rms_db > -60.0);
-                    g.open()
+                    (g.open(), g.monitor_open())
                 };
                 let _ = evt_tx.send(SessionEvent::InputLevel(rms_db));
+
+                // Mic test: hear yourself per the activation mode (ignores mute /
+                // the Settings-open suspend, which is why `mon_open`).
+                if self_monitor_cb.load(Ordering::Relaxed) && mon_open {
+                    mon_playback.push(SELF_MONITOR_LANE, &frame);
+                }
 
                 // Broadcast speaking transitions (with hangover). "Speaking" =
                 // actually transmitting voice: the gate is open AND there's real
@@ -182,6 +197,7 @@ impl NativeVoice {
             deaf,
             suspended: Arc::new(AtomicBool::new(false)),
             ns_wet,
+            self_monitor,
             next_source: 0,
         })
     }
@@ -189,6 +205,11 @@ impl NativeVoice {
     /// Set the RNNoise wet/dry mix in permille (0 = off, 1000 = full). Live.
     pub fn set_noise_wet(&self, wet: u32) {
         self.ns_wet.store(wet, Ordering::Relaxed);
+    }
+
+    /// Toggle the mic-test self-monitor (hear your own captured audio).
+    pub fn set_self_monitor(&self, on: bool) {
+        self.self_monitor.store(on, Ordering::Relaxed);
     }
 
     /// Add a peer: bind a recv socket, start its decode→playback lane, and return

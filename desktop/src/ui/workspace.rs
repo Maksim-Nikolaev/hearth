@@ -407,14 +407,15 @@ impl Workspace {
                 } else {
                     self.voice_state.get(id).copied().unwrap_or((false, false, false))
                 };
+                // Speaker block + headphone render reliably (🗣️ does not).
                 let status = if deafened {
                     "🔇🎧" // deafened (also muted)
                 } else if muted {
                     "🔇"
                 } else if speaking {
-                    "🗣️"
+                    "🔊" // talking (loud speaker)
                 } else {
-                    "🔊"
+                    "🔈" // in voice, idle (quiet speaker)
                 };
                 let sharing_self = is_self && self.sharing;
                 let label = if sharing_self {

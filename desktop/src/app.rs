@@ -515,15 +515,10 @@ impl AppModel {
                 return;
             }
             SettingsOutput::MicTest(on) => {
+                // Works during a call too (self-monitor through the live capture).
                 if let Some(s) = self.session.as_mut() {
                     if on {
-                        if s.in_voice() {
-                            // Reset the toggle without triggering its handler.
-                            let _ = self.settings_window.sender()
-                                .send(SettingsInput::SetMicTestActive(false));
-                        } else {
-                            s.start_mic_test();
-                        }
+                        s.start_mic_test();
                     } else {
                         s.stop_mic_test();
                     }

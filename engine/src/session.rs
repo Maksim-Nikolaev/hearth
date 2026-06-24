@@ -1231,31 +1231,36 @@ impl Session {
     /// to prevent a second concurrent capture + AEC-reference corruption.
     /// Calling while the monitor is already running replaces the previous one.
     pub fn start_mic_test(&mut self) {
-        if self.in_voice() {
-            self.emit(SessionEvent::Error(
-                "mic test unavailable during a call".into(),
-            ));
-            return;
-        }
-
         self.mic_monitor = None;
 
-        // Native backend: loopback via WASAPI + the shared gate (so PTT / voice
-        // activity behave like a real call), with live level metering.
         #[cfg(target_os = "windows")]
-        if native_voice_selected() {
-            match crate::audio::native::NativeMonitor::start(
-                self.gate.clone(),
-                self.evt_tx.clone(),
-                self.input_device.clone(),
-                self.output_device.clone(),
-            ) {
-                Ok(m) => self.native_monitor = Some(m),
-                Err(e) => self.emit(SessionEvent::Error(format!("mic test: {e}"))),
+        {
+            // In a native call: hear yourself through the live capture — no second
+            // mic open, and it tests the real processing chain.
+            if let Some(nv) = self.native_voice.as_ref() {
+                nv.set_self_monitor(true);
+                return;
             }
-            return;
+            // Native, not in a call: standalone WASAPI monitor, gated by mode.
+            if native_voice_selected() {
+                match crate::audio::native::NativeMonitor::start(
+                    self.gate.clone(),
+                    self.evt_tx.clone(),
+                    self.input_device.clone(),
+                    self.output_device.clone(),
+                ) {
+                    Ok(m) => self.native_monitor = Some(m),
+                    Err(e) => self.emit(SessionEvent::Error(format!("mic test: {e}"))),
+                }
+                return;
+            }
         }
 
+        // GStreamer fallback can't share the call's capture — refuse during a call.
+        if self.in_voice() {
+            self.emit(SessionEvent::Error("mic test unavailable during a call".into()));
+            return;
+        }
         match Monitor::start(
             self.input_device.clone(),
             self.output_device.clone(),
@@ -1273,6 +1278,9 @@ impl Session {
         #[cfg(target_os = "windows")]
         {
             self.native_monitor = None;
+            if let Some(nv) = self.native_voice.as_ref() {
+                nv.set_self_monitor(false);
+            }
         }
     }
 
