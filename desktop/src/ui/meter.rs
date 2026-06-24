@@ -73,6 +73,23 @@ impl LevelBar {
                     }
                 }
 
+                // dBFS scale: faint interior ticks + endpoint labels (0 dB right).
+                cr.set_font_size(8.0);
+                for &db in &[-40.0_f32, -20.0] {
+                    let x = db_to_x(db);
+                    cr.set_source_rgba(1.0, 1.0, 1.0, 0.15);
+                    cr.rectangle(x, 0.0, 1.0, h);
+                    let _ = cr.fill();
+                    cr.set_source_rgba(0.85, 0.85, 0.85, 0.75);
+                    cr.move_to(x + 2.0, h - 2.0);
+                    let _ = cr.show_text(&format!("{}", db as i32));
+                }
+                cr.set_source_rgba(0.85, 0.85, 0.85, 0.75);
+                cr.move_to(2.0, h - 2.0);
+                let _ = cr.show_text("-60");
+                cr.move_to(w - 16.0, h - 2.0);
+                let _ = cr.show_text("0 dB");
+
                 // Threshold handle: a thin white vertical bar.
                 let handle_w = 3.0_f64;
                 cr.set_source_rgb(1.0, 1.0, 1.0);

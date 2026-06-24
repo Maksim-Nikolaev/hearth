@@ -568,6 +568,8 @@ impl AppModel {
             ActivationKind::PushToTalk => ActivationMode::PushToTalk,
             ActivationKind::AlwaysOn => ActivationMode::AlwaysOn,
         });
+        // Mic-test monitor gates by the handle in every mode.
+        session.set_input_sensitivity(s.input_sensitivity);
 
         session.set_input_device(s.input_device.clone());
         session.set_output_device(s.output_device.clone());

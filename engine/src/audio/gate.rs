@@ -15,15 +15,40 @@ pub struct Gate {
     ptt_held: bool,
     last_rms_db: f32,
     last_vad: bool,
+    /// Voice-activity sensitivity (dBFS). Tracks the level-bar handle in all
+    /// modes so the mic-test monitor can gate by it regardless of activation mode.
+    sensitivity_db: f32,
 }
 
 impl Gate {
     pub fn new(mode: ActivationMode) -> Gate {
-        Gate { mode, muted: false, suspended: false, ptt_held: false, last_rms_db: -120.0, last_vad: false }
+        let sensitivity_db = match mode {
+            ActivationMode::Voice { threshold } => threshold,
+            _ => -45.0,
+        };
+        Gate {
+            mode,
+            muted: false,
+            suspended: false,
+            ptt_held: false,
+            last_rms_db: -120.0,
+            last_vad: false,
+            sensitivity_db,
+        }
     }
 
     pub fn set_mode(&mut self, mode: ActivationMode) {
+        // Keep the sensitivity in sync when switching into Voice mode.
+        if let ActivationMode::Voice { threshold } = mode {
+            self.sensitivity_db = threshold;
+        }
         self.mode = mode;
+    }
+
+    /// Set the voice-activity sensitivity (the level-bar handle), independent of
+    /// the active mode — drives the mic-test monitor gating.
+    pub fn set_sensitivity(&mut self, db: f32) {
+        self.sensitivity_db = db;
     }
 
     pub fn set_muted(&mut self, muted: bool) {
@@ -51,11 +76,11 @@ impl Gate {
         self.mode_open()
     }
 
-    /// The activation-mode decision alone (PTT held / above threshold / always),
-    /// ignoring mute and suspend. Used by the mic-test monitor so you can hear
-    /// yourself regardless of call mute / the Settings-open suspend.
+    /// Mic-test monitor gating: hear yourself only when the level clears the
+    /// sensitivity handle. Threshold-based in every mode (so you can tune
+    /// sensitivity by ear), and ignores mute / the Settings-open suspend.
     pub fn monitor_open(&self) -> bool {
-        self.mode_open()
+        self.last_rms_db >= self.sensitivity_db
     }
 
     fn mode_open(&self) -> bool {

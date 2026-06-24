@@ -1125,6 +1125,12 @@ impl Session {
         self.gate.lock().unwrap().set_mode(mode);
     }
 
+    /// Set the voice-activity sensitivity (level-bar handle) in all modes — drives
+    /// the mic-test monitor gating regardless of the active mode.
+    pub fn set_input_sensitivity(&self, db: f32) {
+        self.gate.lock().unwrap().set_sensitivity(db);
+    }
+
     /// Set the jitter-buffer depth (ms). Lower = less latency, more sensitive to
     /// network jitter. `rtpjitterbuffer` only honours `latency` at startup, so a
     /// live change takes effect on the next voice connect — leave/rejoin to test

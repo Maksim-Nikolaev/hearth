@@ -40,6 +40,16 @@ $env:Path = "$cargoBin;$GtkRoot\bin;$gstRoot\bin;$env:Path"
 $env:PKG_CONFIG_PATH = "$GtkRoot\lib\pkgconfig;$gstRoot\lib\pkgconfig"
 $env:LIB = "$GtkRoot\lib;$env:LIB"
 
+# cmake + libclang for *-sys crates that build C via cmake/bindgen (e.g. aec-rs).
+# _USE_MATH_DEFINES so speexdsp's M_PI compiles under MSVC.
+$cmakeBin = 'C:\Program Files\CMake\bin'
+if (Test-Path "$cmakeBin\cmake.exe") { $env:Path = "$cmakeBin;$env:Path" }
+foreach ($llvm in @('C:\Program Files\LLVM\bin', "$env:LOCALAPPDATA\Programs\LLVM\bin")) {
+    if (Test-Path "$llvm\libclang.dll") { $env:LIBCLANG_PATH = $llvm; $env:Path = "$llvm;$env:Path"; break }
+}
+$env:CFLAGS = "/D_USE_MATH_DEFINES $($env:CFLAGS)"
+$env:CXXFLAGS = "/D_USE_MATH_DEFINES $($env:CXXFLAGS)"
+
 Write-Host "Hearth Windows dev env ready:" -ForegroundColor Green
 Write-Host "  GTK4       $GtkRoot  (gtk4 $(& "$gstRoot\bin\pkg-config.exe" --modversion gtk4 2>$null))"
 Write-Host "  GStreamer  $gstRoot  ($(& "$gstRoot\bin\pkg-config.exe" --modversion gstreamer-1.0 2>$null))"
