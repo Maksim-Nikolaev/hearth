@@ -56,6 +56,7 @@ impl NativeVoice {
     /// Start the shared capture + playback. Mic frames are gated and Opus-encoded
     /// on the capture thread and sent to every registered peer.
     pub fn new(gate: Arc<Mutex<Gate>>, evt_tx: UnboundedSender<SessionEvent>) -> Result<Self> {
+        eprintln!("[native-voice] active — WASAPI IAudioClient3 capture/playback + Opus + UDP");
         let playback = Arc::new(NativePlayback::start()?);
         let targets: Arc<Mutex<Vec<Arc<SendTarget>>>> = Arc::new(Mutex::new(Vec::new()));
         let deaf = Arc::new(AtomicBool::new(false));

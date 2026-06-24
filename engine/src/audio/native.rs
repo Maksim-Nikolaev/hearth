@@ -34,6 +34,10 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 /// Working sample rate the rest of the engine (Opus, DSP) expects.
 pub const SAMPLE_RATE: u32 = 48000;
 
+/// Max per-source playback backlog (~20 ms). Caps the mixer-lane latency; the
+/// shared engine clock means no drift to buffer against, so keep it shallow.
+const MAX_LANE_SAMPLES: usize = (SAMPLE_RATE as usize) * 20 / 1000;
+
 /// A device opened at its minimum shared engine period, event-driven.
 struct DeviceStream {
     client: IAudioClient3,
@@ -201,14 +205,15 @@ impl NativePlayback {
         }
     }
 
-    /// Queue mono f32 @ 48 kHz for `source`'s lane. Drops the oldest audio if the
-    /// lane runs away (keeps latency bounded; should not happen in steady state).
+    /// Queue mono f32 @ 48 kHz for `source`'s lane, trimmed to a tight target so
+    /// a startup burst (UDP packets buffered before playback drains them) can't
+    /// become permanent latency. WASAPI shared-mode capture+render share the
+    /// engine clock, so there's no drift to absorb — keep the lane shallow.
     pub fn push(&self, source: u64, mono: &[f32]) {
         let mut sources = self.sources.lock().unwrap();
         let q = sources.entry(source).or_default();
         q.extend(mono.iter().copied());
-        let cap = (SAMPLE_RATE / 4) as usize; // 250 ms safety cap
-        while q.len() > cap {
+        while q.len() > MAX_LANE_SAMPLES {
             q.pop_front();
         }
     }
@@ -242,9 +247,18 @@ unsafe fn playback_loop(
     dev.client.Start()?;
     let _ = ready.send(Ok(()));
 
+    let mut cycle: u64 = 0;
     while !stop.load(Ordering::Relaxed) {
         if WaitForSingleObject(dev.event, 100) != WAIT_OBJECT_0 {
             continue;
+        }
+        // Periodically report the deepest mixer lane (its backlog == added latency).
+        cycle += 1;
+        if cycle % 200 == 0 {
+            let max = sources.lock().unwrap().values().map(|q| q.len()).max().unwrap_or(0);
+            if max > 0 {
+                eprintln!("[native] playback lane backlog: {:.1} ms", max as f64 / SAMPLE_RATE as f64 * 1000.0);
+            }
         }
         let padding = dev.client.GetCurrentPadding()?;
         if padding >= target_ahead {
