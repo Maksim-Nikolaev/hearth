@@ -25,9 +25,9 @@ pub struct Gate {
 }
 
 /// Stay open this many 5 ms frames after the level last cleared the threshold
-/// (~150 ms), so gaps between words don't close the gate and the boundary doesn't
+/// (~200 ms), so gaps between words don't close the gate and the boundary doesn't
 /// chatter — without holding the gate open *below* the threshold.
-const HOLD_FRAMES: u32 = 30;
+const HOLD_FRAMES: u32 = 40;
 
 impl Gate {
     pub fn new(mode: ActivationMode) -> Gate {

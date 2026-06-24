@@ -767,12 +767,10 @@ impl Session {
                 self.voice_status.clone(),
             ) {
                 Ok(nv) => {
-                    // A rebuild (device change) mid mic-test must restore the test
-                    // state the new instance defaults off.
-                    if self.mic_testing {
-                        nv.set_self_monitor(true);
-                        nv.set_suspended(true);
-                    }
+                    // Fresh instance is never in test state — a stale mic-test flag
+                    // must not turn the self-monitor on for a real call (that would
+                    // feed your mic straight back to your ears). The device-change-
+                    // during-test case re-applies it explicitly in set_*_device.
                     self.native_voice = Some(nv);
                 }
                 Err(e) => {
@@ -1230,6 +1228,7 @@ impl Session {
         {
             if self.native_voice.is_some() {
                 self.rebuild_native_voice();
+                self.reapply_mic_test_state(); // only if a test is genuinely running
                 return;
             }
             if self.native_monitor.is_some() {
@@ -1251,6 +1250,7 @@ impl Session {
         {
             if self.native_voice.is_some() {
                 self.rebuild_native_voice();
+                self.reapply_mic_test_state();
                 return;
             }
             if self.native_monitor.is_some() {
@@ -1259,6 +1259,18 @@ impl Session {
             }
         }
         self.restart_voice_capture();
+    }
+
+    /// After a device-change rebuild, restore the self-monitor + suspend only if a
+    /// mic test is genuinely in progress (so a stale flag can't leak into a call).
+    #[cfg(target_os = "windows")]
+    fn reapply_mic_test_state(&mut self) {
+        if self.mic_testing {
+            if let Some(nv) = self.native_voice.as_ref() {
+                nv.set_self_monitor(true);
+                nv.set_suspended(true);
+            }
+        }
     }
 
     /// True when at least one Voice-flow peer is connected. Used to gate the

@@ -473,15 +473,17 @@ fn local_ip() -> String {
         .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
-/// Apply a per-sample gain to `buf`, ramping `gain` toward `target` (~10 ms full
-/// 0↔1 swing at 48 kHz) so the gate opens/closes without a click.
+/// Apply a per-sample gain to `buf`, ramping `gain` toward `target`. Asymmetric:
+/// a fast attack (~5 ms) so word onsets aren't clipped, and a gentle release
+/// (~80 ms) so closing the gate is a smooth fade, not a brick-wall cut.
 pub(crate) fn ramp_gain(buf: &mut [f32], gain: &mut f32, target: f32) {
-    const STEP: f32 = 1.0 / 480.0;
+    const ATTACK: f32 = 1.0 / 240.0; // ~5 ms to fully open
+    const RELEASE: f32 = 1.0 / 3840.0; // ~80 ms to fully close
     for s in buf.iter_mut() {
         if *gain < target {
-            *gain = (*gain + STEP).min(target);
+            *gain = (*gain + ATTACK).min(target);
         } else if *gain > target {
-            *gain = (*gain - STEP).max(target);
+            *gain = (*gain - RELEASE).max(target);
         }
         *s *= *gain;
     }
