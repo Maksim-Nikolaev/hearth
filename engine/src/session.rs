@@ -147,16 +147,54 @@ pub(crate) fn should_offer(me: Uuid, peer: Uuid) -> bool {
     me < peer
 }
 
-/// The native WASAPI+Opus voice transport is the default on Windows; set
-/// `HEARTH_GSTREAMER_VOICE=1` to fall back to the GStreamer `voice_udp` path.
-#[cfg(target_os = "windows")]
+/// The native low-latency voice transport (WASAPI on Windows, PipeWire on Linux)
+/// is the default; set `HEARTH_GSTREAMER_VOICE=1` to force the generic GStreamer
+/// `voice_udp` path from the start.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub(crate) fn native_voice_selected() -> bool {
     std::env::var_os("HEARTH_GSTREAMER_VOICE").is_none()
 }
 
+/// Which voice device backend is live this session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VoiceBackendKind {
+    /// Native low-latency I/O (WASAPI / PipeWire).
+    Native,
+    /// Generic GStreamer path (wasapi2 / pulsesrc).
+    Generic,
+}
+
+/// Use the native backend unless it is force-disabled (`HEARTH_GSTREAMER_VOICE`)
+/// or a native construction attempt has already failed this session. Pure, so the
+/// policy is unit-tested without devices.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub(crate) fn pick_backend(force_generic: bool, native_failed: bool) -> bool {
+    !force_generic && !native_failed
+}
+
+#[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
+mod backend_tests {
+    use super::pick_backend;
+
+    #[test]
+    fn native_by_default() {
+        assert!(pick_backend(false, false));
+    }
+
+    #[test]
+    fn forced_generic_skips_native() {
+        assert!(!pick_backend(true, false));
+    }
+
+    #[test]
+    fn prior_failure_stays_generic() {
+        assert!(!pick_backend(false, true));
+    }
+}
+
 /// Map the noise-suppression level to an RNNoise wet/dry mix (permille). RNNoise
 /// is binary, so the level blends denoised vs original for "how much to reduce".
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn ns_wet_permille(level: crate::audio::dsp::NsLevel) -> u32 {
     use crate::audio::dsp::NsLevel::*;
     match level {
@@ -535,8 +573,13 @@ pub struct Session {
     /// Native voice transport (Phase 2): WASAPI IAudioClient3 capture/playback +
     /// Opus + UDP, replacing GStreamer for voice when `HEARTH_NATIVE_AUDIO` is
     /// set. Owns the shared capture/playback; peers register endpoints into it.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     native_voice: Option<crate::audio::native_voice::NativeVoice>,
+    /// Set once a native-voice construction attempt fails this session, so we stop
+    /// retrying native and stay on the generic GStreamer path until a rebuild
+    /// (leave/rejoin resets it).
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    native_voice_failed: bool,
     /// The single mic capture + DSP, shared by every Voice flow. Lazily started
     /// when the first voice peer connects, dropped when the last leaves.
     voice_capture: Option<VoiceCapture>,
@@ -545,7 +588,7 @@ pub struct Session {
     mic_monitor: Option<Monitor>,
     /// Native (WASAPI) mic-test monitor, used in place of `mic_monitor` when the
     /// native voice backend is selected.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     native_monitor: Option<crate::audio::native::NativeMonitor>,
     /// Mic test in progress — survives a device-change rebuild.
     mic_testing: bool,
@@ -654,11 +697,13 @@ impl Session {
             share_config: ShareConfig::default(),
             peers: HashMap::new(),
             voice_peers: HashMap::new(),
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             native_voice: None,
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
+            native_voice_failed: false,
             voice_capture: None,
             mic_monitor: None,
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "windows", target_os = "linux"))]
             native_monitor: None,
             mic_testing: false,
             gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
@@ -711,10 +756,12 @@ impl Session {
         self.voice_status.set_active(false); // stop broadcasting our status
         self.voice_peers.clear();
         self.voice_capture = None;
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             // Dropping it stops the native capture/playback + joins recv threads.
             self.native_voice = None;
+            // A fresh join retries the native backend from scratch.
+            self.native_voice_failed = false;
         }
 
         let screen: Vec<(Uuid, Flow)> = self.peers.keys().copied().collect();
@@ -757,9 +804,9 @@ impl Session {
     /// send, and hand the peer our `ip:port` (carried in the Offer's `sdp`).
     /// Lazily start the native voice transport, returning it when the native
     /// backend is selected. Returns `None` (GStreamer path) when opted out.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn ensure_native_voice(&mut self) -> Option<&mut crate::audio::native_voice::NativeVoice> {
-        if !native_voice_selected() {
+        if !pick_backend(!native_voice_selected(), self.native_voice_failed) {
             return None;
         }
         if self.native_voice.is_none() {
@@ -783,7 +830,12 @@ impl Session {
                     self.native_voice = Some(nv);
                 }
                 Err(e) => {
-                    self.emit(SessionEvent::Error(format!("native voice init: {e}")));
+                    // Best driver unavailable (no server / no RT / device error):
+                    // latch the failure and fall back to the generic path.
+                    self.native_voice_failed = true;
+                    self.emit(SessionEvent::Warning(format!(
+                        "native audio backend unavailable, using generic voice path: {e}"
+                    )));
                     return None;
                 }
             }
@@ -792,16 +844,17 @@ impl Session {
     }
 
     fn voice_offer(&mut self, peer: Uuid) -> Result<()> {
-        #[cfg(target_os = "windows")]
-        if native_voice_selected() {
-            let endpoint = {
-                let nv = self
-                    .ensure_native_voice()
-                    .ok_or_else(|| anyhow::anyhow!("native voice unavailable"))?;
-                nv.add_peer(peer)?
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if native_voice_selected() && !self.native_voice_failed {
+            let endpoint = match self.ensure_native_voice() {
+                Some(nv) => Some(nv.add_peer(peer)?),
+                None => None,
             };
-            let _ = self.out_tx.send(ClientMessage::Offer { to: peer, flow: Flow::Voice, sdp: endpoint });
-            return Ok(());
+            if let Some(endpoint) = endpoint {
+                let _ = self.out_tx.send(ClientMessage::Offer { to: peer, flow: Flow::Voice, sdp: endpoint });
+                return Ok(());
+            }
+            // native construction failed → fall through to the generic GStreamer path
         }
 
         let p = crate::voice_udp::VoiceUdpPeer::new(peer)?;
@@ -819,23 +872,31 @@ impl Session {
     /// Answerer side: the peer sent their endpoint; build our transport pointed
     /// at them and reply with ours.
     fn voice_on_offer(&mut self, from: Uuid, endpoint: &str) {
-        #[cfg(target_os = "windows")]
-        if native_voice_selected() {
-            let result: Result<String> = (|| {
-                let nv = self
-                    .ensure_native_voice()
-                    .ok_or_else(|| anyhow::anyhow!("native voice unavailable"))?;
-                let ep = nv.add_peer(from)?; // replaces any stale peer internally
-                nv.set_remote(from, endpoint)?;
-                Ok(ep)
-            })();
-            match result {
-                Ok(my_endpoint) => {
-                    let _ = self.out_tx.send(ClientMessage::Answer { to: from, flow: Flow::Voice, sdp: my_endpoint });
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if native_voice_selected() && !self.native_voice_failed {
+            // Build the native peer only if the backend constructs; `None` means
+            // it just failed, so fall through to the generic path below.
+            let result: Option<Result<String>> = match self.ensure_native_voice() {
+                Some(nv) => match nv.add_peer(from) {
+                    // add_peer replaces any stale peer internally.
+                    Ok(ep) => match nv.set_remote(from, endpoint) {
+                        Ok(()) => Some(Ok(ep)),
+                        Err(e) => Some(Err(e)),
+                    },
+                    Err(e) => Some(Err(e)),
+                },
+                None => None,
+            };
+            if let Some(result) = result {
+                match result {
+                    Ok(my_endpoint) => {
+                        let _ = self.out_tx.send(ClientMessage::Answer { to: from, flow: Flow::Voice, sdp: my_endpoint });
+                    }
+                    Err(e) => self.emit(SessionEvent::Error(format!("native voice answer: {e}"))),
                 }
-                Err(e) => self.emit(SessionEvent::Error(format!("native voice answer: {e}"))),
+                return;
             }
-            return;
+            // native construction failed → fall through to the generic GStreamer path
         }
 
         self.stop_voice(from); // a re-offer replaces any stale transport
@@ -859,7 +920,7 @@ impl Session {
 
     /// Offerer received the answer: point our sender at the peer.
     fn voice_on_answer(&mut self, from: Uuid, endpoint: &str) {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         if let Some(nv) = self.native_voice.as_ref() {
             if let Err(e) = nv.set_remote(from, endpoint) {
                 self.emit(SessionEvent::Error(format!("native voice endpoint: {e}")));
@@ -876,7 +937,7 @@ impl Session {
 
     /// Tear down one voice peer and unregister its mic send.
     fn stop_voice(&mut self, peer: Uuid) {
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         if let Some(nv) = self.native_voice.as_mut() {
             nv.remove_peer(peer);
         }
@@ -1102,7 +1163,7 @@ impl Session {
         for p in self.voice_peers.values() {
             p.set_deaf(on);
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         if let Some(nv) = self.native_voice.as_ref() {
             nv.set_deaf(on);
         }
@@ -1116,7 +1177,7 @@ impl Session {
     /// restores whatever the user had set.
     pub fn set_io_suspended(&self, on: bool) {
         self.gate.lock().unwrap().set_suspended(on);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         if let Some(nv) = self.native_voice.as_ref() {
             nv.set_suspended(on);
         }
@@ -1127,7 +1188,7 @@ impl Session {
         self.dsp_config = cfg.clone();
 
         // Native path: drive RNNoise from the noise-suppression setting.
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         if let Some(nv) = self.native_voice.as_ref() {
             nv.set_noise_wet(ns_wet_permille(cfg.noise_suppression));
             nv.set_vad(cfg.vad);
@@ -1209,7 +1270,7 @@ impl Session {
     /// call up by re-offering to every voice member (each peer's `voice_on_offer`
     /// rebuilds its side). No-op if native voice isn't active. Applies a device
     /// change mid-call without a manual rejoin.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn rebuild_native_voice(&mut self) {
         if self.native_voice.is_none() {
             return;
@@ -1233,7 +1294,7 @@ impl Session {
             return; // no change — don't rebuild (would drop self-monitor etc.)
         }
         self.input_device = dev;
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             if self.native_voice.is_some() {
                 self.rebuild_native_voice();
@@ -1255,7 +1316,7 @@ impl Session {
             return;
         }
         self.output_device = dev;
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             if self.native_voice.is_some() {
                 self.rebuild_native_voice();
@@ -1272,7 +1333,7 @@ impl Session {
 
     /// After a device-change rebuild, restore the self-monitor + suspend only if a
     /// mic test is genuinely in progress (so a stale flag can't leak into a call).
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn reapply_mic_test_state(&mut self) {
         if self.mic_testing {
             if let Some(nv) = self.native_voice.as_ref() {
@@ -1288,7 +1349,7 @@ impl Session {
         if !self.voice_peers.is_empty() {
             return true;
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         if let Some(nv) = self.native_voice.as_ref() {
             return !nv.is_empty();
         }
@@ -1311,7 +1372,7 @@ impl Session {
         self.set_io_suspended(true);
         self.voice_status.set_testing(true);
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             // In a native call: hear yourself through the live capture — no second
             // mic open, and it tests the real processing chain.
@@ -1361,7 +1422,7 @@ impl Session {
         self.mic_testing = false;
         self.set_io_suspended(false);       // restore the user's real mute/deafen
         self.voice_status.set_testing(false); // re-broadcast real status
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             self.native_monitor = None;
             if let Some(nv) = self.native_voice.as_ref() {
@@ -1375,7 +1436,7 @@ impl Session {
     fn restart_voice_capture(&mut self) {
         // The native voice transport owns its own WASAPI capture (always the
         // default device); nothing to restart on the GStreamer side.
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         if self.native_voice.is_some() {
             return;
         }
@@ -1531,11 +1592,13 @@ mod tests {
                 share_config: ShareConfig::default(),
                 peers: HashMap::new(),
                 voice_peers: HashMap::new(),
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
                 native_voice: None,
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                native_voice_failed: false,
                 voice_capture: None,
                 mic_monitor: None,
-                #[cfg(target_os = "windows")]
+                #[cfg(any(target_os = "windows", target_os = "linux"))]
                 native_monitor: None,
                 mic_testing: false,
                 gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
