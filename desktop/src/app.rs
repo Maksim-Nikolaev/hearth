@@ -398,7 +398,10 @@ impl AppModel {
             SessionEvent::InputLevel(db) => {
                 let _ = self.settings_window.sender().send(SettingsInput::SetLevel(db));
             }
-            SessionEvent::FlowState { .. } | SessionEvent::Error(_) | SessionEvent::Warning(_) => {}
+            SessionEvent::Warning(msg) => {
+                eprintln!("[hearth] warning: {msg}");
+            }
+            SessionEvent::FlowState { .. } | SessionEvent::Error(_) => {}
         }
     }
 
@@ -550,18 +553,13 @@ impl AppModel {
 
     /// Push all audio-relevant settings to a live `Session`.
     fn apply_settings_to_session(session: &mut Session, s: &Settings) {
-        session.set_dsp(DspConfig {
-            echo_cancel: s.echo_cancellation,
-            noise_suppression: match s.noise_suppression {
-                NsLevel::Off => EngineNsLevel::Off,
-                NsLevel::Low => EngineNsLevel::Low,
-                NsLevel::Moderate => EngineNsLevel::Moderate,
-                NsLevel::High => EngineNsLevel::High,
-            },
-            agc: s.agc,
-            vad: s.vad,
-            high_pass: true,
-        });
+        let output_kind = if matches!(s.profile, crate::config::VoiceProfile::Auto) {
+            engine::audio::classify::classify_output(s.output_device.as_deref())
+        } else {
+            engine::audio::profile::OutputKind::Unknown
+        };
+
+        session.set_dsp(crate::config::effective_dsp(s, output_kind));
 
         session.set_activation(match s.activation {
             ActivationKind::Voice => ActivationMode::Voice { threshold: s.input_sensitivity },
