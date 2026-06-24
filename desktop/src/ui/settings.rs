@@ -528,6 +528,9 @@ impl Component for SettingsWindow {
             SettingsInput::SetSettings(s) => {
                 self.settings = s.clone();
                 self.apply_settings_to_widgets(widgets, &s);
+                // Re-sync the device dropdown selection too (e.g. Reset to Defaults
+                // must move them back to "Default", not leave the old picks).
+                self.repopulate_dropdowns(widgets);
             }
 
             SettingsInput::SetLevel(db) => {
