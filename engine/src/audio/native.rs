@@ -54,6 +54,7 @@ struct DeviceStream {
 unsafe fn open_device(capture: bool, device: Option<&str>) -> Result<DeviceStream> {
     let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
     let dataflow = if capture { eCapture } else { eRender };
+    eprintln!("[native] open {} requested device={:?}", if capture { "capture" } else { "render" }, device);
     let dev = match device.filter(|s| !s.is_empty()) {
         Some(id) => match enumerator.GetDevice(&HSTRING::from(id)) {
             Ok(d) => d,

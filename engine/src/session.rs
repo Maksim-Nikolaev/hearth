@@ -544,6 +544,8 @@ pub struct Session {
     /// native voice backend is selected.
     #[cfg(target_os = "windows")]
     native_monitor: Option<crate::audio::native::NativeMonitor>,
+    /// Mic test in progress — survives a device-change rebuild.
+    mic_testing: bool,
     /// Software activation gate, shared with the capture callback thread.
     gate: Arc<Mutex<Gate>>,
     dsp_config: DspConfig,
@@ -655,6 +657,7 @@ impl Session {
             mic_monitor: None,
             #[cfg(target_os = "windows")]
             native_monitor: None,
+            mic_testing: false,
             gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
             dsp_config: default_dsp_config(),
             input_device: None,
@@ -763,7 +766,15 @@ impl Session {
                 self.dsp_config.echo_cancel,
                 self.voice_status.clone(),
             ) {
-                Ok(nv) => self.native_voice = Some(nv),
+                Ok(nv) => {
+                    // A rebuild (device change) mid mic-test must restore the test
+                    // state the new instance defaults off.
+                    if self.mic_testing {
+                        nv.set_self_monitor(true);
+                        nv.set_suspended(true);
+                    }
+                    self.native_voice = Some(nv);
+                }
                 Err(e) => {
                     self.emit(SessionEvent::Error(format!("native voice init: {e}")));
                     return None;
@@ -1216,9 +1227,15 @@ impl Session {
         }
         self.input_device = dev;
         #[cfg(target_os = "windows")]
-        if self.native_voice.is_some() {
-            self.rebuild_native_voice();
-            return;
+        {
+            if self.native_voice.is_some() {
+                self.rebuild_native_voice();
+                return;
+            }
+            if self.native_monitor.is_some() {
+                self.start_mic_test(); // restart the running mic test on the new device
+                return;
+            }
         }
         self.restart_voice_capture();
     }
@@ -1231,9 +1248,15 @@ impl Session {
         }
         self.output_device = dev;
         #[cfg(target_os = "windows")]
-        if self.native_voice.is_some() {
-            self.rebuild_native_voice();
-            return;
+        {
+            if self.native_voice.is_some() {
+                self.rebuild_native_voice();
+                return;
+            }
+            if self.native_monitor.is_some() {
+                self.start_mic_test();
+                return;
+            }
         }
         self.restart_voice_capture();
     }
@@ -1260,6 +1283,7 @@ impl Session {
     /// Calling while the monitor is already running replaces the previous one.
     pub fn start_mic_test(&mut self) {
         self.mic_monitor = None;
+        self.mic_testing = true;
         // Discord-style: while testing, mute the mic + deafen the call and show
         // muted+deafened to the room. The self-monitor still lets you hear
         // yourself (it bypasses the suspend).
@@ -1308,6 +1332,7 @@ impl Session {
     /// Stop the mic-test loopback. No-op if not running.
     pub fn stop_mic_test(&mut self) {
         self.mic_monitor = None;
+        self.mic_testing = false;
         self.set_io_suspended(false);       // restore the user's real mute/deafen
         self.voice_status.set_testing(false); // re-broadcast real status
         #[cfg(target_os = "windows")]
@@ -1480,6 +1505,7 @@ mod tests {
                 mic_monitor: None,
                 #[cfg(target_os = "windows")]
                 native_monitor: None,
+                mic_testing: false,
                 gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
                 dsp_config: default_dsp_config(),
                 input_device: None,
