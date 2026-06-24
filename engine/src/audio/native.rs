@@ -263,8 +263,8 @@ impl NativeMonitor {
             let _ = evt_tx.send(crate::session::SessionEvent::InputLevel(rms));
             let open = {
                 let mut g = gate.lock().unwrap();
-                g.update_level(rms, rms > -60.0);
-                g.monitor_open() // threshold (hysteresis+hold) — ignore mute/suspend
+                g.update_level(rms, false); // no VAD assist — gate purely by threshold
+                g.monitor_open() // threshold + hold — ignore mute/suspend
             };
             // Ramp in/out so crossing the threshold is click-free.
             let mut out = mono.to_vec();
