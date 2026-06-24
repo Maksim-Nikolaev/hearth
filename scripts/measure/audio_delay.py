@@ -19,6 +19,7 @@ Requires: ffmpeg + ffprobe on PATH, and Python packages numpy + scipy.
 """
 
 import argparse
+import json
 import subprocess
 import sys
 import tempfile
@@ -36,6 +37,41 @@ SR = 48000  # working sample rate
 
 def run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def detect_streams(path, mic_override, desk_override):
+    """Pick the mic and desktop/system audio stream indices.
+
+    Explicit overrides always win. Otherwise match OBS track titles
+    ('Mic only' -> mic, 'System only' -> desktop), so drag-and-drop works
+    without flags. Falls back to the last two audio streams, then to the
+    legacy Windows layout (5/6)."""
+    r = run(["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index:stream_tags=title", "-of", "json", path])
+
+    audio = []
+    try:
+        for s in json.loads(r.stdout).get("streams", []):
+            title = (s.get("tags", {}).get("title") or "").lower()
+            audio.append((s["index"], title))
+    except (ValueError, KeyError):
+        pass
+
+    mic, desk = mic_override, desk_override
+
+    if mic is None:
+        mic = next((i for i, t in audio if "mic" in t and "system" not in t), None)
+
+    if desk is None:
+        desk = next((i for i, t in audio if "system" in t and "mic" not in t), None)
+        if desk is None:
+            desk = next((i for i, t in audio if "desktop" in t), None)
+
+    if (mic is None or desk is None) and len(audio) >= 2:
+        mic = mic if mic is not None else audio[-2][0]
+        desk = desk if desk is not None else audio[-1][0]
+
+    return (mic if mic is not None else 5, desk if desk is not None else 6)
 
 
 def probe_duration(path):
@@ -118,6 +154,7 @@ def analyze(path, mic_stream, desk_stream, lo_ms, hi_ms, tmp):
     best = env_d if env_c >= 0.5 else raw_d
 
     print(f"\n=== {name} ===")
+    print(f"  tracks           : mic=stream {mic_stream}, desktop=stream {desk_stream}")
     if dur:
         print(f"  duration         : {dur:.2f} s")
     print(f"  raw  cross-corr  : {raw_d:7.2f} ms   (corr {raw_c:.3f})")
@@ -135,8 +172,10 @@ def analyze(path, mic_stream, desk_stream, lo_ms, hi_ms, tmp):
 def main():
     ap = argparse.ArgumentParser(description="Measure mic->desktop audio delay in OBS-style mkv files.")
     ap.add_argument("files", nargs="+", help="one or more .mkv files")
-    ap.add_argument("--mic", type=int, default=5, help="mic audio stream index (default 5)")
-    ap.add_argument("--desk", type=int, default=6, help="desktop audio stream index (default 6)")
+    ap.add_argument("--mic", type=int, default=None,
+                    help="mic audio stream index (default: auto-detect from track titles)")
+    ap.add_argument("--desk", type=int, default=None,
+                    help="desktop/system audio stream index (default: auto-detect from track titles)")
     ap.add_argument("--min-delay", type=float, default=-50, help="min lag to search, ms (default -50)")
     ap.add_argument("--max-delay", type=float, default=700, help="max lag to search, ms (default 700)")
     args = ap.parse_args()
@@ -148,7 +187,8 @@ def main():
                 print(f"\n=== {f} ===\n  ERROR: file not found")
                 continue
             try:
-                results.append(analyze(f, args.mic, args.desk,
+                mic, desk = detect_streams(f, args.mic, args.desk)
+                results.append(analyze(f, mic, desk,
                                        args.min_delay, args.max_delay, tmp))
             except Exception as e:
                 print(f"\n=== {os.path.basename(f)} ===\n  ERROR: {e}")

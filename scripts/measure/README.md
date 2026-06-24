@@ -12,33 +12,50 @@ cross-checked against per-transient onset spacing. This is the ground-truth
 number (e.g. the 151 → 124 → 92 ms progression).
 
 ### How to record (OBS)
-1. Two audio tracks: **Track 1 = Mic/Aux** (your real mic), **Track 2 = Desktop
-   Audio** ("Entire System" — what the receiving end plays out the speakers).
-2. Talk in short bursts (claps/syllables make clean transients).
-3. Save as `.mkv`.
+Use a split-track layout via *Advanced Audio Properties → Tracks*, then enable
+those tracks under *Settings → Output → Recording → Audio Track*:
+- **Track 1 = System + Mic** (the mix), **Track 2 = Mic only**, **Track 3 =
+  System only**. Name the tracks so auto-detection can find them.
+- The delay is measured between **Mic only** (your instant signal) and **System
+  only** (the same voice after it traveled through Hearth and out the speakers).
+
+Then:
+1. Talk in short bursts (claps/syllables make clean transients).
+2. Save as `.mkv` (robust to crashes; remux to mp4 later if needed).
 
 ### Run it
+**Drag-and-drop** — drop one or more `.mkv` files onto the launcher:
+- **Linux (KDE/GNOME):** `Measure audio delay.desktop` (a copy is installed on the
+  Desktop). First drop creates a private venv under
+  `~/.cache/hearth-audio-delay/` — no sudo, no system packages.
+- **Windows:** `Measure audio delay.bat`.
+
+From any terminal:
 ```sh
-# drag one or more .mkv files onto "Measure audio delay.bat"  (Windows)
-# or from any terminal:
-python audio_delay.py "clip1.mkv" "clip2.mkv" ...
+./audio_delay.sh "clip1.mkv" "clip2.mkv" ...   # Linux (self-bootstraps the venv)
+python audio_delay.py "clip1.mkv" ...          # if numpy/scipy are already present
 ```
 
 Reports three estimates per file — raw cross-correlation, **envelope
 cross-correlation (the primary estimate)**, and onset spacing — plus a `>> DELAY`
 line with a confidence flag.
 
-### Stream indices (important, platform-specific)
-Defaults to **mic = stream 5, desktop = stream 6**, which is how these particular
-Windows OBS recordings are laid out. **A different OBS config / Linux capture may
-number the streams differently** — check with `ffprobe file.mkv` and override:
+### Stream indices (auto-detected)
+By default the streams are **auto-detected from the OBS track titles**: a track
+titled `Mic only` becomes the mic, `System only` (or `Desktop`) becomes the
+system reference. This makes drag-and-drop work with no flags. If a recording has
+untitled tracks, it falls back to the last two audio streams, then to the legacy
+Windows layout (mic = stream 5, desktop = stream 6).
+
+Override per file when needed — check the layout with `ffprobe file.mkv`:
 ```sh
-python audio_delay.py --mic 1 --desk 2 "clip.mkv"
+python audio_delay.py --mic 2 --desk 3 "clip.mkv"
 ```
 Other flags: `--max-delay 1000` widens the search window (default −50…700 ms) for
 very large buffers.
 
-Requires `ffmpeg` + `ffprobe` on `PATH` and Python `numpy` + `scipy`.
+Requires `ffmpeg` + `ffprobe` on `PATH`. `numpy` + `scipy` are provided by the
+launcher's venv; for a bare `python audio_delay.py` run, install them yourself.
 
 ## Per-hop: in-app `[latency]` logging
 
