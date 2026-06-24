@@ -1,6 +1,6 @@
 # Hearth – Status
 
-_Living status doc. Last updated: 2026-06-23._
+_Living status doc. Last updated: 2026-06-24._
 
 Self-hosted, low-latency voice + high-fidelity screenshare + webcam for 2–3 close
 friends over a P2P mesh with a small Rust control server. Stack: **pure-Rust
@@ -138,6 +138,45 @@ Voice processing, device selection, and advanced screenshare. All 12 tasks commi
 - `webrtcdsp` GStreamer element unavailable on Ubuntu Noble – hence the in-process crate approach.
 - DSP defaults (NS/AGC/AEC on) can sound heavily processed; per-user tuning is the intended path.
 - The M6 mutual same-pair screenshare limitation still stands (deferred with the screenshare SFU).
+
+## Voice native rewrite — Phase 1 + Phase 2 (2026-06-24, Windows `windows-phase2-audio`)
+
+The voice path was rebuilt for state-of-the-art latency, **off webrtcbin/GStreamer
+DSP**. Live-verified on the Win11 box at **~50–55 ms** (at the OS loopback floor),
+two-instance both directions.
+
+- **Transport (Phase 1):** voice left `webrtcbin` for **raw RTP/Opus over UDP** —
+  Opus restricted-lowdelay, 5 ms frames, in-band FEC + PLC (decode-None on gap),
+  `[seq:u16 BE | payload]`, late/dup drop. Self-allocated recv port.
+- **Native I/O (Phase 2):** `engine::audio::native` — WASAPI **IAudioClient3**
+  capture + playback (mixer, ~2-period render-ahead, ~20 ms lane cap) on two tight
+  threads. Devices not at 48 kHz fall back to a WASAPI **AUTOCONVERTPCM** resample
+  stream (the IAudioClient3 fast path needs the device's own 48 kHz mix rate; a
+  Settings hint recommends 48 kHz). `engine::audio::native_voice` runs the whole
+  capture chain.
+- **DSP suite (pure-Rust where possible, all opt-in, default OFF):** NS =
+  `nnnoiseless` (RNNoise, graduated wet/dry); VAD = `earshot` (480-sample 48 kHz);
+  AGC = envelope-follower (relaxes to unity in silence); **AEC = `aec-rs`
+  (speexdsp)** with a far-end ring tapped from the playback mix — validated on
+  speakers (killed the feedback loop). Toggled live via `dsp_config`.
+- **Gate:** voice-activity / PTT / always-on; threshold-accurate (hold-gate, no
+  hysteresis band); **200 ms hold + asymmetric ramp** (~5 ms attack, ~80 ms
+  release) for click-free, continuous speech; mixer uses a **soft limiter** not a
+  brick-wall clamp.
+- **UX:** Discord-style member statuses (muted/deafened/🔊speaking, via new
+  `VoiceUpdate`/`VoicePeerUpdate` protocol + backend relay); working mic test
+  (in-call self-monitor through the real chain, transmitting glow, dB meter scale);
+  PTT key + mouse-side-button binds; live-applying settings (no Save); device
+  hot-swap; all filters default off + Reset-to-Defaults resync.
+- **Windows toolchain:** `scripts/dev/win-env.ps1` now adds **cmake + libclang +
+  `/D_USE_MATH_DEFINES`** so `aec-rs`/speexdsp builds under MSVC. See
+  [[windows-build-env]].
+- **Debug:** `eprintln!` traces left in on purpose (`open render/capture`,
+  `filters: …`, AUTOCONVERTPCM) — gate behind a verbose flag before "done-done".
+
+GStreamer voice path remains as a fallback (`HEARTH_GSTREAMER_VOICE`). **Screenshare
+still on webrtcbin** — the next major workstream (mirror this rewrite: HW-encode →
+RTP/UDP, ~20–30 ms).
 
 ## Next candidates
 
