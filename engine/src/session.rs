@@ -70,6 +70,9 @@ struct VoiceStatusInner {
     deafened: std::sync::atomic::AtomicBool,
     speaking: std::sync::atomic::AtomicBool,
     active: std::sync::atomic::AtomicBool,
+    /// Mic-test in progress: report muted+deafened to the room (Discord-style),
+    /// without disturbing the user's real mute/deafen state.
+    testing: std::sync::atomic::AtomicBool,
     out_tx: UnboundedSender<ClientMessage>,
 }
 
@@ -82,6 +85,7 @@ impl VoiceStatus {
                 deafened: AtomicBool::new(false),
                 speaking: AtomicBool::new(false),
                 active: AtomicBool::new(false),
+                testing: AtomicBool::new(false),
                 out_tx,
             }),
         }
@@ -92,11 +96,17 @@ impl VoiceStatus {
         if !self.inner.active.load(Relaxed) {
             return; // only broadcast while in a voice call
         }
+        let testing = self.inner.testing.load(Relaxed);
         let _ = self.inner.out_tx.send(ClientMessage::VoiceUpdate {
-            muted: self.inner.muted.load(Relaxed),
-            deafened: self.inner.deafened.load(Relaxed),
-            speaking: self.inner.speaking.load(Relaxed),
+            muted: testing || self.inner.muted.load(Relaxed),
+            deafened: testing || self.inner.deafened.load(Relaxed),
+            speaking: !testing && self.inner.speaking.load(Relaxed),
         });
+    }
+
+    fn set_testing(&self, on: bool) {
+        self.inner.testing.store(on, std::sync::atomic::Ordering::Relaxed);
+        self.send();
     }
 
     fn set_active(&self, on: bool) {
@@ -1189,6 +1199,9 @@ impl Session {
     }
 
     pub fn set_input_device(&mut self, dev: Option<String>) {
+        if dev == self.input_device {
+            return; // no change — don't rebuild (would drop self-monitor etc.)
+        }
         self.input_device = dev;
         #[cfg(target_os = "windows")]
         if self.native_voice.is_some() {
@@ -1201,6 +1214,9 @@ impl Session {
     /// Select the speaker output device; restarts the capture so AEC references
     /// the new sink's monitor (brief blip).
     pub fn set_output_device(&mut self, dev: Option<String>) {
+        if dev == self.output_device {
+            return;
+        }
         self.output_device = dev;
         #[cfg(target_os = "windows")]
         if self.native_voice.is_some() {
@@ -1232,6 +1248,11 @@ impl Session {
     /// Calling while the monitor is already running replaces the previous one.
     pub fn start_mic_test(&mut self) {
         self.mic_monitor = None;
+        // Discord-style: while testing, mute the mic + deafen the call and show
+        // muted+deafened to the room. The self-monitor still lets you hear
+        // yourself (it bypasses the suspend).
+        self.set_io_suspended(true);
+        self.voice_status.set_testing(true);
 
         #[cfg(target_os = "windows")]
         {
@@ -1275,6 +1296,8 @@ impl Session {
     /// Stop the mic-test loopback. No-op if not running.
     pub fn stop_mic_test(&mut self) {
         self.mic_monitor = None;
+        self.set_io_suspended(false);       // restore the user's real mute/deafen
+        self.voice_status.set_testing(false); // re-broadcast real status
         #[cfg(target_os = "windows")]
         {
             self.native_monitor = None;

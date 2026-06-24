@@ -199,12 +199,8 @@ impl Component for AppModel {
                         let _ = self.settings_window.sender().send(
                             SettingsInput::SetSettings(saved),
                         );
-                        // Discord-style: silence mic + output while in Settings
-                        // (e.g. so testing a mic device causes no feedback). The
-                        // user's real mute/deafen is restored on close.
-                        if let Some(s) = self.session.as_ref() {
-                            s.set_io_suspended(true);
-                        }
+                        // Settings changes apply live — you stay in the call and
+                        // can hear/talk. Only "Test Mic" mutes/deafens you.
                         self.settings_window.widget().present();
                     }
                     WorkspaceOutput::OpenSharePicker => {
@@ -508,9 +504,11 @@ impl AppModel {
                 return;
             }
             SettingsOutput::Close => {
-                if let Some(s) = self.session.as_ref() {
-                    s.set_io_suspended(false); // restore the user's real mute/deafen
+                // Stop any in-progress mic test (restores mute/deafen) on close.
+                if let Some(s) = self.session.as_mut() {
+                    s.stop_mic_test();
                 }
+                let _ = self.settings_window.sender().send(SettingsInput::SetMicTestActive(false));
                 self.settings_window.widget().set_visible(false);
                 return;
             }
