@@ -21,10 +21,12 @@ pub enum SettingsOutput {
     Activation(ActivationKind),
     PttKey(Option<String>),
     JitterLatency(u32),
-    /// Apply the current jitter-buffer value to an active call (rebuild voice).
-    ApplyJitter,
     MicTest(bool),
     ResetDefaults,
+    /// Revert all settings to the snapshot taken when the window opened.
+    Discard,
+    /// Close (hide) the settings window. Settings already applied immediately.
+    Close,
 }
 
 // ── Input ─────────────────────────────────────────────────────────────────────
@@ -208,21 +210,25 @@ impl Component for SettingsWindow {
         root_box.append(&section_label("NETWORK"));
 
         // Jitter buffer depth (ms). Lower = less latency, more sensitive to
-        // network jitter. The spinner only stores the value; "Apply" rebuilds an
-        // active voice call so it takes effect (rtpjitterbuffer honours `latency`
-        // only at startup). Overwritten from the loaded config on open.
+        // network jitter. Applies to the GStreamer fallback transport; the native
+        // voice path (default on Windows) uses its own fixed mixer lane.
         let jitter_spin = gtk::SpinButton::with_range(0.0, 500.0, 5.0);
         jitter_spin.set_value(20.0);
         root_box.append(&hrow("Jitter buffer (ms)", 180, &jitter_spin));
-        let jitter_apply_btn = gtk::Button::with_label("Apply to active call");
-        jitter_apply_btn.set_halign(gtk::Align::End);
-        jitter_apply_btn.set_tooltip_text(Some("Rebuild the current voice call so the jitter value above takes effect"));
-        root_box.append(&jitter_apply_btn);
 
-        // Reset section
-        let reset_btn = gtk::Button::with_label("Reset to Default");
-        reset_btn.set_halign(gtk::Align::End);
-        root_box.append(&reset_btn);
+        // Bottom action row. Settings apply immediately (no Save); "Discard"
+        // reverts to the values as they were when the window opened.
+        let reset_btn = gtk::Button::with_label("Reset to Defaults");
+        let discard_btn = gtk::Button::with_label("Discard Changes");
+        let close_btn = gtk::Button::with_label("Close");
+        close_btn.add_css_class("suggested-action");
+        let action_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        action_row.set_halign(gtk::Align::End);
+        action_row.set_margin_top(12);
+        action_row.append(&reset_btn);
+        action_row.append(&discard_btn);
+        action_row.append(&close_btn);
+        root_box.append(&action_row);
 
         // ── Wire signals (once; handler IDs stored for block/unblock) ─────────
 
@@ -346,15 +352,22 @@ impl Component for SettingsWindow {
 
         {
             let s = sender.clone();
-            jitter_apply_btn.connect_clicked(move |_| {
-                let _ = s.output(SettingsOutput::ApplyJitter);
+            reset_btn.connect_clicked(move |_| {
+                let _ = s.output(SettingsOutput::ResetDefaults);
             });
         }
 
         {
             let s = sender.clone();
-            reset_btn.connect_clicked(move |_| {
-                let _ = s.output(SettingsOutput::ResetDefaults);
+            discard_btn.connect_clicked(move |_| {
+                let _ = s.output(SettingsOutput::Discard);
+            });
+        }
+
+        {
+            let s = sender.clone();
+            close_btn.connect_clicked(move |_| {
+                let _ = s.output(SettingsOutput::Close);
             });
         }
 

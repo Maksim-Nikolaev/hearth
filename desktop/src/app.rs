@@ -34,6 +34,9 @@ pub struct AppModel {
     login: Controller<LoginForm>,
     workspace: Controller<Workspace>,
     settings_window: Controller<SettingsWindow>,
+    /// Settings as they were when the Settings window was last opened, so
+    /// "Discard Changes" can revert (changes are applied immediately, not batched).
+    settings_snapshot: Option<Settings>,
     /// The picker window. Created once and re-presented each time the user
     /// clicks "Share screen". Hidden on Cancel / GoLive / StopShare.
     share_picker: Controller<ScreenSharePicker>,
@@ -154,6 +157,7 @@ impl Component for AppModel {
             login,
             workspace,
             settings_window,
+            settings_snapshot: None,
             share_picker,
             preview_picture,
             previewed_source: None,
@@ -186,6 +190,9 @@ impl Component for AppModel {
                 match out {
                     WorkspaceOutput::OpenSettings => {
                         let saved = self.config.load_settings();
+                        // Snapshot for "Discard Changes" — settings apply live, so
+                        // this captures the state to revert to.
+                        self.settings_snapshot = Some(saved.clone());
                         let _ = self.settings_window.sender().send(
                             SettingsInput::SetDevices(list_devices()),
                         );
@@ -475,14 +482,21 @@ impl AppModel {
             SettingsOutput::Activation(a) => settings.activation = a,
             SettingsOutput::PttKey(k) => settings.ptt_key = k,
             SettingsOutput::JitterLatency(ms) => settings.jitter_latency_ms = ms,
-            SettingsOutput::ApplyJitter => {
-                // Store the value, then rebuild the active voice call so the new
-                // jitter depth takes effect (explicit apply, not per-tick).
-                self.config.save_settings(&settings);
-                if let Some(s) = self.session.as_mut() {
-                    s.set_jitter_latency_ms(settings.jitter_latency_ms);
-                    s.reconnect_voice();
+            SettingsOutput::Discard => {
+                // Revert every setting to the snapshot taken when the window
+                // opened (changes are applied live, so this re-applies the old ones).
+                if let Some(snap) = self.settings_snapshot.clone() {
+                    self.config.save_settings(&snap);
+                    if let Some(s) = self.session.as_mut() {
+                        Self::apply_settings_to_session(s, &snap);
+                    }
+                    let _ = self.settings_window.sender()
+                        .send(SettingsInput::SetSettings(snap));
                 }
+                return;
+            }
+            SettingsOutput::Close => {
+                self.settings_window.widget().set_visible(false);
                 return;
             }
             SettingsOutput::MicTest(on) => {
