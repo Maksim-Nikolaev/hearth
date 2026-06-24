@@ -27,7 +27,7 @@ fn main() -> anyhow::Result<()> {
             let secs = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
             let playback = std::sync::Arc::new(engine::audio::native::NativePlayback::start()?);
             let pb = playback.clone();
-            let _capture = engine::audio::native::NativeCapture::start(move |mono| pb.push(mono))?;
+            let _capture = engine::audio::native::NativeCapture::start(move |mono| pb.push(0, mono))?;
             println!("[native] loopback up for {secs}s — mic -> speaker via NativeCapture/NativePlayback");
             std::thread::sleep(std::time::Duration::from_secs(secs));
             println!("[native] done.");

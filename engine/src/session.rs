@@ -422,6 +422,11 @@ pub struct Session {
     pub(crate) peers: HashMap<(Uuid, Flow), FlowPeer>,
     /// Voice flows, one thin RTP/Opus-over-UDP transport per peer (no webrtcbin).
     voice_peers: HashMap<Uuid, crate::voice_udp::VoiceUdpPeer>,
+    /// Native voice transport (Phase 2): WASAPI IAudioClient3 capture/playback +
+    /// Opus + UDP, replacing GStreamer for voice when `HEARTH_NATIVE_AUDIO` is
+    /// set. Owns the shared capture/playback; peers register endpoints into it.
+    #[cfg(target_os = "windows")]
+    native_voice: Option<crate::audio::native_voice::NativeVoice>,
     /// The single mic capture + DSP, shared by every Voice flow. Lazily started
     /// when the first voice peer connects, dropped when the last leaves.
     voice_capture: Option<VoiceCapture>,
@@ -531,6 +536,8 @@ impl Session {
             share_config: ShareConfig::default(),
             peers: HashMap::new(),
             voice_peers: HashMap::new(),
+            #[cfg(target_os = "windows")]
+            native_voice: None,
             voice_capture: None,
             mic_monitor: None,
             gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
@@ -575,6 +582,11 @@ impl Session {
         // screenshare being watched (Discord-like). Chat/presence are untouched.
         self.voice_peers.clear();
         self.voice_capture = None;
+        #[cfg(target_os = "windows")]
+        {
+            // Dropping it stops the native capture/playback + joins recv threads.
+            self.native_voice = None;
+        }
 
         let screen: Vec<(Uuid, Flow)> = self.peers.keys().copied().collect();
         for (peer, flow) in screen {
@@ -614,7 +626,38 @@ impl Session {
 
     /// Offerer side of a UDP voice flow: build the transport, register the mic
     /// send, and hand the peer our `ip:port` (carried in the Offer's `sdp`).
+    /// Lazily start the native voice transport, returning it if `HEARTH_NATIVE_AUDIO`
+    /// selects it. Returns `None` (falling back to the GStreamer path) otherwise.
+    #[cfg(target_os = "windows")]
+    fn ensure_native_voice(&mut self) -> Option<&mut crate::audio::native_voice::NativeVoice> {
+        if std::env::var_os("HEARTH_NATIVE_AUDIO").is_none() {
+            return None;
+        }
+        if self.native_voice.is_none() {
+            match crate::audio::native_voice::NativeVoice::new(self.gate.clone(), self.evt_tx.clone()) {
+                Ok(nv) => self.native_voice = Some(nv),
+                Err(e) => {
+                    self.emit(SessionEvent::Error(format!("native voice init: {e}")));
+                    return None;
+                }
+            }
+        }
+        self.native_voice.as_mut()
+    }
+
     fn voice_offer(&mut self, peer: Uuid) -> Result<()> {
+        #[cfg(target_os = "windows")]
+        if std::env::var_os("HEARTH_NATIVE_AUDIO").is_some() {
+            let endpoint = {
+                let nv = self
+                    .ensure_native_voice()
+                    .ok_or_else(|| anyhow::anyhow!("native voice unavailable"))?;
+                nv.add_peer(peer)?
+            };
+            let _ = self.out_tx.send(ClientMessage::Offer { to: peer, flow: Flow::Voice, sdp: endpoint });
+            return Ok(());
+        }
+
         let p = crate::voice_udp::VoiceUdpPeer::new(peer)?;
         let endpoint = p.local_endpoint();
         self.voice_peers.insert(peer, p);
@@ -630,6 +673,25 @@ impl Session {
     /// Answerer side: the peer sent their endpoint; build our transport pointed
     /// at them and reply with ours.
     fn voice_on_offer(&mut self, from: Uuid, endpoint: &str) {
+        #[cfg(target_os = "windows")]
+        if std::env::var_os("HEARTH_NATIVE_AUDIO").is_some() {
+            let result: Result<String> = (|| {
+                let nv = self
+                    .ensure_native_voice()
+                    .ok_or_else(|| anyhow::anyhow!("native voice unavailable"))?;
+                let ep = nv.add_peer(from)?; // replaces any stale peer internally
+                nv.set_remote(from, endpoint)?;
+                Ok(ep)
+            })();
+            match result {
+                Ok(my_endpoint) => {
+                    let _ = self.out_tx.send(ClientMessage::Answer { to: from, flow: Flow::Voice, sdp: my_endpoint });
+                }
+                Err(e) => self.emit(SessionEvent::Error(format!("native voice answer: {e}"))),
+            }
+            return;
+        }
+
         self.stop_voice(from); // a re-offer replaces any stale transport
         match crate::voice_udp::VoiceUdpPeer::new(from) {
             Ok(p) => {
@@ -651,6 +713,14 @@ impl Session {
 
     /// Offerer received the answer: point our sender at the peer.
     fn voice_on_answer(&mut self, from: Uuid, endpoint: &str) {
+        #[cfg(target_os = "windows")]
+        if let Some(nv) = self.native_voice.as_ref() {
+            if let Err(e) = nv.set_remote(from, endpoint) {
+                self.emit(SessionEvent::Error(format!("native voice endpoint: {e}")));
+            }
+            return;
+        }
+
         if let Some(p) = self.voice_peers.get(&from) {
             if let Err(e) = p.set_remote(endpoint) {
                 self.emit(SessionEvent::Error(format!("voice endpoint: {e}")));
@@ -660,6 +730,10 @@ impl Session {
 
     /// Tear down one voice peer and unregister its mic send.
     fn stop_voice(&mut self, peer: Uuid) {
+        #[cfg(target_os = "windows")]
+        if let Some(nv) = self.native_voice.as_mut() {
+            nv.remove_peer(peer);
+        }
         if let Some(p) = self.voice_peers.remove(&peer) {
             let appsrc = Some(p.voice_appsrc());
             drop(p);
@@ -881,6 +955,10 @@ impl Session {
         for p in self.voice_peers.values() {
             p.set_deaf(on);
         }
+        #[cfg(target_os = "windows")]
+        if let Some(nv) = self.native_voice.as_ref() {
+            nv.set_deaf(on);
+        }
 
         self.set_muted(on);
     }
@@ -968,7 +1046,14 @@ impl Session {
     /// True when at least one Voice-flow peer is connected. Used to gate the
     /// mic test so it cannot open a second concurrent capture during a call.
     pub fn in_voice(&self) -> bool {
-        !self.voice_peers.is_empty()
+        if !self.voice_peers.is_empty() {
+            return true;
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(nv) = self.native_voice.as_ref() {
+            return !nv.is_empty();
+        }
+        false
     }
 
     /// Start the standalone mic loopback for the Settings mic-test panel.
@@ -1007,6 +1092,12 @@ impl Session {
     /// Rebuild the shared capture with the current devices/config, re-registering
     /// every live Voice flow's send `appsrc`. No-op when no capture is running.
     fn restart_voice_capture(&mut self) {
+        // The native voice transport owns its own WASAPI capture (always the
+        // default device); nothing to restart on the GStreamer side.
+        #[cfg(target_os = "windows")]
+        if self.native_voice.is_some() {
+            return;
+        }
         if self.voice_capture.is_none() {
             return;
         }
@@ -1148,6 +1239,8 @@ mod tests {
                 share_config: ShareConfig::default(),
                 peers: HashMap::new(),
                 voice_peers: HashMap::new(),
+                #[cfg(target_os = "windows")]
+                native_voice: None,
                 voice_capture: None,
                 mic_monitor: None,
                 gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),

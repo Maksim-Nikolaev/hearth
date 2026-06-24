@@ -13,6 +13,10 @@ pub mod wasapi3;
 #[cfg(target_os = "windows")]
 pub mod native;
 
+// Phase 2: native voice transport (NativeCapture+Opus+UDP+NativePlayback).
+#[cfg(target_os = "windows")]
+pub mod native_voice;
+
 /// Microphone capture source element for this platform. Linux/macOS use
 /// PulseAudio (`pulsesrc`); Windows uses WASAPI (`wasapi2src`). Both accept a
 /// `device` property whose value is the id returned by [`devices::list_devices`].

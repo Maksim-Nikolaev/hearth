@@ -16,7 +16,7 @@
 //! the Opus codec and the DSP frame. Each stream owns a COM-initialized thread.
 
 use anyhow::{bail, Result};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -168,47 +168,54 @@ where
 
 // ── Playback ────────────────────────────────────────────────────────────────
 
-/// Running speaker playback. `push` queues mono f32 @ 48 kHz; the thread renders
-/// it with a tight render-ahead. Dropping it stops and joins the thread.
+/// Running speaker playback with a built-in mixer: each source (e.g. one per
+/// remote peer) `push`es mono f32 @ 48 kHz and the render thread sums them.
+/// Dropping it stops and joins the thread.
 pub struct NativePlayback {
     stop: Arc<AtomicBool>,
-    ring: Arc<Mutex<VecDeque<f32>>>,
+    sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl NativePlayback {
     pub fn start() -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
-        let ring: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::with_capacity(SAMPLE_RATE as usize)));
+        let sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>> = Arc::new(Mutex::new(HashMap::new()));
         let stop_thread = stop.clone();
-        let ring_thread = ring.clone();
+        let sources_thread = sources.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
 
         let handle = std::thread::Builder::new()
             .name("native-playback".into())
             .spawn(move || {
-                let r = unsafe { playback_loop(&stop_thread, &ring_thread, &ready_tx) };
+                let r = unsafe { playback_loop(&stop_thread, &sources_thread, &ready_tx) };
                 if let Err(e) = r {
                     let _ = ready_tx.send(Err(e.to_string()));
                 }
             })?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { stop, ring, handle: Some(handle) }),
+            Ok(Ok(())) => Ok(Self { stop, sources, handle: Some(handle) }),
             Ok(Err(e)) => bail!("native playback init: {e}"),
             Err(_) => bail!("native playback thread exited before init"),
         }
     }
 
-    /// Queue mono f32 @ 48 kHz for playback. Drops the oldest audio if the queue
-    /// runs away (should not happen in steady state — keeps latency bounded).
-    pub fn push(&self, mono: &[f32]) {
-        let mut ring = self.ring.lock().unwrap();
-        ring.extend(mono.iter().copied());
+    /// Queue mono f32 @ 48 kHz for `source`'s lane. Drops the oldest audio if the
+    /// lane runs away (keeps latency bounded; should not happen in steady state).
+    pub fn push(&self, source: u64, mono: &[f32]) {
+        let mut sources = self.sources.lock().unwrap();
+        let q = sources.entry(source).or_default();
+        q.extend(mono.iter().copied());
         let cap = (SAMPLE_RATE / 4) as usize; // 250 ms safety cap
-        while ring.len() > cap {
-            ring.pop_front();
+        while q.len() > cap {
+            q.pop_front();
         }
+    }
+
+    /// Drop a source's lane (peer left).
+    pub fn remove_source(&self, source: u64) {
+        self.sources.lock().unwrap().remove(&source);
     }
 }
 
@@ -223,7 +230,7 @@ impl Drop for NativePlayback {
 
 unsafe fn playback_loop(
     stop: &AtomicBool,
-    ring: &Mutex<VecDeque<f32>>,
+    sources: &Mutex<HashMap<u64, VecDeque<f32>>>,
     ready: &mpsc::Sender<Result<(), String>>,
 ) -> Result<()> {
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -247,9 +254,16 @@ unsafe fn playback_loop(
         let data = svc.GetBuffer(to_write)?;
         let out = std::slice::from_raw_parts_mut(data as *mut f32, to_write as usize * ch);
         {
-            let mut ring = ring.lock().unwrap();
+            let mut sources = sources.lock().unwrap();
             for f in 0..to_write as usize {
-                let v = ring.pop_front().unwrap_or(0.0); // silence on underrun
+                // mix: sum one sample from every source lane (silence on underrun)
+                let mut v = 0.0f32;
+                for q in sources.values_mut() {
+                    if let Some(s) = q.pop_front() {
+                        v += s;
+                    }
+                }
+                v = v.clamp(-1.0, 1.0); // guard against summed clipping
                 for c in 0..ch {
                     out[f * ch + c] = v; // mono -> all channels
                 }
