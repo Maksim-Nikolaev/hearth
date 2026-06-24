@@ -18,10 +18,29 @@ use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use uuid::Uuid;
 
-use crate::flow_peer::audio_recv_sink;
-
 /// RTP payload type for the Opus voice stream (matches the legacy webrtc path).
 const VOICE_PT: i32 = 97;
+
+/// Playback sink for received voice. `sync=false` plays on arrival — unlike the
+/// old webrtc path (whose internal buffer accumulated, forcing sync=true), the
+/// explicit `rtpjitterbuffer` here already paces the stream, so clock-syncing
+/// only adds the sink's render-ahead latency. `low-latency` keeps the WASAPI
+/// device buffer minimal.
+fn voice_playback_sink() -> Result<gst::Element> {
+    #[cfg(target_os = "windows")]
+    {
+        Ok(gst::ElementFactory::make("wasapi2sink")
+            .property("low-latency", true)
+            .property("sync", false)
+            .build()?)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Ok(gst::ElementFactory::make("autoaudiosink")
+            .property("sync", false)
+            .build()?)
+    }
+}
 
 /// Best-effort local IPv4 the peer can reach us on. Uses the route to a public
 /// address to discover the LAN interface (no packet is sent). Falls back to
@@ -89,7 +108,7 @@ impl VoiceUdpPeer {
             .name("spk_valve")
             .property("drop", false)
             .build()?;
-        let sink = audio_recv_sink();
+        let sink = voice_playback_sink()?;
 
         pipeline.add_many([&udpsrc, &jitter, &depay, &dec, &rconv, &rresample, &spk_valve, &sink])?;
         gst::Element::link_many([&udpsrc, &jitter, &depay, &dec, &rconv, &rresample, &spk_valve, &sink])?;
