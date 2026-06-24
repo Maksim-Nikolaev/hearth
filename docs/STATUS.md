@@ -213,6 +213,29 @@ audible both ways on Wayland**, clean quality. OBS-measured mouth→system acous
   The home migration also left a partially-copied Cargo registry (corrupt `cc`
   crate); fixed by wiping `~/.cargo/registry/src` to force re-extraction.
 
+## Voice DSP profiles landed (2026-06-24, on main)
+
+`VoiceProfile` Custom/Headset/Speaker/Auto above the existing per-platform DSP
+engines (approach C: best engine per platform, unified profile layer). Default
+**Custom** = today's behavior unchanged. Headset = AEC off (low latency); Speaker
+= AEC on; Auto classifies the output device (Linux: form-factor/icon-name; Windows
+deferred → Unknown→Headset). Single "custom slot"; editing a toggle on a preset
+demotes to Custom (overwrites). Plus an rtkit-aware RT-scheduling warning and a
+Re-probe button. 6 TDD tasks + post-verify fixes, all on main (engine 63 + desktop
+6 tests). Spec/plan in `docs/superpowers/{specs,plans}/2026-06-24-voice-dsp-profiles*`.
+
+**Known limits:** Auto can't classify a generic USB "analog stereo" headset (no
+form factor) → Unknown→Headset, manual selector is the guarantee. Volume sliders
+still not wired to the live session (pre-existing). Mic/speaker volume setter TODO.
+
+## ACTIVE NEXT: native PipeWire low-latency capture
+
+Decided 2026-06-24: replace `pulsesrc` with **`pipewiresrc`** (small quantum, RT
+graph) to cut the voice **send hop** (~16–26 ms, load-dependent because our
+`pulsesrc` is untuned and the capture thread is non-RT). This is the proper Linux
+low-latency path and the "cleanest results always" target. Own spec/branch. The
+`pulsesrc` path stays as the compatibility fallback.
+
 ## Next candidates
 
 - **M4 Task 5** – cross-machine Windows↔Linux measurement (user-run; see
