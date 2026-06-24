@@ -9,6 +9,10 @@ pub mod monitor;
 #[cfg(target_os = "windows")]
 pub mod wasapi3;
 
+// Phase 2: native WASAPI capture/playback (replaces GStreamer wasapi2 on voice).
+#[cfg(target_os = "windows")]
+pub mod native;
+
 /// Microphone capture source element for this platform. Linux/macOS use
 /// PulseAudio (`pulsesrc`); Windows uses WASAPI (`wasapi2src`). Both accept a
 /// `device` property whose value is the id returned by [`devices::list_devices`].

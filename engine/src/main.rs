@@ -20,6 +20,18 @@ fn main() -> anyhow::Result<()> {
             let secs = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
             engine::audio::wasapi3::run_loopback(secs)?;
         }
+        #[cfg(target_os = "windows")]
+        "native" => {
+            // Phase 2: exercise the NativeCapture + NativePlayback abstractions as
+            // a mic -> speaker loopback (the building blocks for the voice path).
+            let secs = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+            let playback = std::sync::Arc::new(engine::audio::native::NativePlayback::start()?);
+            let pb = playback.clone();
+            let _capture = engine::audio::native::NativeCapture::start(move |mono| pb.push(mono))?;
+            println!("[native] loopback up for {secs}s — mic -> speaker via NativeCapture/NativePlayback");
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            println!("[native] done.");
+        }
         "share" | "view" | "call" | "listen" => {
             let share = matches!(mode.as_str(), "share" | "call");
             let flow = if matches!(mode.as_str(), "call" | "listen") {
