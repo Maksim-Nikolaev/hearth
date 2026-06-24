@@ -183,15 +183,22 @@ RTP/UDP, ~20–30 ms).
 Re-verified the voice channel after the Mint→Kubuntu (X11→Wayland) move. Two
 live desktop instances (alice/bob) through the backend: **voice connects and is
 audible both ways on Wayland**, clean quality. OBS-measured mouth→system acoustic
-**~74 ms** (beats the Windows 36–50 ms floor only at the device layer; see below).
+**~74 ms with all DSP filters on, but ~7.14 ms with filters OFF**.
 
 - **Path on Linux = GStreamer `voice_udp`** (raw RTP/Opus/UDP), `pulsesrc` capture
   + `webrtc-audio-processing` DSP + `autoaudiosink`. The Phase-2 native I/O
-  (WASAPI IAudioClient3) is Windows-only; **native PipeWire small-quantum is still
-  TODO** and is the next Linux latency win (current ~16.5 ms send hop is the
-  PulseAudio-compat buffer).
-- Probe breakdown: send (mic→wire) ~16.5 ms, jitter buffer 20 ms, recv
-  (wire→speaker) ~2.4 ms.
+  (WASAPI IAudioClient3) is Windows-only.
+- **The DSP is the dominant latency cost, not the device path.** Per-filter
+  attribution (full table in `docs/findings/voice-latency-linux.md`): baseline
+  filters-off ≈7 ms; **NS and AEC each add ~one 10 ms frame (~7 ms), roughly
+  additive; VAD and AGC are free; NS level is latency-free.** Full processing
+  ~20 ms — still under the Windows 36–50 ms floor.
+- Because the device path is already ≈7 ms, **native PipeWire small-quantum is a
+  robustness nicety, not the latency win** (revises the earlier "Pulse-compat
+  buffer is the bottleneck" assumption). The real lever with processing on is
+  reducing NS/AEC frame cost — a low-delay `webrtc-audio-processing` config, or
+  porting the Windows pure-Rust suite (`nnnoiseless` + `aec-rs`) to converge both
+  platforms on one DSP.
 - **Fixes landed:** (1) the desktop startup banner no longer claims "NATIVE WASAPI"
   on Linux — it now prints the true per-platform backend. (2) In-call **mic-test
   self-monitor on Linux**: `VoiceCapture` gained `set_self_monitor`, feeding the
