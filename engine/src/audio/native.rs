@@ -263,10 +263,10 @@ impl NativeMonitor {
             let open = {
                 let mut g = gate.lock().unwrap();
                 g.update_level(rms, rms > -60.0);
-                g.open()
+                g.monitor_open() // mode only — ignore mute / Settings suspend
             };
             if open {
-                pb.push(0, mono); // hear yourself only when the gate transmits
+                pb.push(0, mono); // hear yourself per the activation mode
             }
         })?;
         Ok(Self { _capture: capture, _playback: playback })

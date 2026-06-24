@@ -32,6 +32,7 @@ pub struct Workspace {
     voice_state: HashMap<Uuid, (bool, bool, bool)>,
     self_muted: bool,
     self_deafened: bool,
+    self_speaking: bool,
     sharers: Vec<Uuid>,
     selected: Option<Uuid>,
     screens: Screens,
@@ -53,6 +54,7 @@ pub enum WorkspaceInput {
     VoiceJoined { user: Uuid, username: String },
     VoiceLeft { user: Uuid },
     PeerVoiceState { user: Uuid, muted: bool, deafened: bool, speaking: bool },
+    SelfSpeaking(bool),
     ShareStarted { user: Uuid },
     ShareStopped { user: Uuid },
     ChatHistory(Vec<ChatEntry>),
@@ -188,6 +190,7 @@ impl SimpleComponent for Workspace {
             voice_state: HashMap::new(),
             self_muted: false,
             self_deafened: false,
+            self_speaking: false,
             sharers: Vec::new(),
             selected: None,
             screens,
@@ -245,6 +248,7 @@ impl SimpleComponent for Workspace {
             WorkspaceInput::PeerVoiceState { user, muted, deafened, speaking } => {
                 self.voice_state.insert(user, (muted, deafened, speaking));
             }
+            WorkspaceInput::SelfSpeaking(on) => self.self_speaking = on,
             WorkspaceInput::ShareStarted { user } => {
                 if !self.sharers.contains(&user) {
                     self.sharers.push(user);
@@ -288,8 +292,12 @@ impl SimpleComponent for Workspace {
             }
             WorkspaceInput::Deafen(b) => {
                 self.self_deafened = b;
-                self.self_muted = b; // deafen mutes the mic too
                 let _ = sender.output(WorkspaceOutput::Deafen(b));
+                // Deafen mutes the mic; un-deafen must restore the user's prior
+                // mute intent (self_muted), not blanket-unmute.
+                if !b {
+                    let _ = sender.output(WorkspaceOutput::Mute(self.self_muted));
+                }
             }
             WorkspaceInput::OpenSharePicker => {
                 let _ = sender.output(WorkspaceOutput::OpenSharePicker);
@@ -395,7 +403,7 @@ impl Workspace {
                 let is_self = *id == self.self_id;
                 // Status icon (Discord-style): deafened > muted > speaking > idle.
                 let (muted, deafened, speaking) = if is_self {
-                    (self.self_muted, self.self_deafened, false)
+                    (self.self_muted, self.self_deafened, self.self_speaking)
                 } else {
                     self.voice_state.get(id).copied().unwrap_or((false, false, false))
                 };

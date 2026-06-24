@@ -47,6 +47,8 @@ pub enum SessionEvent {
     /// A voice member's status changed (mute / deafen / speaking) — drives the
     /// member-rail indicators.
     PeerVoiceState { user: Uuid, muted: bool, deafened: bool, speaking: bool },
+    /// Our own speaking transition (so the self row gets a speaking indicator).
+    SelfSpeaking(bool),
     ShareStarted { user: Uuid },
     ShareStopped { user: Uuid },
     /// Local microphone level in RMS dBFS, emitted ~once per processed frame for

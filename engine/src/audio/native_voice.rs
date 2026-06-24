@@ -148,12 +148,14 @@ impl NativeVoice {
                     if !speaking {
                         speaking = true;
                         voice_status.set_speaking(true);
+                        let _ = evt_tx.send(SessionEvent::SelfSpeaking(true));
                     }
                 } else {
                     silent_frames += 1;
                     if speaking && silent_frames > SPEAKING_HANGOVER {
                         speaking = false;
                         voice_status.set_speaking(false);
+                        let _ = evt_tx.send(SessionEvent::SelfSpeaking(false));
                     }
                 }
 

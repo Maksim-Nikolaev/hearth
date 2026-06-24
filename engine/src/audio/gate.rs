@@ -48,7 +48,17 @@ impl Gate {
         if self.suspended || self.muted {
             return false;
         }
+        self.mode_open()
+    }
 
+    /// The activation-mode decision alone (PTT held / above threshold / always),
+    /// ignoring mute and suspend. Used by the mic-test monitor so you can hear
+    /// yourself regardless of call mute / the Settings-open suspend.
+    pub fn monitor_open(&self) -> bool {
+        self.mode_open()
+    }
+
+    fn mode_open(&self) -> bool {
         match self.mode {
             ActivationMode::PushToTalk => self.ptt_held,
             ActivationMode::Voice { threshold } => self.last_rms_db >= threshold || self.last_vad,
