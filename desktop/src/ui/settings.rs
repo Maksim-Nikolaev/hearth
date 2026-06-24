@@ -206,9 +206,10 @@ impl Component for SettingsWindow {
         root_box.append(&section_label("NETWORK"));
 
         // Jitter buffer depth (ms). Lower = less latency, more sensitive to
-        // network jitter. Applies to calls connected after a change.
+        // network jitter. Applies live to active UDP voice (overwritten from the
+        // loaded config on open).
         let jitter_spin = gtk::SpinButton::with_range(0.0, 500.0, 5.0);
-        jitter_spin.set_value(40.0);
+        jitter_spin.set_value(20.0);
         root_box.append(&hrow("Jitter buffer (ms)", 180, &jitter_spin));
 
         // Reset section

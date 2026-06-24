@@ -66,15 +66,16 @@ pub struct Settings {
     pub share_content: ContentKind,
     pub share_audio: ShareAudioKind,
     pub share_bitrate_kbps: u32,
-    /// webrtcbin jitter-buffer depth in ms (lower = less latency). Applied to
-    /// connections established after a change. `serde(default)` keeps older
-    /// saved settings loadable.
+    /// Jitter-buffer depth in ms (lower = less latency). Applied live to active
+    /// UDP voice and to connections established after a change. `serde(default)`
+    /// keeps older saved settings loadable. 20 ms = ~2 Opus packets of headroom,
+    /// the measured stability floor on LAN (10 ms destabilizes).
     #[serde(default = "default_jitter_ms")]
     pub jitter_latency_ms: u32,
 }
 
 fn default_jitter_ms() -> u32 {
-    40
+    20
 }
 
 impl Default for Settings {

@@ -120,6 +120,7 @@ pub(crate) struct VoiceUdpPeer {
     local_port: u16,
     udpsink: gst::Element,
     send_valve: gst::Element,
+    jitter: gst::Element,
     voice_appsrc: gst_app::AppSrc,
     spk_valve: gst::Element,
 }
@@ -180,6 +181,12 @@ impl VoiceUdpPeer {
             .caps(&pcm_caps)
             .is_live(true)
             .format(gst::Format::Time)
+            // Timestamp on the pipeline clock, not VoiceCapture's frame counter.
+            // The counter resets to 0 on every capture restart (device/DSP
+            // change) while this pipeline's clock keeps running — which both
+            // breaks the send latency probe and resets the outgoing RTP
+            // timestamps. do-timestamp keeps both continuous across restarts.
+            .do_timestamp(true)
             .build();
         let sconv = gst::ElementFactory::make("audioconvert").build()?;
         let sresample = gst::ElementFactory::make("audioresample").build()?;
@@ -242,8 +249,10 @@ impl VoiceUdpPeer {
         }
 
         // Per-hop latency instrumentation (always on; ~one line / 2 s per hop).
+        // Send probe measures the send pipeline (encode + pay); the mic capture
+        // + 10 ms DSP frame sit upstream of the appsrc and aren't included here.
         // The recv probe also logs the configured latency once it settles.
-        probe_hop(&udpsink, "voice send  (mic -> wire)", &pipeline, None);
+        probe_hop(&udpsink, "voice send  (encode -> wire)", &pipeline, None);
         probe_hop(&sink, "voice recv  (wire -> speaker, post-jitter)", &pipeline, Some(target));
 
         Ok(Self {
@@ -252,9 +261,17 @@ impl VoiceUdpPeer {
             local_port,
             udpsink,
             send_valve,
+            jitter,
             voice_appsrc: appsrc,
             spk_valve,
         })
+    }
+
+    /// Live-update the receive jitter buffer depth (ms). Lets the Voice-settings
+    /// slider change buffering on an active call so its latency effect is
+    /// testable without rejoining.
+    pub fn set_jitter_ms(&self, ms: u32) {
+        self.jitter.set_property("latency", ms);
     }
 
     /// The `ip:port` we receive on — carried to the peer in the Offer/Answer.

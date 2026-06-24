@@ -878,11 +878,18 @@ impl Session {
         self.gate.lock().unwrap().set_mode(mode);
     }
 
-    /// Set the `webrtcbin` jitter-buffer depth (ms) for connections established
-    /// afterwards. Lower = less latency, more sensitive to network jitter.
-    /// Reconnect a flow (e.g. leave/rejoin voice) to apply it.
+    /// Set the jitter-buffer depth (ms). Lower = less latency, more sensitive to
+    /// network jitter. Stored for connections established afterwards, and applied
+    /// live to any active UDP voice peers so the slider's effect is testable
+    /// mid-call (the legacy webrtc flows still need a reconnect).
     pub fn set_jitter_latency_ms(&self, ms: u32) {
         crate::flow_peer::set_jitter_latency_ms(ms);
+        for p in self.voice_peers.values() {
+            p.set_jitter_ms(ms);
+        }
+        if !self.voice_peers.is_empty() {
+            eprintln!("[latency] jitter buffer -> {ms} ms (applied live to {} voice peer(s))", self.voice_peers.len());
+        }
     }
 
     /// Mute / unmute the mic via the shared gate.
