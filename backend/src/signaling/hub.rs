@@ -147,6 +147,21 @@ impl SignalingHub {
         }
     }
 
+    /// Relay a member's voice status to the other voice members (not echoed back
+    /// to the sender, who already knows their own state).
+    pub fn voice_update(&self, user: Uuid, muted: bool, deafened: bool, speaking: bool) {
+        let peers = self.peers.lock().unwrap();
+        let voice = self.voice.lock().unwrap();
+        for id in voice.iter() {
+            if *id == user {
+                continue;
+            }
+            if let Some(p) = peers.get(id) {
+                let _ = p.tx.send(ServerMessage::VoicePeerUpdate { user, muted, deafened, speaking });
+            }
+        }
+    }
+
     fn voice_broadcast(&self, msg: ServerMessage) {
         let peers = self.peers.lock().unwrap();
         let voice = self.voice.lock().unwrap();

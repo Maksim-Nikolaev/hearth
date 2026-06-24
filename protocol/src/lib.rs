@@ -39,6 +39,8 @@ pub enum ClientMessage {
     Leave,
     VoiceJoin,
     VoiceLeave,
+    /// Broadcast this client's voice status to the room (Discord-style chips).
+    VoiceUpdate { muted: bool, deafened: bool, speaking: bool },
     ShareStart,
     ShareStop,
 }
@@ -57,6 +59,8 @@ pub enum ServerMessage {
     VoiceState { members: Vec<PeerInfo> },
     VoiceJoined { user: Uuid, username: String },
     VoiceLeft { user: Uuid },
+    /// A voice member's status changed (mute / deafen / speaking).
+    VoicePeerUpdate { user: Uuid, muted: bool, deafened: bool, speaking: bool },
     ShareStarted { user: Uuid },
     ShareStopped { user: Uuid },
 }

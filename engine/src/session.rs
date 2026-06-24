@@ -44,12 +44,85 @@ pub enum SessionEvent {
     VoiceState(Vec<PeerInfo>),
     VoiceJoined { user: Uuid, username: String },
     VoiceLeft { user: Uuid },
+    /// A voice member's status changed (mute / deafen / speaking) — drives the
+    /// member-rail indicators.
+    PeerVoiceState { user: Uuid, muted: bool, deafened: bool, speaking: bool },
     ShareStarted { user: Uuid },
     ShareStopped { user: Uuid },
     /// Local microphone level in RMS dBFS, emitted ~once per processed frame for
     /// the input meter. The capture already feeds the gate; the UI only displays.
     InputLevel(f32),
     Error(String),
+}
+
+/// Shared voice presence (mute / deafen / speaking) broadcast to the room on
+/// change. The session updates mute/deafen; the capture thread updates speaking;
+/// both trigger a `VoiceUpdate`. Cloneable (Arc inside).
+#[derive(Clone)]
+pub struct VoiceStatus {
+    inner: Arc<VoiceStatusInner>,
+}
+
+struct VoiceStatusInner {
+    muted: std::sync::atomic::AtomicBool,
+    deafened: std::sync::atomic::AtomicBool,
+    speaking: std::sync::atomic::AtomicBool,
+    active: std::sync::atomic::AtomicBool,
+    out_tx: UnboundedSender<ClientMessage>,
+}
+
+impl VoiceStatus {
+    fn new(out_tx: UnboundedSender<ClientMessage>) -> Self {
+        use std::sync::atomic::AtomicBool;
+        Self {
+            inner: Arc::new(VoiceStatusInner {
+                muted: AtomicBool::new(false),
+                deafened: AtomicBool::new(false),
+                speaking: AtomicBool::new(false),
+                active: AtomicBool::new(false),
+                out_tx,
+            }),
+        }
+    }
+
+    fn send(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if !self.inner.active.load(Relaxed) {
+            return; // only broadcast while in a voice call
+        }
+        let _ = self.inner.out_tx.send(ClientMessage::VoiceUpdate {
+            muted: self.inner.muted.load(Relaxed),
+            deafened: self.inner.deafened.load(Relaxed),
+            speaking: self.inner.speaking.load(Relaxed),
+        });
+    }
+
+    fn set_active(&self, on: bool) {
+        self.inner.active.store(on, std::sync::atomic::Ordering::Relaxed);
+        if on {
+            self.send(); // hand the room our current state on join
+        }
+    }
+
+    fn set_muted(&self, v: bool) {
+        self.inner.muted.store(v, std::sync::atomic::Ordering::Relaxed);
+        self.send();
+    }
+
+    fn set_mute_deafen(&self, muted: bool, deafened: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.inner.muted.store(muted, Relaxed);
+        self.inner.deafened.store(deafened, Relaxed);
+        self.send();
+    }
+
+    /// Called from the capture thread; broadcasts only on a real transition.
+    pub(crate) fn set_speaking(&self, v: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.inner.speaking.swap(v, Relaxed) != v {
+            self.send();
+        }
+    }
 }
 
 /// In a voice mesh both sides want to connect, so a deterministic rule decides
@@ -422,6 +495,8 @@ impl FlowPeer {
 /// into [`Session::handle`] there.
 pub struct Session {
     out_tx: UnboundedSender<ClientMessage>,
+    /// Shared mute/deafen/speaking presence, broadcast to the room on change.
+    voice_status: VoiceStatus,
     evt_tx: UnboundedSender<SessionEvent>,
     sink: VideoSink,
     /// The logged-in user, decoded from the JWT `sub` claim. Drives the voice
@@ -548,9 +623,11 @@ impl Session {
         let out_tx = conn.client.sender();
         let (evt_tx, evt_rx) = mpsc::unbounded_channel();
         let (self_id, self_name) = self_from_token(&conn.token);
+        let voice_status = VoiceStatus::new(out_tx.clone());
 
         let session = Session {
             out_tx,
+            voice_status,
             evt_tx,
             sink,
             self_id,
@@ -600,12 +677,14 @@ impl Session {
     /// `VoiceState`/`VoiceJoined` server messages.
     pub fn join_voice(&self) {
         let _ = self.out_tx.send(ClientMessage::VoiceJoin);
+        self.voice_status.set_active(true); // start broadcasting our status
     }
 
     /// Leave Voice: tear down every Voice flow, then tell the server.
     pub fn leave_voice(&mut self) {
         // Leaving the call disconnects every media flow — voice AND any
         // screenshare being watched (Discord-like). Chat/presence are untouched.
+        self.voice_status.set_active(false); // stop broadcasting our status
         self.voice_peers.clear();
         self.voice_capture = None;
         #[cfg(target_os = "windows")]
@@ -667,6 +746,7 @@ impl Session {
                 self.input_device.clone(),
                 self.output_device.clone(),
                 ns_wet,
+                self.voice_status.clone(),
             ) {
                 Ok(nv) => self.native_voice = Some(nv),
                 Err(e) => {
@@ -981,6 +1061,7 @@ impl Session {
     /// capture callback then pushes silence to every peer.
     pub fn mute(&self, on: bool) {
         self.set_muted(on);
+        self.voice_status.set_muted(on);
     }
 
     /// Deafen: silence incoming audio (spk_valve on every voice recv) and mute the mic.
@@ -994,6 +1075,7 @@ impl Session {
         }
 
         self.set_muted(on);
+        self.voice_status.set_mute_deafen(on, on);
     }
 
     /// Temporarily silence mic + output (e.g. while the Settings window is open),
@@ -1313,6 +1395,9 @@ impl Session {
                 self.stop_flow(user, Flow::Voice);
                 self.emit(SessionEvent::VoiceLeft { user });
             }
+            ServerMessage::VoicePeerUpdate { user, muted, deafened, speaking } => {
+                self.emit(SessionEvent::PeerVoiceState { user, muted, deafened, speaking });
+            }
             ServerMessage::ShareStarted { user } => self.emit(SessionEvent::ShareStarted { user }),
             ServerMessage::ShareStopped { user } => self.emit(SessionEvent::ShareStopped { user }),
         }
@@ -1331,8 +1416,10 @@ mod tests {
         fn for_test() -> (Session, UnboundedReceiver<SessionEvent>) {
             let (out_tx, _out_rx) = mpsc::unbounded_channel();
             let (evt_tx, evt_rx) = mpsc::unbounded_channel();
+            let voice_status = VoiceStatus::new(out_tx.clone());
             let s = Session {
                 out_tx,
+                voice_status,
                 evt_tx,
                 sink: VideoSink::Auto,
                 self_id: Uuid::nil(),

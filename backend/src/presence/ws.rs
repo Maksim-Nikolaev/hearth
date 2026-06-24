@@ -104,6 +104,9 @@ async fn dispatch(state: &AppState, from: uuid::Uuid, msg: crate::signaling::mes
         ClientMessage::Leave => state.signaling.leave_room(from),
         ClientMessage::VoiceJoin => state.signaling.voice_join(from),
         ClientMessage::VoiceLeave => state.signaling.voice_leave(from),
+        ClientMessage::VoiceUpdate { muted, deafened, speaking } => {
+            state.signaling.voice_update(from, muted, deafened, speaking)
+        }
         ClientMessage::ShareStart => state.signaling.share_start(from),
         ClientMessage::ShareStop => state.signaling.share_stop(from),
     }

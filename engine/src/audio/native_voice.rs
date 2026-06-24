@@ -74,6 +74,7 @@ impl NativeVoice {
         input_device: Option<String>,
         output_device: Option<String>,
         ns_wet: u32,
+        voice_status: crate::session::VoiceStatus,
     ) -> Result<Self> {
         eprintln!("[native-voice] active — WASAPI IAudioClient3 capture/playback + Opus + UDP");
         let playback = Arc::new(NativePlayback::start(output_device)?);
@@ -95,6 +96,11 @@ impl NativeVoice {
         let mut denoiser = DenoiseState::new();
         let mut ns_in: Vec<f32> = Vec::with_capacity(NS_FRAME * 2);
         let mut ns_out: Vec<f32> = Vec::new();
+        // Speaking indicator: on when the gate transmits, with ~200 ms hangover so
+        // it doesn't flicker between words.
+        let mut speaking = false;
+        let mut silent_frames = 0usize;
+        const SPEAKING_HANGOVER: usize = 40; // 40 × 5 ms = 200 ms
 
         let capture = NativeCapture::start(input_device, move |mono| {
             // Optional noise suppression before the Opus path. RNNoise expects
@@ -133,6 +139,21 @@ impl NativeVoice {
                     g.open()
                 };
                 let _ = evt_tx.send(SessionEvent::InputLevel(rms_db));
+
+                // Broadcast speaking transitions (with hangover) to the room.
+                if open {
+                    silent_frames = 0;
+                    if !speaking {
+                        speaking = true;
+                        voice_status.set_speaking(true);
+                    }
+                } else {
+                    silent_frames += 1;
+                    if speaking && silent_frames > SPEAKING_HANGOVER {
+                        speaking = false;
+                        voice_status.set_speaking(false);
+                    }
+                }
 
                 let pcm: &[f32] = if open { &frame } else { &silence };
                 packet[..2].copy_from_slice(&seq.to_be_bytes());

@@ -709,6 +709,7 @@ fn handle_signal(
         ServerMessage::VoiceState { .. }
         | ServerMessage::VoiceJoined { .. }
         | ServerMessage::VoiceLeft { .. }
+        | ServerMessage::VoicePeerUpdate { .. }
         | ServerMessage::ShareStarted { .. }
         | ServerMessage::ShareStopped { .. } => {}
     }

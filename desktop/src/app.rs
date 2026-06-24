@@ -371,6 +371,9 @@ impl AppModel {
             SessionEvent::VoiceLeft { user } => {
                 let _ = w.send(WorkspaceInput::VoiceLeft { user });
             }
+            SessionEvent::PeerVoiceState { user, muted, deafened, speaking } => {
+                let _ = w.send(WorkspaceInput::PeerVoiceState { user, muted, deafened, speaking });
+            }
             SessionEvent::ShareStarted { user } => {
                 let _ = w.send(WorkspaceInput::ShareStarted { user });
             }

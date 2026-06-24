@@ -28,6 +28,10 @@ pub struct Workspace {
     sharing: bool,
     online: Vec<PeerInfo>,
     voice: Vec<PeerInfo>,
+    /// Per-peer voice status (muted, deafened, speaking) for the member rail.
+    voice_state: HashMap<Uuid, (bool, bool, bool)>,
+    self_muted: bool,
+    self_deafened: bool,
     sharers: Vec<Uuid>,
     selected: Option<Uuid>,
     screens: Screens,
@@ -48,6 +52,7 @@ pub enum WorkspaceInput {
     VoiceRoster(Vec<PeerInfo>),
     VoiceJoined { user: Uuid, username: String },
     VoiceLeft { user: Uuid },
+    PeerVoiceState { user: Uuid, muted: bool, deafened: bool, speaking: bool },
     ShareStarted { user: Uuid },
     ShareStopped { user: Uuid },
     ChatHistory(Vec<ChatEntry>),
@@ -180,6 +185,9 @@ impl SimpleComponent for Workspace {
             sharing: false,
             online: Vec::new(),
             voice: Vec::new(),
+            voice_state: HashMap::new(),
+            self_muted: false,
+            self_deafened: false,
             sharers: Vec::new(),
             selected: None,
             screens,
@@ -230,7 +238,13 @@ impl SimpleComponent for Workspace {
                     self.voice.push(PeerInfo { user, username });
                 }
             }
-            WorkspaceInput::VoiceLeft { user } => self.voice.retain(|p| p.user != user),
+            WorkspaceInput::VoiceLeft { user } => {
+                self.voice.retain(|p| p.user != user);
+                self.voice_state.remove(&user);
+            }
+            WorkspaceInput::PeerVoiceState { user, muted, deafened, speaking } => {
+                self.voice_state.insert(user, (muted, deafened, speaking));
+            }
             WorkspaceInput::ShareStarted { user } => {
                 if !self.sharers.contains(&user) {
                     self.sharers.push(user);
@@ -257,6 +271,7 @@ impl SimpleComponent for Workspace {
                     let _ = sender.output(WorkspaceOutput::JoinVoice);
                 } else {
                     self.voice.clear();
+                    self.voice_state.clear();
                     self.sharing = false;
                     // Leaving the call clears the stage: stop watching anyone and
                     // drop their (now-frozen) frames so no black box lingers.
@@ -268,9 +283,12 @@ impl SimpleComponent for Workspace {
                 }
             }
             WorkspaceInput::Mute(b) => {
+                self.self_muted = b;
                 let _ = sender.output(WorkspaceOutput::Mute(b));
             }
             WorkspaceInput::Deafen(b) => {
+                self.self_deafened = b;
+                self.self_muted = b; // deafen mutes the mic too
                 let _ = sender.output(WorkspaceOutput::Deafen(b));
             }
             WorkspaceInput::OpenSharePicker => {
@@ -375,12 +393,28 @@ impl Workspace {
             rows.push(header("IN VOICE"));
             for (id, name) in &in_voice {
                 let is_self = *id == self.self_id;
-                let label = if is_self && self.sharing {
+                // Status icon (Discord-style): deafened > muted > speaking > idle.
+                let (muted, deafened, speaking) = if is_self {
+                    (self.self_muted, self.self_deafened, false)
+                } else {
+                    self.voice_state.get(id).copied().unwrap_or((false, false, false))
+                };
+                let status = if deafened {
+                    "🔇🎧" // deafened (also muted)
+                } else if muted {
+                    "🔇"
+                } else if speaking {
+                    "🗣️"
+                } else {
+                    "🔊"
+                };
+                let sharing_self = is_self && self.sharing;
+                let label = if sharing_self {
                     format!("🔴 {}{}", name, you(*id))
                 } else {
-                    format!("🔊 {}{}", name, you(*id))
+                    format!("{} {}{}", status, name, you(*id))
                 };
-                rows.push(member(label, true, is_self && self.sharing));
+                rows.push(member(label, true, sharing_self));
             }
         }
 
