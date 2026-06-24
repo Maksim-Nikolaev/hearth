@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Measure audio delay
+Comment=Drag OBS .mkv recordings here to measure mic->system audio delay
+Exec="/home/maksim/Desktop/work/hearth/scripts/measure/audio_delay.sh" %F
+Icon=audio-x-generic
+Terminal=true
+Categories=AudioVideo;Utility;
+MimeType=video/x-matroska;
