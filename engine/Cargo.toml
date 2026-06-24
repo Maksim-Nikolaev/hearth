@@ -44,6 +44,7 @@ windows = { version = "0.58", features = [
     "Win32_Media_Audio",
     "Win32_System_Com",
     "Win32_System_Threading",
+    "Win32_Security", # SECURITY_ATTRIBUTES in CreateEventW (IAudioClient3 spike)
 ] }
 
 # Spike-only: the X11 GPU-capture feasibility example (engine/examples/).

@@ -14,6 +14,12 @@ fn main() -> anyhow::Result<()> {
             println!("capture chain: {}", engine::capture::capture_chain());
             println!("selected encoder: {chosen:?}");
         }
+        #[cfg(target_os = "windows")]
+        "wasapi3" => {
+            // Phase 2 spike: IAudioClient3 low-latency loopback floor measurement.
+            let secs = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+            engine::audio::wasapi3::run_loopback(secs)?;
+        }
         "share" | "view" | "call" | "listen" => {
             let share = matches!(mode.as_str(), "share" | "call");
             let flow = if matches!(mode.as_str(), "call" | "listen") {

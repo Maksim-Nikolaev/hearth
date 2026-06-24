@@ -4,6 +4,11 @@ pub mod dsp;
 pub mod gate;
 pub mod monitor;
 
+// Phase 2 spike: WASAPI IAudioClient3 low-latency shared-mode loopback, to
+// measure the device floor the GStreamer `wasapi2` path can't reach.
+#[cfg(target_os = "windows")]
+pub mod wasapi3;
+
 /// Microphone capture source element for this platform. Linux/macOS use
 /// PulseAudio (`pulsesrc`); Windows uses WASAPI (`wasapi2src`). Both accept a
 /// `device` property whose value is the id returned by [`devices::list_devices`].
