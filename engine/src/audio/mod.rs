@@ -15,12 +15,14 @@ pub mod voicebench;
 #[cfg(target_os = "windows")]
 pub mod wasapi3;
 
-// Phase 2: native WASAPI capture/playback (replaces GStreamer wasapi2 on voice).
-#[cfg(target_os = "windows")]
+// Native low-latency voice device I/O: WASAPI on Windows, PipeWire on Linux.
+// Replaces GStreamer wasapi2/pulsesrc on the voice path.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod native;
 
-// Phase 2: native voice transport (NativeCapture+Opus+UDP+NativePlayback).
-#[cfg(target_os = "windows")]
+// Native voice transport (NativeCapture+Opus+UDP+NativePlayback). Platform-
+// independent; rides whichever device backend `native` selects per target.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod native_voice;
 
 /// Microphone capture source element for this platform. Linux/macOS use
