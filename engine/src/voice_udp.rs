@@ -71,8 +71,15 @@ impl VoiceUdpPeer {
             .field("encoding-name", "OPUS")
             .field("payload", VOICE_PT)
             .build();
+        // Allocate a free UDP port up front (bind/drop), then bind udpsrc to it.
+        // Avoids reading udpsrc's `used-port` after PLAYING (whose property type
+        // panicked, and a panic there can't unwind the live pipeline cleanly).
+        let local_port = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|s| s.local_addr())
+            .map(|a| a.port())
+            .map_err(|e| anyhow!("could not allocate a voice port: {e}"))?;
         let udpsrc = gst::ElementFactory::make("udpsrc")
-            .property("port", 0i32) // 0 = OS picks a free port; read back via used-port
+            .property("port", local_port as i32)
             .property("caps", &rtp_caps)
             .build()?;
         let jitter = gst::ElementFactory::make("rtpjitterbuffer")
@@ -151,19 +158,13 @@ impl VoiceUdpPeer {
             }
         }
 
-        // Go live so udpsrc binds; then read the actual port to advertise. On
-        // failure, set NULL first — a `udpsrc` left attached to the main context
-        // and then finalized aborts the process (GSocket finalize assertion).
+        // Go live. On failure, set NULL first — a `udpsrc` left attached to the
+        // main context and then finalized aborts the process (GSocket finalize
+        // assertion).
         if let Err(e) = pipeline.set_state(gst::State::Playing) {
             let _ = pipeline.set_state(gst::State::Null);
             let _ = pipeline.state(gst::ClockTime::from_seconds(2));
             return Err(anyhow!("voice pipeline failed to start: {e:?}"));
-        }
-        let local_port = udpsrc.property::<i32>("used-port") as u16;
-        if local_port == 0 {
-            let _ = pipeline.set_state(gst::State::Null);
-            let _ = pipeline.state(gst::ClockTime::from_seconds(2));
-            return Err(anyhow!("voice udpsrc did not bind a port"));
         }
 
         Ok(Self {
