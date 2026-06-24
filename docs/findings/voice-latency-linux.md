@@ -53,3 +53,9 @@ Reducing the NS/AEC frame cost, via either:
 - `self-hear` had lower confidence (0.90) — AEC likely partly cancels the
   self-monitor playback, smearing the correlation.
 - Single machine, ~one short clip per config; treat as order-of-magnitude (±1 frame).
+
+## Native PipeWire backend build deps
+
+The native pipewire-rs voice backend (`native_pw.rs`) needs `libpipewire-0.3-dev`
+at build time (pkg-config `libpipewire-0.3`). Without it the `pipewire`/`libspa`
+crates fail to build with "Package libpipewire-0.3 was not found".

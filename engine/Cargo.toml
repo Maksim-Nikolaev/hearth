@@ -40,6 +40,13 @@ webrtc-audio-processing = { version = "0.3", features = ["bundled"] }
 # where those paths fall back to platform stubs.
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["composite", "xfixes", "randr", "dri3"] }
+# Native low-latency voice I/O on Linux: a pipewire-rs capture/playback pair with
+# a pinned small quantum, replacing the GStreamer pulsesrc path (which drifts in
+# latency over a long session). Needs `libpipewire-0.3-dev` at build time.
+pipewire = "0.8"
+libspa = "0.8"
+# Zero-copy reinterpret of mapped PipeWire buffers as f32 slices.
+bytemuck = "1"
 
 # Windows global push-to-talk uses a WH_KEYBOARD_LL low-level keyboard hook;
 # per-app screenshare audio enumerates WASAPI audio sessions over COM.
