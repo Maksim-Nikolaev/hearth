@@ -170,6 +170,9 @@ where
 
     let mut on_frame = on_frame;
     let mut mono: Vec<f32> = Vec::with_capacity(SAMPLE_RATE as usize / 50);
+    // Periodic period log: confirms the quantum stays pinned (no drift) over a
+    // long session — the whole point of the native path.
+    let mut cb_count = 0u64;
 
     let _listener = stream
         .add_local_listener_with_user_data(CaptureState { channels: 1 })
@@ -197,6 +200,14 @@ where
                     let samples: &[f32] = bytemuck::cast_slice(&slice[..n]);
                     downmix_to_mono(samples, state.channels as usize, &mut mono);
                     if !mono.is_empty() {
+                        cb_count += 1;
+                        if cb_count % 200 == 0 {
+                            eprintln!(
+                                "[native] capture period: {} samples ({:.1} ms)",
+                                mono.len(),
+                                mono.len() as f64 / SAMPLE_RATE as f64 * 1000.0
+                            );
+                        }
                         on_frame(&mono);
                     }
                 }
@@ -313,6 +324,8 @@ fn run_playback(
 
     // Reused across callbacks so the RT render thread never allocates.
     let mut rendered: Vec<f32> = Vec::with_capacity(2048);
+    // Periodic backlog log: the deepest mixer lane == added playback latency.
+    let mut cyc = 0u64;
 
     let _listener = stream
         .add_local_listener_with_user_data(())
@@ -349,6 +362,17 @@ fn run_playback(
                 }
                 None => 0,
             };
+
+            cyc += 1;
+            if cyc % 200 == 0 {
+                let max = sources.lock().unwrap().values().map(|q| q.len()).max().unwrap_or(0);
+                if max > 0 {
+                    eprintln!(
+                        "[native] playback lane backlog: {:.1} ms",
+                        max as f64 / SAMPLE_RATE as f64 * 1000.0
+                    );
+                }
+            }
 
             let chunk = data.chunk_mut();
             *chunk.offset_mut() = 0;

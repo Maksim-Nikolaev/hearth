@@ -59,3 +59,20 @@ Reducing the NS/AEC frame cost, via either:
 The native pipewire-rs voice backend (`native_pw.rs`) needs `libpipewire-0.3-dev`
 at build time (pkg-config `libpipewire-0.3`). Without it the `pipewire`/`libspa`
 crates fail to build with "Package libpipewire-0.3 was not found".
+
+## Verifying the native PipeWire drift fix
+
+Native PipeWire is the default voice backend on Linux (best driver), with an
+automatic fall-through to the generic GStreamer path if it can't start. Settings →
+Voice shows "Audio engine: Native (PipeWire)" / "Generic (GStreamer)".
+
+1. Start a call. `[native-voice] active — PipeWire …` confirms the native path.
+2. Watch `[native] capture period` — it must stay near the pinned quantum
+   (`256/48000` ≈ 5.3 ms, or whatever `HEARTH_PW_QUANTUM` requests) and **not grow**
+   over a 30+ min session.
+3. Watch `[native] playback lane backlog` — must stay bounded (≲20 ms).
+4. Compare against the generic path with `HEARTH_GSTREAMER_VOICE=1`: the old
+   `pulsesrc` path drifts toward ~70 ms over a long session.
+
+`HEARTH_PW_QUANTUM=<num>/48000` (e.g. `480/48000`) sweeps the requested quantum on
+real hardware without a rebuild.
