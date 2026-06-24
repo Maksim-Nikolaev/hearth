@@ -262,3 +262,25 @@ unsafe fn playback_loop(
     CoUninitialize();
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use audiopus::{coder::Decoder, coder::Encoder, Application, Channels, SampleRate};
+
+    // De-risk: confirm the bundled libopus links and round-trips at runtime
+    // (10 ms mono @ 48 kHz, low-delay) — the codec the native voice path uses.
+    #[test]
+    fn opus_lowdelay_roundtrip() {
+        let mut enc = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::LowDelay).unwrap();
+        let mut dec = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+
+        let pcm: Vec<f32> = (0..480).map(|i| (i as f32 * 0.05).sin() * 0.25).collect();
+        let mut packet = vec![0u8; 4000];
+        let n = enc.encode_float(&pcm, &mut packet).unwrap();
+        assert!(n > 0 && n < 4000);
+
+        let mut out = vec![0.0f32; 480];
+        let frames = dec.decode_float(Some(&packet[..n]), &mut out, false).unwrap();
+        assert_eq!(frames, 480);
+    }
+}

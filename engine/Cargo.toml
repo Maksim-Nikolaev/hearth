@@ -16,6 +16,9 @@ serde_json = "1"
 anyhow = "1"
 uuid = { version = "1", features = ["v7", "serde"] }
 base64 = "0.22"
+# Native-path Opus codec (Phase 2): bundles + builds libopus, so the native
+# voice path doesn't depend on GStreamer's opusenc/opusdec.
+audiopus = "0.2"
 hearth-protocol = { path = "../protocol" }
 
 # Voice DSP (AEC/NS/AGC/VAD). The `bundled` build uses autotools and only links
