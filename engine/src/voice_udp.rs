@@ -23,15 +23,6 @@ use crate::flow_peer::audio_recv_sink;
 /// RTP payload type for the Opus voice stream (matches the legacy webrtc path).
 const VOICE_PT: i32 = 97;
 
-/// Jitter-buffer depth in ms (env `HEARTH_JITTER_MS`, default 20). Much smaller
-/// than webrtcbin's 200 — that headroom is the whole point of this transport.
-fn jitter_ms() -> u32 {
-    std::env::var("HEARTH_JITTER_MS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(20)
-}
-
 /// Best-effort local IPv4 the peer can reach us on. Uses the route to a public
 /// address to discover the LAN interface (no packet is sent). Falls back to
 /// loopback, which still works for same-machine testing.
@@ -83,7 +74,8 @@ impl VoiceUdpPeer {
             .property("caps", &rtp_caps)
             .build()?;
         let jitter = gst::ElementFactory::make("rtpjitterbuffer")
-            .property("latency", jitter_ms())
+            // Shared with the Voice-settings "Jitter buffer (ms)" slider.
+            .property("latency", crate::flow_peer::jitter_latency_ms())
             .property("do-lost", true)
             .build()?;
         let depay = gst::ElementFactory::make("rtpopusdepay").build()?;
@@ -117,7 +109,15 @@ impl VoiceUdpPeer {
             .build();
         let sconv = gst::ElementFactory::make("audioconvert").build()?;
         let sresample = gst::ElementFactory::make("audioresample").build()?;
-        let enc = gst::ElementFactory::make("opusenc").build()?;
+        // Lowest-latency Opus: restricted-lowdelay drops the SILK layer + variable
+        // lookahead (~26 ms → ~5 ms algorithmic delay); 10 ms frames match the DSP
+        // frame and halve packetization delay vs the 20 ms default. inband-fec
+        // lets the decoder conceal a lost packet from the next one.
+        let enc = gst::ElementFactory::make("opusenc")
+            .property_from_str("audio-type", "restricted-lowdelay")
+            .property_from_str("frame-size", "10")
+            .property("inband-fec", true)
+            .build()?;
         let pay = gst::ElementFactory::make("rtpopuspay")
             .property("pt", VOICE_PT as u32)
             .build()?;

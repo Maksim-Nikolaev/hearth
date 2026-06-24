@@ -53,7 +53,7 @@ pub(crate) fn jitter_latency_ms() -> u32 {
             let init = std::env::var("HEARTH_JITTER_MS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(40);
+                .unwrap_or(20);
             JITTER_MS.store(init, Ordering::Relaxed);
             init
         },
