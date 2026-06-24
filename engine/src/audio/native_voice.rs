@@ -56,19 +56,27 @@ pub struct NativeVoice {
 impl NativeVoice {
     /// Start the shared capture + playback. Mic frames are gated and Opus-encoded
     /// on the capture thread and sent to every registered peer.
-    pub fn new(gate: Arc<Mutex<Gate>>, evt_tx: UnboundedSender<SessionEvent>) -> Result<Self> {
+    pub fn new(
+        gate: Arc<Mutex<Gate>>,
+        evt_tx: UnboundedSender<SessionEvent>,
+        input_device: Option<String>,
+        output_device: Option<String>,
+    ) -> Result<Self> {
         eprintln!("[native-voice] active — WASAPI IAudioClient3 capture/playback + Opus + UDP");
-        let playback = Arc::new(NativePlayback::start()?);
+        let playback = Arc::new(NativePlayback::start(output_device)?);
         let targets: Arc<Mutex<Vec<Arc<SendTarget>>>> = Arc::new(Mutex::new(Vec::new()));
         let deaf = Arc::new(AtomicBool::new(false));
 
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::LowDelay)?;
         let mut acc: Vec<f32> = Vec::with_capacity(FRAME * 2);
+        // [seq: u16 BE | opus payload]. The 2-byte sequence lets the receiver
+        // detect loss and run Opus PLC, and drop late/duplicate packets.
         let mut packet = vec![0u8; 4000];
+        let mut seq: u16 = 0;
         let silence = [0.0f32; FRAME];
         let targets_cb = targets.clone();
 
-        let capture = NativeCapture::start(move |mono| {
+        let capture = NativeCapture::start(input_device, move |mono| {
             acc.extend_from_slice(mono);
             while acc.len() >= FRAME {
                 let frame: Vec<f32> = acc.drain(..FRAME).collect();
@@ -81,13 +89,15 @@ impl NativeVoice {
                 let _ = evt_tx.send(SessionEvent::InputLevel(rms_db));
 
                 let pcm: &[f32] = if open { &frame } else { &silence };
-                let n = match encoder.encode_float(pcm, &mut packet) {
+                packet[..2].copy_from_slice(&seq.to_be_bytes());
+                let n = match encoder.encode_float(pcm, &mut packet[2..]) {
                     Ok(n) => n,
                     Err(_) => continue,
                 };
+                seq = seq.wrapping_add(1);
                 for t in targets_cb.lock().unwrap().iter() {
                     if let Some(remote) = *t.remote.lock().unwrap() {
-                        let _ = t.sock.send_to(&packet[..n], remote);
+                        let _ = t.sock.send_to(&packet[..2 + n], remote);
                     }
                 }
             }
@@ -132,17 +142,38 @@ impl NativeVoice {
                 };
                 let mut buf = [0u8; 4000];
                 let mut out = vec![0.0f32; FRAME];
+                let mut expected: Option<u16> = None;
                 while !stop_thread.load(Ordering::Relaxed) {
-                    match sock.recv(&mut buf) {
-                        Ok(n) => {
-                            if let Ok(frames) = dec.decode_float(Some(&buf[..n]), &mut out, false) {
-                                if !deaf.load(Ordering::Relaxed) {
+                    let n = match sock.recv(&mut buf) {
+                        Ok(n) if n >= 3 => n,
+                        Ok(_) => continue,    // runt packet
+                        Err(_) => continue,   // read timeout — re-check stop
+                    };
+                    let seq = u16::from_be_bytes([buf[0], buf[1]]);
+                    let payload = &buf[2..n];
+                    let deaf_now = deaf.load(Ordering::Relaxed);
+
+                    if let Some(exp) = expected {
+                        let gap = seq.wrapping_sub(exp) as i16;
+                        if gap < 0 {
+                            continue; // late or duplicate — drop
+                        }
+                        // Conceal up to a bounded run of lost frames with Opus PLC.
+                        for _ in 0..(gap as usize).min(10) {
+                            if let Ok(frames) = dec.decode_float(None::<&[u8]>, &mut out, false) {
+                                if !deaf_now {
                                     playback.push(source_id, &out[..frames]);
                                 }
                             }
                         }
-                        Err(_) => continue, // read timeout — re-check stop
                     }
+
+                    if let Ok(frames) = dec.decode_float(Some(payload), &mut out, false) {
+                        if !deaf_now {
+                            playback.push(source_id, &out[..frames]);
+                        }
+                    }
+                    expected = Some(seq.wrapping_add(1));
                 }
             })?;
 

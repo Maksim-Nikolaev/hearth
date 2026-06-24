@@ -20,6 +20,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use windows::core::HSTRING;
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient3, IAudioRenderClient,
@@ -46,12 +47,23 @@ struct DeviceStream {
     period_frames: u32,
 }
 
-/// Open the default capture/render endpoint at the minimum shared engine period.
-/// Caller must have initialized COM on this thread.
-unsafe fn open_device(capture: bool) -> Result<DeviceStream> {
+/// Open a capture/render endpoint at the minimum shared engine period. `device`
+/// is a device id to honor (from the Settings picker); if it can't be resolved
+/// (id format differs from WASAPI's), fall back to the default endpoint. Caller
+/// must have initialized COM on this thread.
+unsafe fn open_device(capture: bool, device: Option<&str>) -> Result<DeviceStream> {
     let enumerator: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
     let dataflow = if capture { eCapture } else { eRender };
-    let dev = enumerator.GetDefaultAudioEndpoint(dataflow, eConsole)?;
+    let dev = match device.filter(|s| !s.is_empty()) {
+        Some(id) => match enumerator.GetDevice(&HSTRING::from(id)) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[native] device {id:?} not resolvable ({e}); using default endpoint");
+                enumerator.GetDefaultAudioEndpoint(dataflow, eConsole)?
+            }
+        },
+        None => enumerator.GetDefaultAudioEndpoint(dataflow, eConsole)?,
+    };
     let client: IAudioClient3 = dev.Activate(CLSCTX_ALL, None)?;
     let fmt = client.GetMixFormat()?;
 
@@ -81,9 +93,10 @@ pub struct NativeCapture {
 }
 
 impl NativeCapture {
-    /// Start capturing the default mic. `on_frame` runs on the capture thread
-    /// with mono f32 @ 48 kHz (downmixed) in ~device-period chunks (~10 ms).
-    pub fn start<F>(on_frame: F) -> Result<Self>
+    /// Start capturing `device` (or the default mic if `None`). `on_frame` runs
+    /// on the capture thread with mono f32 @ 48 kHz (downmixed) in ~device-period
+    /// chunks (~10 ms).
+    pub fn start<F>(device: Option<String>, on_frame: F) -> Result<Self>
     where
         F: FnMut(&[f32]) + Send + 'static,
     {
@@ -94,7 +107,7 @@ impl NativeCapture {
         let handle = std::thread::Builder::new()
             .name("native-capture".into())
             .spawn(move || {
-                let r = unsafe { capture_loop(&stop_thread, on_frame, &ready_tx) };
+                let r = unsafe { capture_loop(&stop_thread, device.as_deref(), on_frame, &ready_tx) };
                 if let Err(e) = r {
                     let _ = ready_tx.send(Err(e.to_string()));
                 }
@@ -119,6 +132,7 @@ impl Drop for NativeCapture {
 
 unsafe fn capture_loop<F>(
     stop: &AtomicBool,
+    device: Option<&str>,
     mut on_frame: F,
     ready: &mpsc::Sender<Result<(), String>>,
 ) -> Result<()>
@@ -126,7 +140,7 @@ where
     F: FnMut(&[f32]),
 {
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    let dev = open_device(true)?;
+    let dev = open_device(true, device)?;
     let svc: IAudioCaptureClient = dev.client.GetService()?;
     let ch = dev.channels;
     dev.client.Start()?;
@@ -182,7 +196,7 @@ pub struct NativePlayback {
 }
 
 impl NativePlayback {
-    pub fn start() -> Result<Self> {
+    pub fn start(device: Option<String>) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>> = Arc::new(Mutex::new(HashMap::new()));
         let stop_thread = stop.clone();
@@ -192,7 +206,7 @@ impl NativePlayback {
         let handle = std::thread::Builder::new()
             .name("native-playback".into())
             .spawn(move || {
-                let r = unsafe { playback_loop(&stop_thread, &sources_thread, &ready_tx) };
+                let r = unsafe { playback_loop(&stop_thread, device.as_deref(), &sources_thread, &ready_tx) };
                 if let Err(e) = r {
                     let _ = ready_tx.send(Err(e.to_string()));
                 }
@@ -235,11 +249,12 @@ impl Drop for NativePlayback {
 
 unsafe fn playback_loop(
     stop: &AtomicBool,
+    device: Option<&str>,
     sources: &Mutex<HashMap<u64, VecDeque<f32>>>,
     ready: &mpsc::Sender<Result<(), String>>,
 ) -> Result<()> {
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    let dev = open_device(false)?;
+    let dev = open_device(false, device)?;
     let svc: IAudioRenderClient = dev.client.GetService()?;
     let ch = dev.channels;
     let buf_frames = dev.client.GetBufferSize()?;

@@ -30,9 +30,9 @@ fn main() -> anyhow::Result<()> {
             // Phase 2: exercise the NativeCapture + NativePlayback abstractions as
             // a mic -> speaker loopback (the building blocks for the voice path).
             let secs = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(20);
-            let playback = std::sync::Arc::new(engine::audio::native::NativePlayback::start()?);
+            let playback = std::sync::Arc::new(engine::audio::native::NativePlayback::start(None)?);
             let pb = playback.clone();
-            let _capture = engine::audio::native::NativeCapture::start(move |mono| pb.push(0, mono))?;
+            let _capture = engine::audio::native::NativeCapture::start(None, move |mono| pb.push(0, mono))?;
             println!("[native] loopback up for {secs}s — mic -> speaker via NativeCapture/NativePlayback");
             std::thread::sleep(std::time::Duration::from_secs(secs));
             println!("[native] done.");

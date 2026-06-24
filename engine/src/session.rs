@@ -59,6 +59,13 @@ pub(crate) fn should_offer(me: Uuid, peer: Uuid) -> bool {
     me < peer
 }
 
+/// The native WASAPI+Opus voice transport is the default on Windows; set
+/// `HEARTH_GSTREAMER_VOICE=1` to fall back to the GStreamer `voice_udp` path.
+#[cfg(target_os = "windows")]
+pub(crate) fn native_voice_selected() -> bool {
+    std::env::var_os("HEARTH_GSTREAMER_VOICE").is_none()
+}
+
 /// How a local screenshare reaches viewers. P2P now (one offerer flow per
 /// viewer); a future SFU impl negotiates once with the backend instead, without
 /// changing the UI or `Session::start_share`.
@@ -626,15 +633,20 @@ impl Session {
 
     /// Offerer side of a UDP voice flow: build the transport, register the mic
     /// send, and hand the peer our `ip:port` (carried in the Offer's `sdp`).
-    /// Lazily start the native voice transport, returning it if `HEARTH_NATIVE_AUDIO`
-    /// selects it. Returns `None` (falling back to the GStreamer path) otherwise.
+    /// Lazily start the native voice transport, returning it when the native
+    /// backend is selected. Returns `None` (GStreamer path) when opted out.
     #[cfg(target_os = "windows")]
     fn ensure_native_voice(&mut self) -> Option<&mut crate::audio::native_voice::NativeVoice> {
-        if std::env::var_os("HEARTH_NATIVE_AUDIO").is_none() {
+        if !native_voice_selected() {
             return None;
         }
         if self.native_voice.is_none() {
-            match crate::audio::native_voice::NativeVoice::new(self.gate.clone(), self.evt_tx.clone()) {
+            match crate::audio::native_voice::NativeVoice::new(
+                self.gate.clone(),
+                self.evt_tx.clone(),
+                self.input_device.clone(),
+                self.output_device.clone(),
+            ) {
                 Ok(nv) => self.native_voice = Some(nv),
                 Err(e) => {
                     self.emit(SessionEvent::Error(format!("native voice init: {e}")));
@@ -647,7 +659,7 @@ impl Session {
 
     fn voice_offer(&mut self, peer: Uuid) -> Result<()> {
         #[cfg(target_os = "windows")]
-        if std::env::var_os("HEARTH_NATIVE_AUDIO").is_some() {
+        if native_voice_selected() {
             let endpoint = {
                 let nv = self
                     .ensure_native_voice()
@@ -674,7 +686,7 @@ impl Session {
     /// at them and reply with ours.
     fn voice_on_offer(&mut self, from: Uuid, endpoint: &str) {
         #[cfg(target_os = "windows")]
-        if std::env::var_os("HEARTH_NATIVE_AUDIO").is_some() {
+        if native_voice_selected() {
             let result: Result<String> = (|| {
                 let nv = self
                     .ensure_native_voice()

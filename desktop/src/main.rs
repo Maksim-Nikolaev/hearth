@@ -10,10 +10,10 @@ fn main() {
 
     eprintln!(
         "[hearth] voice backend: {}",
-        if std::env::var_os("HEARTH_NATIVE_AUDIO").is_some() {
-            "NATIVE (WASAPI IAudioClient3 + Opus)"
+        if std::env::var_os("HEARTH_GSTREAMER_VOICE").is_some() {
+            "GStreamer (HEARTH_GSTREAMER_VOICE set)"
         } else {
-            "GStreamer (set HEARTH_NATIVE_AUDIO=1 for native)"
+            "NATIVE (WASAPI IAudioClient3 + Opus) — default; set HEARTH_GSTREAMER_VOICE=1 to revert"
         }
     );
 
