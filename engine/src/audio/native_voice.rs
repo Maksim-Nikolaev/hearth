@@ -20,7 +20,7 @@ use audiopus::{coder::Decoder, coder::Encoder, Application, Channels, SampleRate
 use nnnoiseless::DenoiseState;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
@@ -58,8 +58,10 @@ pub struct NativeVoice {
     /// Temporary output silence (e.g. while Settings is open), independent of
     /// the user's deafen state.
     suspended: Arc<AtomicBool>,
-    /// RNNoise noise suppression on the capture path (toggled from Settings).
-    noise_suppress: Arc<AtomicBool>,
+    /// RNNoise wet/dry mix in permille (0 = off, 1000 = full). RNNoise itself is
+    /// binary, so the Off/Low/Moderate/High level blends denoised vs original to
+    /// give "how much to reduce".
+    ns_wet: Arc<AtomicU32>,
     next_source: u64,
 }
 
@@ -71,13 +73,13 @@ impl NativeVoice {
         evt_tx: UnboundedSender<SessionEvent>,
         input_device: Option<String>,
         output_device: Option<String>,
-        noise_suppress: bool,
+        ns_wet: u32,
     ) -> Result<Self> {
         eprintln!("[native-voice] active — WASAPI IAudioClient3 capture/playback + Opus + UDP");
         let playback = Arc::new(NativePlayback::start(output_device)?);
         let targets: Arc<Mutex<Vec<Arc<SendTarget>>>> = Arc::new(Mutex::new(Vec::new()));
         let deaf = Arc::new(AtomicBool::new(false));
-        let noise_suppress = Arc::new(AtomicBool::new(noise_suppress));
+        let ns_wet = Arc::new(AtomicU32::new(ns_wet));
 
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::LowDelay)?;
         let mut acc: Vec<f32> = Vec::with_capacity(FRAME * 2);
@@ -89,7 +91,7 @@ impl NativeVoice {
         let targets_cb = targets.clone();
 
         // NS pre-stage state (RNNoise works in 480-sample i16-range frames).
-        let ns_flag = noise_suppress.clone();
+        let ns_wet_cb = ns_wet.clone();
         let mut denoiser = DenoiseState::new();
         let mut ns_in: Vec<f32> = Vec::with_capacity(NS_FRAME * 2);
         let mut ns_out: Vec<f32> = Vec::new();
@@ -97,18 +99,24 @@ impl NativeVoice {
         let capture = NativeCapture::start(input_device, move |mono| {
             // Optional noise suppression before the Opus path. RNNoise expects
             // f32 in i16 amplitude range and fixed 480-sample frames; buffer to
-            // that, denoise, and feed the (denoised) samples to the Opus framing.
-            let feed: &[f32] = if ns_flag.load(Ordering::Relaxed) {
+            // that, denoise, and blend denoised vs original by the wet level.
+            let wet = ns_wet_cb.load(Ordering::Relaxed);
+            let feed: &[f32] = if wet > 0 {
+                let wetf = wet as f32 / 1000.0;
                 ns_in.extend_from_slice(mono);
                 ns_out.clear();
                 while ns_in.len() >= NS_FRAME {
+                    let raw: Vec<f32> = ns_in.drain(..NS_FRAME).collect();
                     let mut inp = [0.0f32; NS_FRAME];
                     let mut outp = [0.0f32; NS_FRAME];
-                    for (d, s) in inp.iter_mut().zip(ns_in.drain(..NS_FRAME)) {
+                    for (d, s) in inp.iter_mut().zip(raw.iter()) {
                         *d = s * 32768.0;
                     }
                     denoiser.process_frame(&mut outp, &inp);
-                    ns_out.extend(outp.iter().map(|x| (x / 32768.0).clamp(-1.0, 1.0)));
+                    for (i, o) in outp.iter().enumerate() {
+                        let den = (o / 32768.0).clamp(-1.0, 1.0);
+                        ns_out.push((wetf * den + (1.0 - wetf) * raw[i]).clamp(-1.0, 1.0));
+                    }
                 }
                 &ns_out
             } else {
@@ -148,14 +156,14 @@ impl NativeVoice {
             peers: HashMap::new(),
             deaf,
             suspended: Arc::new(AtomicBool::new(false)),
-            noise_suppress,
+            ns_wet,
             next_source: 0,
         })
     }
 
-    /// Toggle RNNoise noise suppression on the capture path (live).
-    pub fn set_noise_suppress(&self, on: bool) {
-        self.noise_suppress.store(on, Ordering::Relaxed);
+    /// Set the RNNoise wet/dry mix in permille (0 = off, 1000 = full). Live.
+    pub fn set_noise_wet(&self, wet: u32) {
+        self.ns_wet.store(wet, Ordering::Relaxed);
     }
 
     /// Add a peer: bind a recv socket, start its decode→playback lane, and return

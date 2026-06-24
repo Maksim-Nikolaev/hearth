@@ -66,6 +66,19 @@ pub(crate) fn native_voice_selected() -> bool {
     std::env::var_os("HEARTH_GSTREAMER_VOICE").is_none()
 }
 
+/// Map the noise-suppression level to an RNNoise wet/dry mix (permille). RNNoise
+/// is binary, so the level blends denoised vs original for "how much to reduce".
+#[cfg(target_os = "windows")]
+fn ns_wet_permille(level: crate::audio::dsp::NsLevel) -> u32 {
+    use crate::audio::dsp::NsLevel::*;
+    match level {
+        Off => 0,
+        Low => 500,
+        Moderate => 750,
+        High => 1000,
+    }
+}
+
 /// How a local screenshare reaches viewers. P2P now (one offerer flow per
 /// viewer); a future SFU impl negotiates once with the backend instead, without
 /// changing the UI or `Session::start_share`.
@@ -647,13 +660,13 @@ impl Session {
             return None;
         }
         if self.native_voice.is_none() {
-            let ns = !matches!(self.dsp_config.noise_suppression, crate::audio::dsp::NsLevel::Off);
+            let ns_wet = ns_wet_permille(self.dsp_config.noise_suppression);
             match crate::audio::native_voice::NativeVoice::new(
                 self.gate.clone(),
                 self.evt_tx.clone(),
                 self.input_device.clone(),
                 self.output_device.clone(),
-                ns,
+                ns_wet,
             ) {
                 Ok(nv) => self.native_voice = Some(nv),
                 Err(e) => {
@@ -1001,7 +1014,7 @@ impl Session {
         // Native path: drive RNNoise from the noise-suppression setting.
         #[cfg(target_os = "windows")]
         if let Some(nv) = self.native_voice.as_ref() {
-            nv.set_noise_suppress(!matches!(cfg.noise_suppression, crate::audio::dsp::NsLevel::Off));
+            nv.set_noise_wet(ns_wet_permille(cfg.noise_suppression));
         }
 
         if let Some(vc) = self.voice_capture.as_ref() {
