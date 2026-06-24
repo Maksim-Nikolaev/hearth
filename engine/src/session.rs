@@ -55,6 +55,9 @@ pub enum SessionEvent {
     /// the input meter. The capture already feeds the gate; the UI only displays.
     InputLevel(f32),
     Error(String),
+    /// Non-fatal diagnostic surfaced to the UI/log (e.g. realtime scheduling
+    /// unavailable, so latency may be unstable).
+    Warning(String),
 }
 
 /// Shared voice presence (mute / deafen / speaking) broadcast to the room on
@@ -642,7 +645,7 @@ impl Session {
         let session = Session {
             out_tx,
             voice_status,
-            evt_tx,
+            evt_tx: evt_tx.clone(),
             sink,
             self_id,
             self_name,
@@ -666,6 +669,12 @@ impl Session {
             _client: Some(conn.client),
             screen_source: None,
         };
+
+        if !crate::audio::rt::realtime_available() {
+            let _ = evt_tx.send(SessionEvent::Warning(
+                "audio not running with realtime priority; latency may be unstable".into(),
+            ));
+        }
 
         (session, conn.inbound, evt_rx)
     }

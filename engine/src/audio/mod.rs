@@ -5,6 +5,7 @@ pub mod dsp;
 pub mod gate;
 pub mod monitor;
 pub mod profile;
+pub mod rt;
 
 // Device-independent voice-path microbench (Opus + UDP round-trip). Cross-platform.
 pub mod voicebench;
