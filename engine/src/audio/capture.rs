@@ -232,9 +232,7 @@ fn build_mic_pipeline(
     let mut render_buf = vec![0.0f32; FRAME_SAMPLES];
     let silence = vec![0.0f32; FRAME_SAMPLES];
 
-    // Monotonic frame counter for deriving PTS. Advances by exactly 10 ms per
-    // processed frame so Opus/RTP timing is frame-derived, not arrival-derived.
-    let mut frame_count: u64 = 0;
+    // Each processed frame is exactly 10 ms; the peer appsrcs timestamp on push.
     let frame_duration = gst::ClockTime::from_mseconds(10);
 
     appsink.set_callbacks(
@@ -274,13 +272,10 @@ fn build_mic_pipeline(
 
                 let _ = evt.send(SessionEvent::InputLevel(rms_db));
 
-                let pts = frame_duration * frame_count;
-                frame_count += 1;
-
                 // Closed gate => push silence so each Opus/RTP stream keeps stable
                 // timing. Never skip the push.
                 let frame = if open { &mic[..] } else { &silence[..] };
-                push_to_peers(&peers, frame, pts, frame_duration);
+                push_to_peers(&peers, frame, frame_duration);
 
                 Ok(gst::FlowSuccess::Ok)
             })
@@ -324,13 +319,15 @@ pub(super) fn sample_to_f32(sample: &gst::Sample) -> Option<Vec<f32>> {
     Some(frame)
 }
 
-/// Encode a f32 frame as S16LE bytes into a fresh `gst::Buffer`, stamp it with
-/// an explicit PTS and duration, then push it into every registered peer appsrc.
-/// PTS is frame-derived so Opus/RTP timing stays stable regardless of callback jitter.
+/// Encode a f32 frame as S16LE bytes into a fresh `gst::Buffer`, stamp its
+/// duration, then push it into every registered peer appsrc. PTS is left unset
+/// on purpose: each peer appsrc has `do-timestamp=true` and stamps the buffer on
+/// its own (continuous) pipeline clock. A frame-derived PTS would instead reset
+/// to 0 whenever VoiceCapture is recreated (device/DSP change), which both
+/// breaks the latency probe and creates an RTP-timestamp discontinuity downstream.
 fn push_to_peers(
     peers: &Arc<Mutex<Vec<gst_app::AppSrc>>>,
     frame: &[f32],
-    pts: gst::ClockTime,
     duration: gst::ClockTime,
 ) {
     let byte_len = frame.len() * 2;
@@ -355,7 +352,6 @@ fn push_to_peers(
             f32_to_bytes(frame, map.as_mut_slice());
         }
 
-        buffer_mut.set_pts(pts);
         buffer_mut.set_duration(duration);
     }
 
