@@ -110,11 +110,36 @@ coexists with other apps:
 
 `IAudioClient3` is Windows-only; Linux is a different stack entirely (PipeWire/
 ALSA), and PipeWire is *better* suited — low-latency shared audio is what it's
-built for. `cpal` abstracts device I/O but uses the default `IAudioClient`/ALSA
-path and does **not** expose `IAudioClient3`/PipeWire low-latency modes, so the
-Phase-2 audio layer likely needs a thin per-platform shim (or a `cpal` fork)
-targeting `IAudioClient3` on Windows and a small PipeWire quantum on Linux. This
-is where the ~37.5 ms floor actually drops.
+built for.
+
+#### Confirmed crate landscape (researched 2026-06)
+- **`IAudioClient3`** delivers **~2.67 ms at 48 kHz in *shared* mode**, no lock;
+  the original `IAudioClient` is stuck at a **10 ms** shared minimum. You call
+  `GetSharedModeEnginePeriod` to discover the min period, then
+  `InitializeSharedAudioStream` with it.
+- **`cpal` does NOT support `IAudioClient3`** — it uses `IAudioClient` (10 ms
+  shared floor); its only low-latency answer is the **ASIO** backend, which is
+  exclusive/driver-dependent (rejected). PRs exist but aren't merged.
+- **The `wasapi` crate also lacks `IAudioClient3`** (base `IAudioClient` only) —
+  but it *does* expose `new_application_loopback_client` (process-specific
+  loopback), useful later for **per-app audio** (the OBS-source requirement).
+- **The [`windows`](https://crates.io/crates/windows) crate — already a Hearth
+  dependency — has the full `Windows::Win32::Media::Audio` projection including
+  `IAudioClient3`, `GetSharedModeEnginePeriod`, `InitializeSharedAudioStream`.**
+  So the lowest-latency Windows path is **raw WASAPI via the `windows` crate**,
+  no new dependency.
+- **Linux:** the [`pipewire`](https://crates.io/crates/pipewire) crate (safe
+  libpipewire bindings); set a small quantum (256 frames @ 48 kHz ≈ 5.3 ms;
+  2048 ≈ 42 ms). PipeWire is the modern low-latency shared path, coexists with
+  everything.
+
+**Conclusion: `cpal` can't reach the floor (caps at ~10 ms shared, or needs
+ASIO).** The no-compromise path is a thin per-platform audio I/O module:
+`IAudioClient3` via the `windows` crate on Windows, `pipewire` (small quantum)
+on Linux — behind one capture/playback trait. `cpal` remains the easy
+cross-platform fallback (~10 ms) and the eventual **mobile** path (Android
+AAudio / iOS). This is where the ~37.5 ms floor actually drops — toward ~3–5 ms
+of device latency.
 
 ## Recommendation: two phases
 
@@ -122,10 +147,15 @@ is where the ~37.5 ms floor actually drops.
    (Option A).** Biggest latency win for the least work; keeps the proven capture
    /DSP/encode. Gets us from 151 ms to ~30 ms now. Add `srtpenc`/`srtpdec` for
    encryption and STUN hole-punching for non-LAN.
-2. **Phase 2 — native `cpal` + `opus` + adaptive jitter buffer + custom UDP
-   (Option B), borrowing Mumble's packet/jitter design (Option C).** The true
-   state-of-the-art endpoint: full control, lowest latency, the foundation for
-   mobile. Migrate once Phase 1 proves the transport/signaling shape.
+2. **Phase 2 — native low-latency audio I/O + `opus` + adaptive jitter buffer +
+   custom UDP**, borrowing Mumble's packet/jitter design (Option C). Per the
+   confirmed crate research, the lowest-latency I/O is **not `cpal`** (10 ms
+   shared floor) but a thin per-platform module: **`IAudioClient3` via the
+   `windows` crate** on Windows (~2.67 ms shared) and the **`pipewire` crate**
+   (small quantum, ~5 ms) on Linux, behind one capture/playback trait. `cpal`
+   stays as the cross-platform fallback and the mobile path. This is the true
+   state-of-the-art endpoint — it's what drops the ~37.5 ms OS floor. Migrate
+   once Phase 1 proves the transport/signaling shape (it has: 92 ms, stable).
 
 ## Screenshare transport — Moonlight-class (~20–30 ms)
 

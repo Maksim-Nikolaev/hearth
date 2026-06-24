@@ -24,15 +24,24 @@ use uuid::Uuid;
 /// `now - PTS` (how long that audio has been in the pipeline up to this point)
 /// and logs a rolling average every ~2 s, so each hop is a visible number as it
 /// happens. The deltas between probe points are the per-stage cost.
-fn probe_hop(element: &gst::Element, label: &'static str, pipeline: &gst::Pipeline) {
+fn probe_hop(element: &gst::Element, label: &'static str, pipeline: &gst::Pipeline, config_for: Option<Uuid>) {
     let Some(pad) = element.static_pad("sink") else { return };
     let weak = pipeline.downgrade();
     let count = Arc::new(AtomicU64::new(0));
     let sum_us = Arc::new(AtomicU64::new(0));
+    // Query the configured latency once, on the first buffer — by then the
+    // pipeline has finished its async latency calculation (querying at startup
+    // returns live=false/min=0).
+    let config_done = Arc::new(std::sync::atomic::AtomicBool::new(config_for.is_none()));
 
     pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
         if let Some(gst::PadProbeData::Buffer(buf)) = info.data.as_ref() {
             if let (Some(pipeline), Some(pts)) = (weak.upgrade(), buf.pts()) {
+                if !config_done.swap(true, Ordering::Relaxed) {
+                    if let Some(target) = config_for {
+                        report_configured_latency(&pipeline, target);
+                    }
+                }
                 if let Some(now) = pipeline.current_running_time() {
                     if now >= pts {
                         sum_us.fetch_add((now - pts).useconds(), Ordering::Relaxed);
@@ -233,9 +242,9 @@ impl VoiceUdpPeer {
         }
 
         // Per-hop latency instrumentation (always on; ~one line / 2 s per hop).
-        report_configured_latency(&pipeline, target);
-        probe_hop(&udpsink, "voice send  (mic -> wire)", &pipeline);
-        probe_hop(&sink, "voice recv  (wire -> speaker, post-jitter)", &pipeline);
+        // The recv probe also logs the configured latency once it settles.
+        probe_hop(&udpsink, "voice send  (mic -> wire)", &pipeline, None);
+        probe_hop(&sink, "voice recv  (wire -> speaker, post-jitter)", &pipeline, Some(target));
 
         Ok(Self {
             pipeline,
