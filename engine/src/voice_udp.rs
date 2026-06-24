@@ -16,7 +16,53 @@ use anyhow::{anyhow, Result};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use uuid::Uuid;
+
+/// Attach a latency probe to an element's sink pad. For every buffer it computes
+/// `now - PTS` (how long that audio has been in the pipeline up to this point)
+/// and logs a rolling average every ~2 s, so each hop is a visible number as it
+/// happens. The deltas between probe points are the per-stage cost.
+fn probe_hop(element: &gst::Element, label: &'static str, pipeline: &gst::Pipeline) {
+    let Some(pad) = element.static_pad("sink") else { return };
+    let weak = pipeline.downgrade();
+    let count = Arc::new(AtomicU64::new(0));
+    let sum_us = Arc::new(AtomicU64::new(0));
+
+    pad.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+        if let Some(gst::PadProbeData::Buffer(buf)) = info.data.as_ref() {
+            if let (Some(pipeline), Some(pts)) = (weak.upgrade(), buf.pts()) {
+                if let Some(now) = pipeline.current_running_time() {
+                    if now >= pts {
+                        sum_us.fetch_add((now - pts).useconds(), Ordering::Relaxed);
+                        let n = count.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n % 200 == 0 {
+                            let avg_ms = sum_us.swap(0, Ordering::Relaxed) as f64 / 200.0 / 1000.0;
+                            count.store(0, Ordering::Relaxed);
+                            eprintln!("[latency] {label}: {avg_ms:.1} ms");
+                        }
+                    }
+                }
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+}
+
+/// Log the pipeline's GStreamer-computed configured latency (sum of element
+/// latencies — chiefly the jitter buffer + the audio sink).
+fn report_configured_latency(pipeline: &gst::Pipeline, target: Uuid) {
+    let mut q = gst::query::Latency::new();
+    if pipeline.query(q.query_mut()) {
+        let (live, min, max) = q.result();
+        eprintln!(
+            "[latency] voice {target}: configured live={live} min={:.1}ms max={}",
+            min.mseconds() as f64,
+            max.map(|m| format!("{:.1}ms", m.mseconds() as f64)).unwrap_or_else(|| "∞".into())
+        );
+    }
+}
 
 /// RTP payload type for the Opus voice stream (matches the legacy webrtc path).
 const VOICE_PT: i32 = 97;
@@ -185,6 +231,11 @@ impl VoiceUdpPeer {
             let _ = pipeline.state(gst::ClockTime::from_seconds(2));
             return Err(anyhow!("voice pipeline failed to start: {e:?}"));
         }
+
+        // Per-hop latency instrumentation (always on; ~one line / 2 s per hop).
+        report_configured_latency(&pipeline, target);
+        probe_hop(&udpsink, "voice send  (mic -> wire)", &pipeline);
+        probe_hop(&sink, "voice recv  (wire -> speaker, post-jitter)", &pipeline);
 
         Ok(Self {
             pipeline,

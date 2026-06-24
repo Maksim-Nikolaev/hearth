@@ -81,6 +81,41 @@ Candidate for the control plane, not the lowest-latency voice path.
 | D: str0m | ~80–150 ms | med | still WebRTC overhead |
 | E: QUIC datagrams | ~40–80 ms | med | better as control plane |
 
+## The real floor is the OS audio engine, not us (measured)
+
+Measuring with OBS (Mic track vs "Entire System" track, cross-correlated):
+- **"Listen to this device"** (mic → speakers, near-zero app logic): **~37.5 ms**.
+- That matches the public benchmark for a *normal Windows app's* click→sound
+  (~36 ms) — and even CS2 measures ~96 ms. It's the **Windows shared-mode audio
+  engine**, common to every app, not our pipeline.
+- ASIO/exclusive gets ~3 ms but **locks the device** — unacceptable for a voice
+  app that must coexist with the game's audio, the browser, system sounds. We do
+  not use exclusive mode.
+
+After moving voice off webrtcbin + Opus low-delay + play-on-arrival, our measured
+one-way latency went **151 → 124 → 92 ms** (stable, no drift over 3 min). So our
+own pipeline adds **~54 ms** on top of the ~37.5 ms OS floor: jitter buffer
+(20 ms, ~the stability floor), the device capture/render periods, Opus (~13 ms),
+and GStreamer `wasapi2` element overhead (~11 ms). The GStreamer path is near its
+floor here.
+
+### Breaking the OS floor — per platform (no exclusive lock)
+"Shared mode" is not one number. Each OS has a low-latency shared path that
+coexists with other apps:
+
+| | Low-latency shared (what we want) | Exclusive (rejected) |
+|---|---|---|
+| **Windows** | WASAPI **`IAudioClient3`** — ~3–10 ms engine periods, no lock | WASAPI exclusive / ASIO (~3 ms, locks device) |
+| **Linux** | **PipeWire** small quantum (~5 ms) — its design goal | JACK (~3 ms) |
+
+`IAudioClient3` is Windows-only; Linux is a different stack entirely (PipeWire/
+ALSA), and PipeWire is *better* suited — low-latency shared audio is what it's
+built for. `cpal` abstracts device I/O but uses the default `IAudioClient`/ALSA
+path and does **not** expose `IAudioClient3`/PipeWire low-latency modes, so the
+Phase-2 audio layer likely needs a thin per-platform shim (or a `cpal` fork)
+targeting `IAudioClient3` on Windows and a small PipeWire quantum on Linux. This
+is where the ~37.5 ms floor actually drops.
+
 ## Recommendation: two phases
 
 1. **Phase 1 — swap voice transport to raw RTP/Opus over UDP in GStreamer

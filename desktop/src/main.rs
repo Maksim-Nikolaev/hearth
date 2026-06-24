@@ -11,6 +11,7 @@ fn main() {
     setup_portable_runtime();
     ensure_gst_plugin_path();
     ensure_inprocess_plugin_scan();
+    enable_latency_tracer();
     gstreamer::init().expect("init gstreamer");
 
     let config = config::Config::load();
@@ -64,6 +65,19 @@ fn ensure_gst_plugin_path() {
     };
 
     std::env::set_var("GST_PLUGIN_PATH", combined);
+}
+
+/// Opt-in deep latency profiling: `HEARTH_LATENCY_TRACE=1` turns on GStreamer's
+/// built-in latency tracer (per-element and source→sink latency in the log).
+/// Must run before `gstreamer::init`. The always-on per-hop `[latency]` lines
+/// from the engine work without this; this is for element-level detail.
+fn enable_latency_tracer() {
+    if std::env::var_os("HEARTH_LATENCY_TRACE").is_some() {
+        std::env::set_var("GST_TRACERS", "latency(flags=pipeline+element)");
+        if std::env::var_os("GST_DEBUG").is_none() {
+            std::env::set_var("GST_DEBUG", "GST_TRACER:7");
+        }
+    }
 }
 
 /// When running from a self-contained package — a `lib\gstreamer-1.0` folder
