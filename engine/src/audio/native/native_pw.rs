@@ -4,7 +4,7 @@
 //! quantum (`node.latency`) keeps the capture period from drifting under load,
 //! which is the failure mode of the GStreamer pulsesrc path over a long session.
 
-use crate::audio::native::{MAX_LANE_SAMPLES, SAMPLE_RATE};
+use crate::audio::native::{FAR_END_CAP, MAX_LANE_SAMPLES, SAMPLE_RATE};
 use anyhow::{bail, Result};
 use pipewire as pw;
 use pw::{properties::properties, spa};
@@ -12,7 +12,6 @@ use spa::param::audio::{AudioFormat, AudioInfoRaw};
 use spa::pod::{serialize::PodSerializer, Object, Pod, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -224,18 +223,36 @@ where
 // ── Playback ──────────────────────────────────────────────────────────────────
 
 /// Running speaker playback with a built-in mixer: each source `push`es mono f32
-/// @ 48 kHz and the render thread sums them. Dropping it stops and joins.
-#[allow(dead_code)] // fields wired up in the stream implementation (Task 5)
+/// @ 48 kHz and the render thread sums them. Dropping it quits the loop and joins.
 pub struct NativePlayback {
-    stop: Arc<AtomicBool>,
+    quit_tx: pw::channel::Sender<()>,
     sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>>,
     far_end: Arc<Mutex<VecDeque<f32>>>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl NativePlayback {
-    pub fn start(_device: Option<String>) -> Result<Self> {
-        bail!("native_pw playback not yet implemented")
+    pub fn start(device: Option<String>) -> Result<Self> {
+        let sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let far_end: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let (quit_tx, quit_rx) = pw::channel::channel::<()>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+
+        let sources_t = sources.clone();
+        let far_t = far_end.clone();
+        let handle = std::thread::Builder::new()
+            .name("native-pw-playback".into())
+            .spawn(move || {
+                if let Err(e) = run_playback(device, sources_t, far_t, quit_rx, &ready_tx) {
+                    let _ = ready_tx.send(Err(e.to_string()));
+                }
+            })?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self { quit_tx, sources, far_end, handle: Some(handle) }),
+            Ok(Err(e)) => bail!("native pw playback init: {e}"),
+            Err(_) => bail!("native pw playback thread exited before init"),
+        }
     }
 
     /// The rendered speaker mix (AEC far-end reference).
@@ -257,11 +274,103 @@ impl NativePlayback {
 
 impl Drop for NativePlayback {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.quit_tx.send(());
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
+}
+
+fn run_playback(
+    device: Option<String>,
+    sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>>,
+    far_end: Arc<Mutex<VecDeque<f32>>>,
+    quit_rx: pw::channel::Receiver<()>,
+    ready: &mpsc::Sender<Result<(), String>>,
+) -> Result<()> {
+    pw::init();
+    let mainloop = pw::main_loop::MainLoop::new(None)?;
+    let context = pw::context::Context::new(&mainloop)?;
+    let core = context.connect(None)?;
+
+    let _quit = quit_rx.attach(mainloop.loop_(), {
+        let ml = mainloop.clone();
+        move |_| ml.quit()
+    });
+
+    let mut props = properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Playback",
+        *pw::keys::MEDIA_ROLE => "Communication",
+        *pw::keys::NODE_NAME => "hearth-voice-playback",
+        *pw::keys::NODE_LATENCY => latency_prop(),
+    };
+    if let Some(id) = device.filter(|s| !s.is_empty()) {
+        props.insert(*pw::keys::TARGET_OBJECT, id);
+    }
+
+    let stream = pw::stream::Stream::new(&core, "hearth-voice-playback", props)?;
+
+    // Reused across callbacks so the RT render thread never allocates.
+    let mut rendered: Vec<f32> = Vec::with_capacity(2048);
+
+    let _listener = stream
+        .add_local_listener_with_user_data(())
+        .process(move |stream, _| {
+            let Some(mut buffer) = stream.dequeue_buffer() else { return };
+            let datas = buffer.datas_mut();
+            let Some(data) = datas.first_mut() else { return };
+
+            let stride = std::mem::size_of::<f32>();
+            let n_frames = match data.data() {
+                Some(slice) => {
+                    let n = slice.len() / stride;
+                    let out: &mut [f32] = bytemuck::cast_slice_mut(&mut slice[..n * stride]);
+
+                    rendered.clear();
+                    let mut src = sources.lock().unwrap();
+                    for o in out.iter_mut() {
+                        // Mix: sum one sample from every source lane (silence on underrun).
+                        let mut v = 0.0f32;
+                        for q in src.values_mut() {
+                            if let Some(s) = q.pop_front() {
+                                v += s;
+                            }
+                        }
+                        v = crate::audio::native::soft_clip(v); // gentle limiter
+                        *o = v;
+                        rendered.push(v);
+                    }
+                    drop(src);
+
+                    // Tap the rendered mono as the AEC far-end reference.
+                    push_far(&mut far_end.lock().unwrap(), &rendered, FAR_END_CAP);
+                    n
+                }
+                None => 0,
+            };
+
+            let chunk = data.chunk_mut();
+            *chunk.offset_mut() = 0;
+            *chunk.stride_mut() = stride as _;
+            *chunk.size_mut() = (stride * n_frames) as _;
+        })
+        .register()?;
+
+    let values = audio_format_param(1);
+    let mut params = [Pod::from_bytes(&values).unwrap()];
+    stream.connect(
+        spa::utils::Direction::Output,
+        None,
+        pw::stream::StreamFlags::AUTOCONNECT
+            | pw::stream::StreamFlags::MAP_BUFFERS
+            | pw::stream::StreamFlags::RT_PROCESS,
+        &mut params,
+    )?;
+
+    let _ = ready.send(Ok(()));
+    mainloop.run();
+    Ok(())
 }
 
 #[cfg(test)]
