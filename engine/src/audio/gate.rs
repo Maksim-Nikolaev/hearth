@@ -18,7 +18,17 @@ pub struct Gate {
     /// Voice-activity sensitivity (dBFS). Tracks the level-bar handle in all
     /// modes so the mic-test monitor can gate by it regardless of activation mode.
     sensitivity_db: f32,
+    /// Debounced voice-activity state (hysteresis + hold), so the gate doesn't
+    /// chatter when the level hovers near the threshold.
+    voice_active: bool,
+    hold_remaining: u32,
 }
+
+/// Re-open at the sensitivity, but don't close until `HYSTERESIS_DB` below it.
+const HYSTERESIS_DB: f32 = 6.0;
+/// Stay open this many 5 ms frames after dropping below the close threshold
+/// (~200 ms), so gaps between words don't close the gate.
+const HOLD_FRAMES: u32 = 40;
 
 impl Gate {
     pub fn new(mode: ActivationMode) -> Gate {
@@ -34,6 +44,8 @@ impl Gate {
             last_rms_db: -120.0,
             last_vad: false,
             sensitivity_db,
+            voice_active: false,
+            hold_remaining: 0,
         }
     }
 
@@ -66,6 +78,22 @@ impl Gate {
     pub fn update_level(&mut self, rms_db: f32, vad: bool) {
         self.last_rms_db = rms_db;
         self.last_vad = vad;
+
+        // Debounce voice activity: open at the sensitivity, stay open within the
+        // hysteresis band, and only close after holding below it (kills both the
+        // threshold chatter and premature closes between words).
+        let open_th = self.sensitivity_db;
+        let close_th = self.sensitivity_db - HYSTERESIS_DB;
+        if rms_db >= open_th || vad {
+            self.voice_active = true;
+            self.hold_remaining = HOLD_FRAMES;
+        } else if self.voice_active && rms_db >= close_th {
+            self.hold_remaining = HOLD_FRAMES; // in-band: refresh hold
+        } else if self.hold_remaining > 0 {
+            self.hold_remaining -= 1;
+        } else {
+            self.voice_active = false;
+        }
     }
 
     /// True = transmit. Precedence: suspend > mute > ptt > voice-activity > always-on.
@@ -80,13 +108,13 @@ impl Gate {
     /// sensitivity handle. Threshold-based in every mode (so you can tune
     /// sensitivity by ear), and ignores mute / the Settings-open suspend.
     pub fn monitor_open(&self) -> bool {
-        self.last_rms_db >= self.sensitivity_db
+        self.voice_active
     }
 
     fn mode_open(&self) -> bool {
         match self.mode {
             ActivationMode::PushToTalk => self.ptt_held,
-            ActivationMode::Voice { threshold } => self.last_rms_db >= threshold || self.last_vad,
+            ActivationMode::Voice { .. } => self.voice_active,
             ActivationMode::AlwaysOn => true,
         }
     }

@@ -257,17 +257,19 @@ impl NativeMonitor {
     ) -> Result<Self> {
         let playback = std::sync::Arc::new(NativePlayback::start(output_device)?);
         let pb = playback.clone();
+        let mut mon_gain = 0.0f32;
         let capture = NativeCapture::start(input_device, move |mono| {
             let rms = rms_dbfs(mono);
             let _ = evt_tx.send(crate::session::SessionEvent::InputLevel(rms));
             let open = {
                 let mut g = gate.lock().unwrap();
                 g.update_level(rms, rms > -60.0);
-                g.monitor_open() // mode only — ignore mute / Settings suspend
+                g.monitor_open() // threshold (hysteresis+hold) — ignore mute/suspend
             };
-            if open {
-                pb.push(0, mono); // hear yourself per the activation mode
-            }
+            // Ramp in/out so crossing the threshold is click-free.
+            let mut out = mono.to_vec();
+            super::native_voice::ramp_gain(&mut out, &mut mon_gain, if open { 1.0 } else { 0.0 });
+            pb.push(0, &out);
         })?;
         Ok(Self { _capture: capture, _playback: playback })
     }

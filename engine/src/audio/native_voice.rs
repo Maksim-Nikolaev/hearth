@@ -96,7 +96,6 @@ impl NativeVoice {
         // detect loss and run Opus PLC, and drop late/duplicate packets.
         let mut packet = vec![0u8; 4000];
         let mut seq: u16 = 0;
-        let silence = [0.0f32; FRAME];
         let targets_cb = targets.clone();
 
         // NS pre-stage state (RNNoise works in 480-sample i16-range frames).
@@ -130,6 +129,12 @@ impl NativeVoice {
         let agc_enabled = Arc::new(AtomicBool::new(agc));
         let agc_cb = agc_enabled.clone();
         let mut agc_gain = 1.0f32;
+
+        // Gate de-click: smoothly ramp the applied gain in/out (~10 ms) so opening
+        // and closing the gate doesn't produce a click. Separate envelopes for the
+        // send path and the self-monitor (they gate on different decisions).
+        let mut send_gain = 0.0f32;
+        let mut mon_gain = 0.0f32;
 
         let capture = NativeCapture::start(input_device, move |mono| {
             // Voice activity detection on the raw mic (10 ms / 480-sample frames).
@@ -195,10 +200,14 @@ impl NativeVoice {
                 };
                 let _ = evt_tx.send(SessionEvent::InputLevel(rms_db));
 
-                // Mic test: hear yourself per the activation mode (ignores mute /
-                // the Settings-open suspend, which is why `mon_open`).
-                if self_monitor_cb.load(Ordering::Relaxed) && mon_open {
-                    mon_playback.push(SELF_MONITOR_LANE, &frame);
+                // Mic test: hear yourself, ramped in/out so crossing the threshold
+                // doesn't click. (ignores mute / the Settings-open suspend.)
+                if self_monitor_cb.load(Ordering::Relaxed) {
+                    let mut mon = frame.clone();
+                    ramp_gain(&mut mon, &mut mon_gain, if mon_open { 1.0 } else { 0.0 });
+                    mon_playback.push(SELF_MONITOR_LANE, &mon);
+                } else {
+                    mon_gain = 0.0;
                 }
 
                 // Broadcast speaking transitions (with hangover). "Speaking" =
@@ -220,9 +229,11 @@ impl NativeVoice {
                     }
                 }
 
-                let pcm: &[f32] = if open { &frame } else { &silence };
+                // Ramp the send gain in/out for a click-free open/close, then encode
+                // the (faded) frame — silence once fully closed.
+                ramp_gain(&mut frame, &mut send_gain, if open { 1.0 } else { 0.0 });
                 packet[..2].copy_from_slice(&seq.to_be_bytes());
-                let n = match encoder.encode_float(pcm, &mut packet[2..]) {
+                let n = match encoder.encode_float(&frame, &mut packet[2..]) {
                     Ok(n) => n,
                     Err(_) => continue,
                 };
@@ -390,6 +401,20 @@ fn local_ip() -> String {
         })
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
+/// Apply a per-sample gain to `buf`, ramping `gain` toward `target` (~10 ms full
+/// 0↔1 swing at 48 kHz) so the gate opens/closes without a click.
+pub(crate) fn ramp_gain(buf: &mut [f32], gain: &mut f32, target: f32) {
+    const STEP: f32 = 1.0 / 480.0;
+    for s in buf.iter_mut() {
+        if *gain < target {
+            *gain = (*gain + STEP).min(target);
+        } else if *gain > target {
+            *gain = (*gain - STEP).max(target);
+        }
+        *s *= *gain;
+    }
 }
 
 fn rms_dbfs(frame: &[f32]) -> f32 {
