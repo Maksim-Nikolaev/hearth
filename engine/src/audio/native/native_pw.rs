@@ -4,12 +4,43 @@
 //! quantum (`node.latency`) keeps the capture period from drifting under load,
 //! which is the failure mode of the GStreamer pulsesrc path over a long session.
 
-use crate::audio::native::MAX_LANE_SAMPLES;
+use crate::audio::native::{MAX_LANE_SAMPLES, SAMPLE_RATE};
 use anyhow::{bail, Result};
+use pipewire as pw;
+use pw::{properties::properties, spa};
+use spa::param::audio::{AudioFormat, AudioInfoRaw};
+use spa::pod::{serialize::PodSerializer, Object, Pod, Value};
 use std::collections::{HashMap, VecDeque};
+use std::io::Cursor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+
+/// Build the F32LE format param for `stream.connect`, requesting a fixed channel
+/// count (1 = mono) at 48 kHz; PipeWire inserts a converter from the device's
+/// native rate/layout.
+fn audio_format_param(channels: u32) -> Vec<u8> {
+    let mut info = AudioInfoRaw::new();
+    info.set_format(AudioFormat::F32LE);
+    info.set_rate(SAMPLE_RATE);
+    info.set_channels(channels);
+
+    let obj = Object {
+        type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+        id: spa::param::ParamType::EnumFormat.as_raw(),
+        properties: info.into(),
+    };
+
+    PodSerializer::serialize(Cursor::new(Vec::new()), &Value::Object(obj))
+        .unwrap()
+        .0
+        .into_inner()
+}
+
+/// The `node.latency` value from the env-tunable quantum (see [`quantum_prop`]).
+fn latency_prop() -> String {
+    quantum_prop(std::env::var("HEARTH_PW_QUANTUM").ok().as_deref())
+}
 
 // ── Pure helpers (unit-tested without a PipeWire server) ──────────────────────
 
@@ -58,31 +89,136 @@ pub(crate) fn quantum_prop(env: Option<&str>) -> String {
 
 // ── Capture ───────────────────────────────────────────────────────────────────
 
-/// Running mic capture. Dropping it stops and joins the capture thread.
-#[allow(dead_code)] // fields wired up in the stream implementation (Task 4)
+/// The negotiated channel count, shared from `param_changed` to `process`.
+struct CaptureState {
+    channels: u32,
+}
+
+/// Running mic capture. Dropping it quits the loop and joins the thread.
 pub struct NativeCapture {
-    stop: Arc<AtomicBool>,
+    quit_tx: pw::channel::Sender<()>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl NativeCapture {
-    /// Start capturing `device` (or the default mic if `None`). `on_frame` runs
-    /// on the PipeWire RT thread with mono f32 @ 48 kHz in fixed-quantum chunks.
-    pub fn start<F>(_device: Option<String>, _on_frame: F) -> Result<Self>
+    /// Start capturing `device` (or the PipeWire default source if `None`/empty).
+    /// `on_frame` runs on the PipeWire RT thread with mono f32 @ 48 kHz in
+    /// fixed-quantum chunks.
+    pub fn start<F>(device: Option<String>, on_frame: F) -> Result<Self>
     where
         F: FnMut(&[f32]) + Send + 'static,
     {
-        bail!("native_pw capture not yet implemented")
+        let (quit_tx, quit_rx) = pw::channel::channel::<()>();
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+
+        let handle = std::thread::Builder::new()
+            .name("native-pw-capture".into())
+            .spawn(move || {
+                if let Err(e) = run_capture(device, on_frame, quit_rx, &ready_tx) {
+                    let _ = ready_tx.send(Err(e.to_string()));
+                }
+            })?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self { quit_tx, handle: Some(handle) }),
+            Ok(Err(e)) => bail!("native pw capture init: {e}"),
+            Err(_) => bail!("native pw capture thread exited before init"),
+        }
     }
 }
 
 impl Drop for NativeCapture {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.quit_tx.send(());
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
+}
+
+fn run_capture<F>(
+    device: Option<String>,
+    on_frame: F,
+    quit_rx: pw::channel::Receiver<()>,
+    ready: &mpsc::Sender<Result<(), String>>,
+) -> Result<()>
+where
+    F: FnMut(&[f32]) + Send + 'static,
+{
+    pw::init();
+    let mainloop = pw::main_loop::MainLoop::new(None)?;
+    let context = pw::context::Context::new(&mainloop)?;
+    let core = context.connect(None)?;
+
+    // Quit the loop when `NativeCapture` drops (its `quit_tx` fires).
+    let _quit = quit_rx.attach(mainloop.loop_(), {
+        let ml = mainloop.clone();
+        move |_| ml.quit()
+    });
+
+    let mut props = properties! {
+        *pw::keys::MEDIA_TYPE => "Audio",
+        *pw::keys::MEDIA_CATEGORY => "Capture",
+        *pw::keys::MEDIA_ROLE => "Communication",
+        *pw::keys::NODE_NAME => "hearth-voice-capture",
+        *pw::keys::NODE_LATENCY => latency_prop(),
+    };
+    if let Some(id) = device.filter(|s| !s.is_empty()) {
+        props.insert(*pw::keys::TARGET_OBJECT, id);
+    }
+
+    let stream = pw::stream::Stream::new(&core, "hearth-voice-capture", props)?;
+
+    let mut on_frame = on_frame;
+    let mut mono: Vec<f32> = Vec::with_capacity(SAMPLE_RATE as usize / 50);
+
+    let _listener = stream
+        .add_local_listener_with_user_data(CaptureState { channels: 1 })
+        .param_changed(|_, state, id, param| {
+            let Some(param) = param else { return };
+            if id != pw::spa::param::ParamType::Format.as_raw() {
+                return;
+            }
+            let mut info = AudioInfoRaw::new();
+            if info.parse(param).is_ok() {
+                state.channels = info.channels().max(1);
+            }
+        })
+        .process(move |stream, state| {
+            while let Some(mut buffer) = stream.dequeue_buffer() {
+                let datas = buffer.datas_mut();
+                let Some(data) = datas.first_mut() else { continue };
+                let n_bytes = data.chunk().size() as usize;
+                if n_bytes == 0 {
+                    continue;
+                }
+                if let Some(slice) = data.data() {
+                    // Truncate to a whole number of f32 samples before casting.
+                    let n = n_bytes.min(slice.len()) & !3;
+                    let samples: &[f32] = bytemuck::cast_slice(&slice[..n]);
+                    downmix_to_mono(samples, state.channels as usize, &mut mono);
+                    if !mono.is_empty() {
+                        on_frame(&mono);
+                    }
+                }
+            }
+        })
+        .register()?;
+
+    let values = audio_format_param(1);
+    let mut params = [Pod::from_bytes(&values).unwrap()];
+    stream.connect(
+        spa::utils::Direction::Input,
+        None,
+        pw::stream::StreamFlags::AUTOCONNECT
+            | pw::stream::StreamFlags::MAP_BUFFERS
+            | pw::stream::StreamFlags::RT_PROCESS,
+        &mut params,
+    )?;
+
+    let _ = ready.send(Ok(()));
+    mainloop.run();
+    Ok(())
 }
 
 // ── Playback ──────────────────────────────────────────────────────────────────

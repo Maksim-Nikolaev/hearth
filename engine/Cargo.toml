@@ -42,9 +42,10 @@ webrtc-audio-processing = { version = "0.3", features = ["bundled"] }
 x11rb = { version = "0.13", features = ["composite", "xfixes", "randr", "dri3"] }
 # Native low-latency voice I/O on Linux: a pipewire-rs capture/playback pair with
 # a pinned small quantum, replacing the GStreamer pulsesrc path (which drifts in
-# latency over a long session). Needs `libpipewire-0.3-dev` at build time.
-pipewire = "0.8"
-libspa = "0.8"
+# latency over a long session). Needs `libpipewire-0.3-dev` at build time. The
+# `v0_3_65` feature unlocks `target.object` device selection + `WritableDict`
+# (system libpipewire is 1.6.2, well past 0.3.65).
+pipewire = { version = "0.8", features = ["v0_3_65"] }
 # Zero-copy reinterpret of mapped PipeWire buffers as f32 slices.
 bytemuck = "1"
 
