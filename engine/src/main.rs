@@ -14,6 +14,11 @@ fn main() -> anyhow::Result<()> {
             println!("capture chain: {}", engine::capture::capture_chain());
             println!("selected encoder: {chosen:?}");
         }
+        "voicebench" => {
+            // Device-independent: pure Opus + UDP software latency, no audio device.
+            let secs = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(1.0);
+            engine::audio::voicebench::run(secs)?;
+        }
         #[cfg(target_os = "windows")]
         "wasapi3" => {
             // Phase 2 spike: IAudioClient3 low-latency loopback floor measurement.

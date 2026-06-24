@@ -4,6 +4,9 @@ pub mod dsp;
 pub mod gate;
 pub mod monitor;
 
+// Device-independent voice-path microbench (Opus + UDP round-trip). Cross-platform.
+pub mod voicebench;
+
 // Phase 2 spike: WASAPI IAudioClient3 low-latency shared-mode loopback, to
 // measure the device floor the GStreamer `wasapi2` path can't reach.
 #[cfg(target_os = "windows")]
