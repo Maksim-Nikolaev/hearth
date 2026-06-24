@@ -92,12 +92,25 @@ Measuring with OBS (Mic track vs "Entire System" track, cross-correlated):
   app that must coexist with the game's audio, the browser, system sounds. We do
   not use exclusive mode.
 
-After moving voice off webrtcbin + Opus low-delay + play-on-arrival, our measured
-one-way latency went **151 → 124 → 92 ms** (stable, no drift over 3 min). So our
-own pipeline adds **~54 ms** on top of the ~37.5 ms OS floor: jitter buffer
-(20 ms, ~the stability floor), the device capture/render periods, Opus (~13 ms),
-and GStreamer `wasapi2` element overhead (~11 ms). The GStreamer path is near its
-floor here.
+After moving voice off webrtcbin + Opus low-delay + play-on-arrival + a 20 ms
+(vs 40 ms) jitter default, measured one-way latency went **151 → 124 → 92 →
+~74.6 ms** (clean run: 3 clips, 0.999 corr, ±0.1 ms; stable, no drift). **This is
+the GStreamer path's floor.** Per-hop probes: send (mic→wire) ~15 ms, recv
+(wire→speaker, post-jitter) ~6 ms; the rest is the two WASAPI device crossings.
+
+Two findings that close out the GStreamer path:
+- **Jitter buffer is NOT a latency lever here.** Sweeping it 0→80 ms left the
+  measured delay flat (~74–82 ms). With the `sync=false` (play-on-arrival) sink
+  and zero localhost jitter, the buffer never actually holds — its nominal
+  `latency` isn't realized. It's a *stability* knob for real networks, not a
+  latency one. (`rtpjitterbuffer` also only honours `latency` at construction, so
+  it can't be tuned live — the Settings "Apply to active call" button rebuilds
+  the voice transports to apply a new value.)
+- **`appsrc do-timestamp` is a trap: +60 ms.** Stamping on push captures the
+  appsink callback's burst jitter, which the receiver's buffer absorbs. Keep the
+  frame-derived (perfectly 10 ms-paced) PTS in `VoiceCapture`.
+
+So the only remaining lever is the ~37 ms OS device floor → Phase 2 below.
 
 ### Breaking the OS floor — per platform (no exclusive lock)
 "Shared mode" is not one number. Each OS has a low-latency shared path that
