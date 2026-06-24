@@ -144,6 +144,17 @@ impl Component for SettingsWindow {
         spk_dropdown.set_hexpand(true);
         root_box.append(&hrow("Speaker", 140, &spk_dropdown));
 
+        let device_hint = gtk::Label::new(Some(
+            "ℹ For lowest latency, set your mic & speaker to 48000 Hz in Windows Sound \
+             settings (Properties → Advanced). Other rates work but add a little latency.",
+        ));
+        device_hint.set_xalign(0.0);
+        device_hint.set_wrap(true);
+        device_hint.add_css_class("dim-label");
+        device_hint.set_margin_top(4);
+        device_hint.set_margin_bottom(4);
+        root_box.append(&device_hint);
+
         // Volume section
         root_box.append(&section_label("VOLUME"));
 
