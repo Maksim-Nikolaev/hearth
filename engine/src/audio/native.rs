@@ -320,6 +320,19 @@ impl NativeMonitor {
     }
 }
 
+/// Gentle limiter for the summed mix: identity up to ±0.95, then a smooth tanh
+/// knee asymptoting to ±1.0. Avoids the harsh square-wave distortion of a
+/// brick-wall clamp (which also drives the acoustic echo loop harder).
+pub(crate) fn soft_clip(x: f32) -> f32 {
+    const T: f32 = 0.95;
+    let a = x.abs();
+    if a <= T {
+        x
+    } else {
+        x.signum() * (T + (1.0 - T) * ((a - T) / (1.0 - T)).tanh())
+    }
+}
+
 fn rms_dbfs(frame: &[f32]) -> f32 {
     if frame.is_empty() {
         return -120.0;
@@ -391,7 +404,7 @@ unsafe fn playback_loop(
                         v += s;
                     }
                 }
-                v = v.clamp(-1.0, 1.0); // guard against summed clipping
+                v = soft_clip(v); // gentle limiter, not a brick-wall clip
                 for c in 0..ch {
                     out[f * ch + c] = v; // mono -> all channels
                 }

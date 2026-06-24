@@ -252,7 +252,7 @@ impl NativeVoice {
                         agc_gain += 0.05 * (1.0 - agc_gain);
                     }
                     for s in frame.iter_mut() {
-                        *s = (*s * agc_gain).clamp(-1.0, 1.0);
+                        *s = crate::audio::native::soft_clip(*s * agc_gain);
                     }
                 }
 
