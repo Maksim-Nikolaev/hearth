@@ -440,6 +440,10 @@ pub struct Session {
     /// Standalone loopback monitor for the Settings mic-test. Runs only when
     /// NOT in a call; `start_mic_test`/`stop_mic_test` gate it.
     mic_monitor: Option<Monitor>,
+    /// Native (WASAPI) mic-test monitor, used in place of `mic_monitor` when the
+    /// native voice backend is selected.
+    #[cfg(target_os = "windows")]
+    native_monitor: Option<crate::audio::native::NativeMonitor>,
     /// Software activation gate, shared with the capture callback thread.
     gate: Arc<Mutex<Gate>>,
     dsp_config: DspConfig,
@@ -547,6 +551,8 @@ impl Session {
             native_voice: None,
             voice_capture: None,
             mic_monitor: None,
+            #[cfg(target_os = "windows")]
+            native_monitor: None,
             gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
             dsp_config: default_dsp_config(),
             input_device: None,
@@ -1137,6 +1143,22 @@ impl Session {
 
         self.mic_monitor = None;
 
+        // Native backend: loopback via WASAPI + the shared gate (so PTT / voice
+        // activity behave like a real call), with live level metering.
+        #[cfg(target_os = "windows")]
+        if native_voice_selected() {
+            match crate::audio::native::NativeMonitor::start(
+                self.gate.clone(),
+                self.evt_tx.clone(),
+                self.input_device.clone(),
+                self.output_device.clone(),
+            ) {
+                Ok(m) => self.native_monitor = Some(m),
+                Err(e) => self.emit(SessionEvent::Error(format!("mic test: {e}"))),
+            }
+            return;
+        }
+
         match Monitor::start(
             self.input_device.clone(),
             self.output_device.clone(),
@@ -1151,6 +1173,10 @@ impl Session {
     /// Stop the mic-test loopback. No-op if not running.
     pub fn stop_mic_test(&mut self) {
         self.mic_monitor = None;
+        #[cfg(target_os = "windows")]
+        {
+            self.native_monitor = None;
+        }
     }
 
     /// Rebuild the shared capture with the current devices/config, re-registering
@@ -1307,6 +1333,8 @@ mod tests {
                 native_voice: None,
                 voice_capture: None,
                 mic_monitor: None,
+                #[cfg(target_os = "windows")]
+                native_monitor: None,
                 gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
                 dsp_config: default_dsp_config(),
                 input_device: None,

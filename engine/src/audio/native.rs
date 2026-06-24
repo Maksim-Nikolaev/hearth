@@ -238,6 +238,54 @@ impl NativePlayback {
     }
 }
 
+// ── Mic test monitor ─────────────────────────────────────────────────────────
+
+/// Mic → your own speakers loopback for the Settings mic test: captures the mic,
+/// emits the input level, and plays it back **only when the activation gate is
+/// open** (so PTT / voice-activity behave exactly like a real call). Drop to stop.
+pub struct NativeMonitor {
+    _capture: NativeCapture,
+    _playback: std::sync::Arc<NativePlayback>,
+}
+
+impl NativeMonitor {
+    pub fn start(
+        gate: Arc<std::sync::Mutex<crate::audio::gate::Gate>>,
+        evt_tx: tokio::sync::mpsc::UnboundedSender<crate::session::SessionEvent>,
+        input_device: Option<String>,
+        output_device: Option<String>,
+    ) -> Result<Self> {
+        let playback = std::sync::Arc::new(NativePlayback::start(output_device)?);
+        let pb = playback.clone();
+        let capture = NativeCapture::start(input_device, move |mono| {
+            let rms = rms_dbfs(mono);
+            let _ = evt_tx.send(crate::session::SessionEvent::InputLevel(rms));
+            let open = {
+                let mut g = gate.lock().unwrap();
+                g.update_level(rms, rms > -60.0);
+                g.open()
+            };
+            if open {
+                pb.push(0, mono); // hear yourself only when the gate transmits
+            }
+        })?;
+        Ok(Self { _capture: capture, _playback: playback })
+    }
+}
+
+fn rms_dbfs(frame: &[f32]) -> f32 {
+    if frame.is_empty() {
+        return -120.0;
+    }
+    let sum: f32 = frame.iter().map(|s| s * s).sum();
+    let rms = (sum / frame.len() as f32).sqrt();
+    if rms <= 1e-7 {
+        -120.0
+    } else {
+        20.0 * rms.log10()
+    }
+}
+
 impl Drop for NativePlayback {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
