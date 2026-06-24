@@ -216,7 +216,9 @@ fn build_mic_pipeline(
         .name("cap")
         .caps(&pcm_caps())
         .sync(false)
-        .max_buffers(4)
+        // Pull the newest mic frame with no queue depth — any backlog here is
+        // pure added mouth-to-ear latency. drop=true keeps it newest-wins.
+        .max_buffers(1)
         .drop(true)
         .build();
 
