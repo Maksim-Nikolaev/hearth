@@ -43,7 +43,10 @@ fn probe_hop(element: &gst::Element, label: &'static str, pipeline: &gst::Pipeli
                     }
                 }
                 if let Some(now) = pipeline.current_running_time() {
-                    if now >= pts {
+                    // Skip the artifact where the frame-derived PTS timeline and
+                    // the pipeline clock are offset (VoiceCapture restarted under
+                    // a live pipeline): a real hop is never seconds long.
+                    if now >= pts && (now - pts).mseconds() < 2000 {
                         sum_us.fetch_add((now - pts).useconds(), Ordering::Relaxed);
                         let n = count.fetch_add(1, Ordering::Relaxed) + 1;
                         if n % 200 == 0 {
@@ -181,12 +184,11 @@ impl VoiceUdpPeer {
             .caps(&pcm_caps)
             .is_live(true)
             .format(gst::Format::Time)
-            // Timestamp on the pipeline clock, not VoiceCapture's frame counter.
-            // The counter resets to 0 on every capture restart (device/DSP
-            // change) while this pipeline's clock keeps running — which both
-            // breaks the send latency probe and resets the outgoing RTP
-            // timestamps. do-timestamp keeps both continuous across restarts.
-            .do_timestamp(true)
+            // PTS is frame-derived in VoiceCapture (perfectly 10 ms-spaced).
+            // Do NOT use do-timestamp here: stamping on push captures the
+            // appsink callback's burst jitter, which the receiver's jitter
+            // buffer then absorbs — measured +60 ms. Clean paced timestamps keep
+            // it tight. (The send probe clamps the post-restart PTS artifact.)
             .build();
         let sconv = gst::ElementFactory::make("audioconvert").build()?;
         let sresample = gst::ElementFactory::make("audioresample").build()?;
@@ -249,10 +251,10 @@ impl VoiceUdpPeer {
         }
 
         // Per-hop latency instrumentation (always on; ~one line / 2 s per hop).
-        // Send probe measures the send pipeline (encode + pay); the mic capture
-        // + 10 ms DSP frame sit upstream of the appsrc and aren't included here.
-        // The recv probe also logs the configured latency once it settles.
-        probe_hop(&udpsink, "voice send  (encode -> wire)", &pipeline, None);
+        // Send PTS is the frame-capture time, so this is mic capture -> wire
+        // (DSP frame + encode + pay). The recv probe also logs the configured
+        // latency once it settles.
+        probe_hop(&udpsink, "voice send  (mic -> wire)", &pipeline, None);
         probe_hop(&sink, "voice recv  (wire -> speaker, post-jitter)", &pipeline, Some(target));
 
         Ok(Self {
