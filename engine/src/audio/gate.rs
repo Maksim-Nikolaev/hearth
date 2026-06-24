@@ -24,11 +24,10 @@ pub struct Gate {
     hold_remaining: u32,
 }
 
-/// Re-open at the sensitivity, but don't close until `HYSTERESIS_DB` below it.
-const HYSTERESIS_DB: f32 = 6.0;
-/// Stay open this many 5 ms frames after dropping below the close threshold
-/// (~200 ms), so gaps between words don't close the gate.
-const HOLD_FRAMES: u32 = 40;
+/// Stay open this many 5 ms frames after the level last cleared the threshold
+/// (~150 ms), so gaps between words don't close the gate and the boundary doesn't
+/// chatter — without holding the gate open *below* the threshold.
+const HOLD_FRAMES: u32 = 30;
 
 impl Gate {
     pub fn new(mode: ActivationMode) -> Gate {
@@ -79,16 +78,13 @@ impl Gate {
         self.last_rms_db = rms_db;
         self.last_vad = vad;
 
-        // Debounce voice activity: open at the sensitivity, stay open within the
-        // hysteresis band, and only close after holding below it (kills both the
-        // threshold chatter and premature closes between words).
-        let open_th = self.sensitivity_db;
-        let close_th = self.sensitivity_db - HYSTERESIS_DB;
-        if rms_db >= open_th || vad {
+        // Hold-gate: open the moment the level clears the threshold, then keep it
+        // open for HOLD_FRAMES after it last cleared. The hold both bridges word
+        // gaps and prevents boundary chatter (a single poke above re-arms it), but
+        // it never holds the gate open while the level sits below the threshold.
+        if rms_db >= self.sensitivity_db || vad {
             self.voice_active = true;
             self.hold_remaining = HOLD_FRAMES;
-        } else if self.voice_active && rms_db >= close_th {
-            self.hold_remaining = HOLD_FRAMES; // in-band: refresh hold
         } else if self.hold_remaining > 0 {
             self.hold_remaining -= 1;
         } else {
