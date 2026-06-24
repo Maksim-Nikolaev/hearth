@@ -68,7 +68,7 @@ pub struct SettingsWindowWidgets {
     agc_switch: gtk::Switch,
     vad_switch: gtk::Switch,
     activation_dropdown: gtk::DropDown,
-    ptt_entry: gtk::Entry,
+    ptt_btn: gtk::Button,
     jitter_spin: gtk::SpinButton,
     mic_test_btn: gtk::ToggleButton,
     // Signal handler IDs – stored so programmatic updates can be blocked.
@@ -200,18 +200,14 @@ impl Component for SettingsWindow {
             gtk::DropDown::from_strings(&["Voice activity", "Push-to-talk", "Always on"]);
         root_box.append(&hrow("Mode", 140, &activation_dropdown));
 
-        let ptt_entry = gtk::Entry::builder()
-            .placeholder_text("e.g. F12")
-            .hexpand(true)
-            .build();
-        let ptt_record_btn = gtk::Button::with_label("Record");
-        ptt_record_btn.set_tooltip_text(Some(
-            "Click, then press the key to bind (Space, F1–F12, Ctrl/Alt/Shift, letters, digits)",
+        // The bind field is itself the capture control: click it, then press the
+        // key or mouse button to bind. No free-text entry.
+        let ptt_btn = gtk::Button::with_label("Click to bind");
+        ptt_btn.set_hexpand(true);
+        ptt_btn.set_tooltip_text(Some(
+            "Click, then press a key or mouse button (incl. side buttons) to bind for push-to-talk",
         ));
-        let ptt_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        ptt_box.append(&ptt_entry);
-        ptt_box.append(&ptt_record_btn);
-        root_box.append(&hrow("PTT key", 140, &ptt_box));
+        root_box.append(&hrow("PTT bind", 140, &ptt_btn));
 
         // Network section
         root_box.append(&section_label("NETWORK"));
@@ -341,46 +337,65 @@ impl Component for SettingsWindow {
             })
         };
 
-        {
-            let s = sender.clone();
-            ptt_entry.connect_changed(move |e| {
-                let text = e.text().to_string();
-                let key = if text.is_empty() { None } else { Some(text) };
-                let _ = s.output(SettingsOutput::PttKey(key));
-            });
-        }
-
-        // PTT key capture: "Record" arms a one-shot listener; the next keypress
-        // (caught in the capture phase, before any widget) becomes the bind.
-        // `keyval.name()` is the X11/GDK key name the engine maps to a keysym —
-        // identical across X11/Wayland/Windows, so recording is cross-platform.
+        // PTT capture: clicking the field arms a one-shot listener; the next key
+        // OR mouse button (caught in the capture phase, before any widget) becomes
+        // the bind. `keyval.name()` is the X11/GDK key name (identical on
+        // X11/Wayland/Windows); mouse buttons are stored as "Mouse<N>" (X11-style:
+        // 8=back, 9=forward, 2=middle). The engine maps both to the platform.
         {
             let armed = std::rc::Rc::new(std::cell::Cell::new(false));
-            let key_ctl = gtk::EventControllerKey::new();
-            key_ctl.set_propagation_phase(gtk::PropagationPhase::Capture);
+
+            // Arm on click.
             {
                 let armed = armed.clone();
-                let entry = ptt_entry.clone();
-                let btn = ptt_record_btn.clone();
+                let btn = ptt_btn.clone();
+                ptt_btn.connect_clicked(move |_| {
+                    armed.set(true);
+                    btn.set_label("Press a key or mouse button…");
+                });
+            }
+
+            // Keyboard capture.
+            {
+                let key_ctl = gtk::EventControllerKey::new();
+                key_ctl.set_propagation_phase(gtk::PropagationPhase::Capture);
+                let armed = armed.clone();
+                let btn = ptt_btn.clone();
+                let s = sender.clone();
                 key_ctl.connect_key_pressed(move |_, keyval, _, _| {
                     if !armed.get() {
                         return gtk::glib::Propagation::Proceed;
                     }
                     if let Some(name) = keyval.name() {
-                        entry.set_text(name.as_str()); // emits PttKey via connect_changed
+                        btn.set_label(name.as_str());
+                        let _ = s.output(SettingsOutput::PttKey(Some(name.to_string())));
                     }
                     armed.set(false);
-                    btn.set_label("Record");
                     gtk::glib::Propagation::Stop
                 });
+                root_box.add_controller(key_ctl);
             }
-            root_box.add_controller(key_ctl);
 
-            let btn = ptt_record_btn.clone();
-            ptt_record_btn.connect_clicked(move |_| {
-                armed.set(true);
-                btn.set_label("Press a key…");
-            });
+            // Mouse-button capture (incl. side buttons). 0 = listen for any button.
+            {
+                let click = gtk::GestureClick::new();
+                click.set_button(0);
+                click.set_propagation_phase(gtk::PropagationPhase::Capture);
+                let armed = armed.clone();
+                let btn = ptt_btn.clone();
+                let s = sender.clone();
+                click.connect_pressed(move |gesture, _, _, _| {
+                    if !armed.get() {
+                        return; // not armed — let the click (e.g. arming click) pass
+                    }
+                    let name = format!("Mouse{}", gesture.current_button());
+                    btn.set_label(&name);
+                    let _ = s.output(SettingsOutput::PttKey(Some(name)));
+                    armed.set(false);
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                });
+                root_box.add_controller(click);
+            }
         }
 
         let jitter_value_id = {
@@ -430,7 +445,7 @@ impl Component for SettingsWindow {
             agc_switch,
             vad_switch,
             activation_dropdown,
-            ptt_entry,
+            ptt_btn,
             jitter_spin,
             mic_test_btn,
             mic_test_toggled_id,
@@ -579,7 +594,7 @@ impl SettingsWindow {
         };
         widgets.activation_dropdown.set_selected(act_idx);
 
-        widgets.ptt_entry.set_text(s.ptt_key.as_deref().unwrap_or(""));
+        widgets.ptt_btn.set_label(s.ptt_key.as_deref().unwrap_or("Click to bind"));
 
         widgets.input_vol_scale.unblock_signal(&widgets.input_vol_id);
         widgets.output_vol_scale.unblock_signal(&widgets.output_vol_id);

@@ -2,7 +2,7 @@ use crate::audio::capture::VoiceCapture;
 use crate::audio::dsp::{DspConfig, NsLevel};
 use crate::audio::monitor::Monitor;
 use crate::audio::gate::{ActivationMode, Gate};
-use crate::hotkey::{keysym_from_name, PttGrab};
+use crate::hotkey::PttGrab;
 use crate::flow::{Flow, VideoSink};
 use crate::flow_peer::{
     build_screen_send_appsrc_branch, build_voice_send_branch, link_screen_audio_recv,
@@ -1024,17 +1024,17 @@ impl Session {
 
         let Some(name) = key else { return };
 
-        let keysym = match keysym_from_name(&name) {
-            Some(k) => k,
+        let bind = match crate::hotkey::parse_bind(&name) {
+            Some(b) => b,
             None => {
-                self.emit(SessionEvent::Error(format!("unknown PTT key: {name}")));
+                self.emit(SessionEvent::Error(format!("unknown PTT bind: {name}")));
                 return;
             }
         };
 
         let gate = self.gate.clone();
 
-        match PttGrab::grab(keysym, move |held| {
+        match PttGrab::grab(bind, move |held| {
             gate.lock().unwrap().set_ptt_held(held);
         }) {
             Ok(grab) => self.ptt_grab = Some(grab),

@@ -65,6 +65,25 @@ fn vk_from_keysym(keysym: u32) -> Option<u32> {
     })
 }
 
+/// What a push-to-talk binding targets.
+#[derive(Clone, Copy, Debug)]
+pub enum PttBind {
+    /// A keyboard key, by X11 keysym.
+    Key(u32),
+    /// A mouse button, by X11-style number (1=left, 2=middle, 3=right,
+    /// 8=back/side, 9=forward/side).
+    Mouse(u8),
+}
+
+/// Parse a stored PTT name into a bind: `"Mouse<N>"` is a mouse button; any
+/// other string is a key name (see [`keysym_from_name`]).
+pub fn parse_bind(name: &str) -> Option<PttBind> {
+    if let Some(n) = name.strip_prefix("Mouse") {
+        return n.parse::<u8>().ok().map(PttBind::Mouse);
+    }
+    keysym_from_name(name).map(PttBind::Key)
+}
+
 /// X11 global push-to-talk grab. Linux/X11 only.
 #[cfg(target_os = "linux")]
 mod linux {
@@ -124,7 +143,15 @@ impl PttGrab {
     ///
     /// Spawns a background thread that polls for events every 8 ms. On `Drop`
     /// the grab is released and the thread is joined.
-    pub fn grab(keysym: u32, on_change: impl Fn(bool) + Send + 'static) -> Result<Self> {
+    pub fn grab(bind: super::PttBind, on_change: impl Fn(bool) + Send + 'static) -> Result<Self> {
+        // Mouse-button global grab on X11 (grab_button) / Wayland (GlobalShortcuts
+        // portal) is a follow-up; keys work today.
+        let keysym = match bind {
+            super::PttBind::Key(k) => k,
+            super::PttBind::Mouse(_) => {
+                return Err(anyhow!("mouse-button PTT is not yet supported on X11/Wayland"))
+            }
+        };
         let (conn, screen_num) = x11rb::connect(None)?;
 
         let root = conn.setup().roots[screen_num].root;
@@ -197,13 +224,32 @@ mod win {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, PostThreadMessageW, SetWindowsHookExW,
         TranslateMessage, UnhookWindowsHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, MSG,
-        WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_QUIT, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+        WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
     };
 
+    /// What the hook watches: a keyboard VK code, or an X11-style mouse button.
+    enum Target {
+        Key(u32),
+        Mouse(u8),
+    }
+
     struct HookState {
-        vk: u32,
+        target: Target,
         held: bool,
         on_change: Box<dyn Fn(bool) + Send>,
+    }
+
+    /// Toggle held state + fire the callback on a press/release edge.
+    fn edge(st: &mut HookState, down: bool) {
+        if down && !st.held {
+            st.held = true;
+            (st.on_change)(true);
+        } else if !down && st.held {
+            st.held = false;
+            (st.on_change)(false);
+        }
     }
 
     thread_local! {
@@ -212,27 +258,60 @@ mod win {
         static STATE: RefCell<Option<HookState>> = const { RefCell::new(None) };
     }
 
-    unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe extern "system" fn kbd_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
         if code == HC_ACTION as i32 {
             let kb = &*(lparam as *const KBDLLHOOKSTRUCT);
             STATE.with(|s| {
                 if let Some(st) = s.borrow_mut().as_mut() {
-                    if kb.vkCode == st.vk {
-                        let msg = wparam as u32;
-                        if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
-                            if !st.held {
-                                st.held = true;
-                                (st.on_change)(true);
+                    if let Target::Key(vk) = st.target {
+                        if kb.vkCode == vk {
+                            let msg = wparam as u32;
+                            if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
+                                edge(st, true);
+                            } else if msg == WM_KEYUP || msg == WM_SYSKEYUP {
+                                edge(st, false);
                             }
-                        } else if (msg == WM_KEYUP || msg == WM_SYSKEYUP) && st.held {
-                            st.held = false;
-                            (st.on_change)(false);
                         }
                     }
                 }
             });
         }
+        CallNextHookEx(0 as HHOOK, code, wparam, lparam)
+    }
 
+    unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+        if code == HC_ACTION as i32 {
+            let ms = &*(lparam as *const MSLLHOOKSTRUCT);
+            let msg = wparam as u32;
+            // HIWORD(mouseData): XBUTTON1 (1) = back/x11-8, XBUTTON2 (2) = fwd/x11-9.
+            let xbtn = || match (ms.mouseData >> 16) as u16 {
+                1 => 8u8,
+                2 => 9u8,
+                _ => 0u8,
+            };
+            let (btn, down): (u8, Option<bool>) = match msg {
+                WM_MBUTTONDOWN => (2, Some(true)),
+                WM_MBUTTONUP => (2, Some(false)),
+                WM_XBUTTONDOWN => (xbtn(), Some(true)),
+                WM_XBUTTONUP => (xbtn(), Some(false)),
+                WM_LBUTTONDOWN => (1, Some(true)),
+                WM_LBUTTONUP => (1, Some(false)),
+                WM_RBUTTONDOWN => (3, Some(true)),
+                WM_RBUTTONUP => (3, Some(false)),
+                _ => (0, None),
+            };
+            if let Some(down) = down {
+                STATE.with(|s| {
+                    if let Some(st) = s.borrow_mut().as_mut() {
+                        if let Target::Mouse(target) = st.target {
+                            if btn == target {
+                                edge(st, down);
+                            }
+                        }
+                    }
+                });
+            }
+        }
         CallNextHookEx(0 as HHOOK, code, wparam, lparam)
     }
 
@@ -242,9 +321,19 @@ mod win {
     }
 
     impl PttGrab {
-        pub fn grab(keysym: u32, on_change: impl Fn(bool) + Send + 'static) -> Result<Self> {
-            let vk = super::vk_from_keysym(keysym)
-                .ok_or_else(|| anyhow!("no Windows virtual-key mapping for keysym 0x{keysym:04X}"))?;
+        pub fn grab(bind: super::PttBind, on_change: impl Fn(bool) + Send + 'static) -> Result<Self> {
+            // Resolve to a hook id + callback + target before spawning the thread.
+            let (hook_id, proc, target) = match bind {
+                super::PttBind::Key(keysym) => {
+                    let vk = super::vk_from_keysym(keysym).ok_or_else(|| {
+                        anyhow!("no Windows virtual-key mapping for keysym 0x{keysym:04X}")
+                    })?;
+                    (WH_KEYBOARD_LL, kbd_hook_proc as unsafe extern "system" fn(_, _, _) -> _, Target::Key(vk))
+                }
+                super::PttBind::Mouse(btn) => {
+                    (WH_MOUSE_LL, mouse_hook_proc as unsafe extern "system" fn(_, _, _) -> _, Target::Mouse(btn))
+                }
+            };
 
             // The thread reports back its id (for WM_QUIT) or a setup error.
             let (tx, rx) = mpsc::channel::<Result<u32>>();
@@ -252,17 +341,17 @@ mod win {
             let handle = std::thread::spawn(move || {
                 STATE.with(|s| {
                     *s.borrow_mut() = Some(HookState {
-                        vk,
+                        target,
                         held: false,
                         on_change: Box::new(on_change),
                     });
                 });
 
                 let hook = unsafe {
-                    SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), GetModuleHandleW(std::ptr::null()), 0)
+                    SetWindowsHookExW(hook_id, Some(proc), GetModuleHandleW(std::ptr::null()), 0)
                 };
                 if hook == 0 as HHOOK {
-                    let _ = tx.send(Err(anyhow!("SetWindowsHookExW(WH_KEYBOARD_LL) failed")));
+                    let _ = tx.send(Err(anyhow!("SetWindowsHookExW failed")));
                     STATE.with(|s| *s.borrow_mut() = None);
                     return;
                 }
@@ -320,7 +409,7 @@ mod stub {
     }
 
     impl PttGrab {
-        pub fn grab(_keysym: u32, _on_change: impl Fn(bool) + Send + 'static) -> Result<Self> {
+        pub fn grab(_bind: super::PttBind, _on_change: impl Fn(bool) + Send + 'static) -> Result<Self> {
             Err(anyhow!(
                 "global push-to-talk is not yet implemented on this platform"
             ))
