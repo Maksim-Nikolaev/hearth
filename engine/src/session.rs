@@ -667,6 +667,27 @@ impl Session {
         }
     }
 
+    /// Rebuild the active voice transports so a new jitter-buffer depth takes
+    /// effect (`rtpjitterbuffer` only honours `latency` at construction). Touches
+    /// only voice — screenshare is left running. The caller re-offers to every
+    /// voice peer regardless of the usual offerer election, so the rebuild works
+    /// from either side; each peer's `voice_on_offer` replaces its transport.
+    pub fn reconnect_voice(&mut self) {
+        if self.voice_peers.is_empty() {
+            return;
+        }
+        eprintln!("[latency] rebuilding voice transports (jitter buffer now {} ms)", crate::flow_peer::jitter_latency_ms());
+        let peers: Vec<Uuid> = self.voice_peers.keys().copied().collect();
+        for p in &peers {
+            self.stop_voice(*p);
+        }
+        for p in peers {
+            if let Err(e) = self.voice_offer(p) {
+                self.emit(SessionEvent::Error(format!("voice reconnect: {e}")));
+            }
+        }
+    }
+
     /// Start sharing your screen to every current voice member, via the active
     /// `ScreenTransport` (P2P now). Also tells the server so others list you.
     ///

@@ -475,6 +475,16 @@ impl AppModel {
             SettingsOutput::Activation(a) => settings.activation = a,
             SettingsOutput::PttKey(k) => settings.ptt_key = k,
             SettingsOutput::JitterLatency(ms) => settings.jitter_latency_ms = ms,
+            SettingsOutput::ApplyJitter => {
+                // Store the value, then rebuild the active voice call so the new
+                // jitter depth takes effect (explicit apply, not per-tick).
+                self.config.save_settings(&settings);
+                if let Some(s) = self.session.as_mut() {
+                    s.set_jitter_latency_ms(settings.jitter_latency_ms);
+                    s.reconnect_voice();
+                }
+                return;
+            }
             SettingsOutput::MicTest(on) => {
                 if let Some(s) = self.session.as_mut() {
                     if on {

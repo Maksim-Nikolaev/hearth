@@ -21,6 +21,8 @@ pub enum SettingsOutput {
     Activation(ActivationKind),
     PttKey(Option<String>),
     JitterLatency(u32),
+    /// Apply the current jitter-buffer value to an active call (rebuild voice).
+    ApplyJitter,
     MicTest(bool),
     ResetDefaults,
 }
@@ -206,11 +208,16 @@ impl Component for SettingsWindow {
         root_box.append(&section_label("NETWORK"));
 
         // Jitter buffer depth (ms). Lower = less latency, more sensitive to
-        // network jitter. Applies live to active UDP voice (overwritten from the
-        // loaded config on open).
+        // network jitter. The spinner only stores the value; "Apply" rebuilds an
+        // active voice call so it takes effect (rtpjitterbuffer honours `latency`
+        // only at startup). Overwritten from the loaded config on open.
         let jitter_spin = gtk::SpinButton::with_range(0.0, 500.0, 5.0);
         jitter_spin.set_value(20.0);
         root_box.append(&hrow("Jitter buffer (ms)", 180, &jitter_spin));
+        let jitter_apply_btn = gtk::Button::with_label("Apply to active call");
+        jitter_apply_btn.set_halign(gtk::Align::End);
+        jitter_apply_btn.set_tooltip_text(Some("Rebuild the current voice call so the jitter value above takes effect"));
+        root_box.append(&jitter_apply_btn);
 
         // Reset section
         let reset_btn = gtk::Button::with_label("Reset to Default");
@@ -336,6 +343,13 @@ impl Component for SettingsWindow {
                 let _ = s.output(SettingsOutput::JitterLatency(sb.value() as u32));
             })
         };
+
+        {
+            let s = sender.clone();
+            jitter_apply_btn.connect_clicked(move |_| {
+                let _ = s.output(SettingsOutput::ApplyJitter);
+            });
+        }
 
         {
             let s = sender.clone();
