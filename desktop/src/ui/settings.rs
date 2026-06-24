@@ -189,18 +189,30 @@ impl Component for SettingsWindow {
         let ns_dropdown =
             gtk::DropDown::from_strings(&["Off", "Low", "Moderate", "High"]);
         ns_dropdown.set_selected(2); // Moderate default
+        ns_dropdown.set_tooltip_text(Some(
+            "Removes background noise (RNNoise). May add ~10 ms latency.",
+        ));
         root_box.append(&hrow("Noise suppression", 180, &ns_dropdown));
 
         let ec_switch = gtk::Switch::new();
         ec_switch.set_active(true);
+        ec_switch.set_tooltip_text(Some(
+            "Cancels speaker echo picked up by the mic (not needed with a headset). May add ~10 ms latency.",
+        ));
         root_box.append(&hrow("Echo cancellation", 180, &ec_switch));
 
         let agc_switch = gtk::Switch::new();
         agc_switch.set_active(true);
+        agc_switch.set_tooltip_text(Some(
+            "Auto-levels your mic so your voice stays a consistent loudness. May add a little latency.",
+        ));
         root_box.append(&hrow("Auto gain control", 180, &agc_switch));
 
         let vad_switch = gtk::Switch::new();
         vad_switch.set_active(true);
+        vad_switch.set_tooltip_text(Some(
+            "Detects speech vs. noise to gate transmission in Voice-activity mode. May add a little latency.",
+        ));
         root_box.append(&hrow("Voice activity det.", 180, &vad_switch));
 
         // Activation section

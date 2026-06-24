@@ -17,6 +17,7 @@ use super::native::{NativeCapture, NativePlayback};
 use crate::session::SessionEvent;
 use anyhow::{anyhow, Result};
 use audiopus::{coder::Decoder, coder::Encoder, Application, Channels, SampleRate};
+use nnnoiseless::DenoiseState;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -28,6 +29,10 @@ use uuid::Uuid;
 /// Opus frame: 5 ms @ 48 kHz mono. Smaller frame = less packetization delay and
 /// a shallower playback lane (one frame) than the 10 ms default.
 const FRAME: usize = 240;
+
+/// RNNoise frame: 10 ms @ 48 kHz. NS buffers this much (so enabling it adds
+/// ~10 ms of latency over the 5 ms Opus framing).
+const NS_FRAME: usize = DenoiseState::FRAME_SIZE; // 480
 
 /// A send destination, shared between the capture/encode thread and the session.
 /// The remote is filled in once the peer's endpoint arrives over signaling.
@@ -53,6 +58,8 @@ pub struct NativeVoice {
     /// Temporary output silence (e.g. while Settings is open), independent of
     /// the user's deafen state.
     suspended: Arc<AtomicBool>,
+    /// RNNoise noise suppression on the capture path (toggled from Settings).
+    noise_suppress: Arc<AtomicBool>,
     next_source: u64,
 }
 
@@ -64,11 +71,13 @@ impl NativeVoice {
         evt_tx: UnboundedSender<SessionEvent>,
         input_device: Option<String>,
         output_device: Option<String>,
+        noise_suppress: bool,
     ) -> Result<Self> {
         eprintln!("[native-voice] active — WASAPI IAudioClient3 capture/playback + Opus + UDP");
         let playback = Arc::new(NativePlayback::start(output_device)?);
         let targets: Arc<Mutex<Vec<Arc<SendTarget>>>> = Arc::new(Mutex::new(Vec::new()));
         let deaf = Arc::new(AtomicBool::new(false));
+        let noise_suppress = Arc::new(AtomicBool::new(noise_suppress));
 
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::LowDelay)?;
         let mut acc: Vec<f32> = Vec::with_capacity(FRAME * 2);
@@ -79,8 +88,34 @@ impl NativeVoice {
         let silence = [0.0f32; FRAME];
         let targets_cb = targets.clone();
 
+        // NS pre-stage state (RNNoise works in 480-sample i16-range frames).
+        let ns_flag = noise_suppress.clone();
+        let mut denoiser = DenoiseState::new();
+        let mut ns_in: Vec<f32> = Vec::with_capacity(NS_FRAME * 2);
+        let mut ns_out: Vec<f32> = Vec::new();
+
         let capture = NativeCapture::start(input_device, move |mono| {
-            acc.extend_from_slice(mono);
+            // Optional noise suppression before the Opus path. RNNoise expects
+            // f32 in i16 amplitude range and fixed 480-sample frames; buffer to
+            // that, denoise, and feed the (denoised) samples to the Opus framing.
+            let feed: &[f32] = if ns_flag.load(Ordering::Relaxed) {
+                ns_in.extend_from_slice(mono);
+                ns_out.clear();
+                while ns_in.len() >= NS_FRAME {
+                    let mut inp = [0.0f32; NS_FRAME];
+                    let mut outp = [0.0f32; NS_FRAME];
+                    for (d, s) in inp.iter_mut().zip(ns_in.drain(..NS_FRAME)) {
+                        *d = s * 32768.0;
+                    }
+                    denoiser.process_frame(&mut outp, &inp);
+                    ns_out.extend(outp.iter().map(|x| (x / 32768.0).clamp(-1.0, 1.0)));
+                }
+                &ns_out
+            } else {
+                mono
+            };
+
+            acc.extend_from_slice(feed);
             while acc.len() >= FRAME {
                 let frame: Vec<f32> = acc.drain(..FRAME).collect();
                 let rms_db = rms_dbfs(&frame);
@@ -113,8 +148,14 @@ impl NativeVoice {
             peers: HashMap::new(),
             deaf,
             suspended: Arc::new(AtomicBool::new(false)),
+            noise_suppress,
             next_source: 0,
         })
+    }
+
+    /// Toggle RNNoise noise suppression on the capture path (live).
+    pub fn set_noise_suppress(&self, on: bool) {
+        self.noise_suppress.store(on, Ordering::Relaxed);
     }
 
     /// Add a peer: bind a recv socket, start its decode→playback lane, and return

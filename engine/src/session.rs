@@ -641,11 +641,13 @@ impl Session {
             return None;
         }
         if self.native_voice.is_none() {
+            let ns = !matches!(self.dsp_config.noise_suppression, crate::audio::dsp::NsLevel::Off);
             match crate::audio::native_voice::NativeVoice::new(
                 self.gate.clone(),
                 self.evt_tx.clone(),
                 self.input_device.clone(),
                 self.output_device.clone(),
+                ns,
             ) {
                 Ok(nv) => self.native_voice = Some(nv),
                 Err(e) => {
@@ -989,6 +991,12 @@ impl Session {
     /// Apply a new DSP config live (no pipeline rebuild).
     pub fn set_dsp(&mut self, cfg: DspConfig) {
         self.dsp_config = cfg.clone();
+
+        // Native path: drive RNNoise from the noise-suppression setting.
+        #[cfg(target_os = "windows")]
+        if let Some(nv) = self.native_voice.as_ref() {
+            nv.set_noise_suppress(!matches!(cfg.noise_suppression, crate::audio::dsp::NsLevel::Off));
+        }
 
         if let Some(vc) = self.voice_capture.as_ref() {
             vc.set_config(cfg);
