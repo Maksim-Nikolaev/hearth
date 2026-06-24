@@ -398,7 +398,7 @@ impl AppModel {
             SessionEvent::InputLevel(db) => {
                 let _ = self.settings_window.sender().send(SettingsInput::SetLevel(db));
             }
-            SessionEvent::FlowState { .. } | SessionEvent::Error(_) => {}
+            SessionEvent::FlowState { .. } | SessionEvent::Error(_) | SessionEvent::Warning(_) => {}
         }
     }
 

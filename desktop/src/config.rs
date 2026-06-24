@@ -45,6 +45,16 @@ pub enum ShareAudioKind {
     App,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceProfile {
+    #[default]
+    Custom,
+    Headset,
+    Speaker,
+    Auto,
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,6 +82,8 @@ pub struct Settings {
     /// the measured stability floor on LAN (10 ms destabilizes).
     #[serde(default = "default_jitter_ms")]
     pub jitter_latency_ms: u32,
+    #[serde(default)]
+    pub profile: VoiceProfile,
 }
 
 fn default_jitter_ms() -> u32 {
@@ -99,8 +111,74 @@ impl Default for Settings {
             share_audio: ShareAudioKind::None,
             share_bitrate_kbps: 6000,
             jitter_latency_ms: default_jitter_ms(),
+            profile: VoiceProfile::Custom,
         }
     }
+}
+
+fn to_engine_ns(n: NsLevel) -> engine::audio::dsp::NsLevel {
+    use engine::audio::dsp::NsLevel as E;
+    match n {
+        NsLevel::Off => E::Off,
+        NsLevel::Low => E::Low,
+        NsLevel::Moderate => E::Moderate,
+        NsLevel::High => E::High,
+    }
+}
+
+fn from_engine_ns(n: engine::audio::dsp::NsLevel) -> NsLevel {
+    use engine::audio::dsp::NsLevel as E;
+    match n {
+        E::Off => NsLevel::Off,
+        E::Low => NsLevel::Low,
+        E::Moderate => NsLevel::Moderate,
+        E::High => NsLevel::High,
+    }
+}
+
+fn to_engine_profile(p: VoiceProfile) -> engine::audio::profile::VoiceProfile {
+    use engine::audio::profile::VoiceProfile as E;
+    match p {
+        VoiceProfile::Custom => E::Custom,
+        VoiceProfile::Headset => E::Headset,
+        VoiceProfile::Speaker => E::Speaker,
+        VoiceProfile::Auto => E::Auto,
+    }
+}
+
+/// The user's custom slot, as an engine `DspConfig` (the stored flag fields).
+pub fn settings_custom_dsp(s: &Settings) -> engine::audio::dsp::DspConfig {
+    engine::audio::dsp::DspConfig {
+        echo_cancel: s.echo_cancellation,
+        noise_suppression: to_engine_ns(s.noise_suppression),
+        agc: s.agc,
+        vad: s.vad,
+        high_pass: true,
+    }
+}
+
+/// Write an engine `DspConfig` back into the flag fields (display + demote).
+pub fn write_dsp(s: &mut Settings, d: &engine::audio::dsp::DspConfig) {
+    s.echo_cancellation = d.echo_cancel;
+    s.noise_suppression = from_engine_ns(d.noise_suppression);
+    s.agc = d.agc;
+    s.vad = d.vad;
+}
+
+/// The effective `DspConfig` for the current profile + classification.
+pub fn effective_dsp(s: &Settings, output: engine::audio::profile::OutputKind)
+    -> engine::audio::dsp::DspConfig
+{
+    engine::audio::profile::effective(to_engine_profile(s.profile), &settings_custom_dsp(s), output)
+}
+
+/// Apply the "editing a preset demotes to Custom" rule: materialize the current
+/// effective config into the flag fields, then switch the profile to Custom. The
+/// caller applies the user's single edit after this (or before, on the widget).
+pub fn demote_to_custom(s: &mut Settings, output: engine::audio::profile::OutputKind) {
+    let eff = effective_dsp(s, output);
+    write_dsp(s, &eff);
+    s.profile = VoiceProfile::Custom;
 }
 
 /// Server endpoints plus token persistence (OS keyring, with a file/env fallback
@@ -208,5 +286,48 @@ mod tests {
         assert_eq!(s.share_fps, 30);
         assert_eq!(s.share_bitrate_kbps, 6000);
         assert!(matches!(s.activation, ActivationKind::Voice));
+    }
+
+    #[test]
+    fn profile_defaults_to_custom_and_round_trips() {
+        let s = Settings::default();
+        assert!(matches!(s.profile, VoiceProfile::Custom));
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back.profile, VoiceProfile::Custom));
+    }
+
+    #[test]
+    fn old_settings_without_profile_load_as_custom() {
+        // A settings blob saved before `profile` existed must still load.
+        let json = r#"{"input_device":null,"output_device":null,"input_volume":1.0,
+            "output_volume":1.0,"noise_suppression":"off","echo_cancellation":false,
+            "agc":false,"vad":false,"input_sensitivity":-40.0,"activation":"voice",
+            "ptt_key":null,"share_width":1920,"share_height":1080,"share_fps":30,
+            "share_content":"smoothness","share_audio":"none","share_bitrate_kbps":6000}"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert!(matches!(s.profile, VoiceProfile::Custom));
+    }
+
+    #[test]
+    fn demote_materializes_preset_then_becomes_custom() {
+        // On Headset, the stored custom flags are all-off, but demoting must write
+        // the Headset effective (AEC off, NS moderate, AGC on) into the flags.
+        let mut s = Settings { profile: VoiceProfile::Headset, ..Default::default() };
+        demote_to_custom(&mut s, engine::audio::profile::OutputKind::Unknown);
+        assert!(matches!(s.profile, VoiceProfile::Custom));
+        assert!(s.agc);                 // from the Headset preset
+        assert!(!s.echo_cancellation);  // Headset = AEC off
+        assert!(matches!(s.noise_suppression, NsLevel::Moderate));
+    }
+
+    #[test]
+    fn selecting_preset_does_not_touch_stored_flags() {
+        // Switching to a preset is a view; the custom slot (flags) stays as-is.
+        let mut s = Settings { agc: true, ..Default::default() }; // custom = AGC only
+        s.profile = VoiceProfile::Speaker;
+        // No demote called (no edit) -> flags unchanged.
+        assert!(s.agc);
+        assert!(!s.echo_cancellation);
     }
 }
