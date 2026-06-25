@@ -33,9 +33,6 @@ pub enum SettingsOutput {
     Close,
     /// Voice processing profile changed (Custom / Headset / Speaker / Auto).
     Profile(VoiceProfile),
-    /// "Log voice stats" pressed — dump the current per-peer diagnostics to the
-    /// console (the app formats them, where peer names are known).
-    LogVoiceStats,
 }
 
 // ── Input ─────────────────────────────────────────────────────────────────────
@@ -70,6 +67,8 @@ pub struct SettingsWindow {
     // the list without reconnecting the signal.
     mic_devices_cell: std::rc::Rc<std::cell::RefCell<Vec<AudioDevice>>>,
     spk_devices_cell: std::rc::Rc<std::cell::RefCell<Vec<AudioDevice>>>,
+    // Latest formatted voice-stats snapshot, shared with the Copy/Save closures.
+    stats_cell: std::rc::Rc<std::cell::RefCell<String>>,
 }
 
 // ── Widget struct (named fields the macro generates) ─────────────────────────
@@ -355,14 +354,73 @@ impl Component for SettingsWindow {
         stats_label.add_css_class("dim-label");
         root_box.append(&stats_label);
 
-        let stats_log_btn = gtk::Button::with_label("Log voice stats to console");
-        stats_log_btn.set_halign(gtk::Align::Start);
-        root_box.append(&stats_log_btn);
+        // Latest formatted snapshot, refreshed by SetVoiceStats. The Copy/Save
+        // buttons act on this cached text — a single instant (one line per peer),
+        // not the accumulated 1/s stream, so it stays small on a long call.
+        let stats_cell = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+
+        let stats_btn_row = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(8)
+            .halign(gtk::Align::Start)
+            .build();
+        let stats_copy_btn = gtk::Button::with_label("Copy");
+        let stats_save_btn = gtk::Button::with_label("Save to file…");
+        stats_btn_row.append(&stats_copy_btn);
+        stats_btn_row.append(&stats_save_btn);
+        root_box.append(&stats_btn_row);
 
         {
-            let s = sender.clone();
-            stats_log_btn.connect_clicked(move |_| {
-                let _ = s.output(SettingsOutput::LogVoiceStats);
+            let cell = stats_cell.clone();
+            let btn = stats_copy_btn.clone();
+            stats_copy_btn.connect_clicked(move |_| {
+                let text = cell.borrow().clone();
+                if text.is_empty() {
+                    return;
+                }
+                btn.clipboard().set_text(&text);
+
+                // Brief confirmation, then restore the label.
+                btn.set_label("Copied ✓");
+                let restore = btn.clone();
+                gtk::glib::timeout_add_seconds_local_once(2, move || restore.set_label("Copy"));
+            });
+        }
+
+        {
+            let cell = stats_cell.clone();
+            let win = window.clone();
+            // FileChooserNative (vs the 4.10 FileDialog) keeps the runtime GTK
+            // floor at 4.0 — the bundled Windows GTK may predate 4.10.
+            #[allow(deprecated)]
+            stats_save_btn.connect_clicked(move |_| {
+                let text = cell.borrow().clone();
+                if text.is_empty() {
+                    return;
+                }
+
+                let chooser = gtk::FileChooserNative::new(
+                    Some("Save voice stats"),
+                    Some(&win),
+                    gtk::FileChooserAction::Save,
+                    Some("Save"),
+                    Some("Cancel"),
+                );
+                chooser.set_current_name("voice-stats.txt");
+
+                // Hold a strong ref inside the handler so the native dialog
+                // outlives this closure; destroy() breaks the cycle on response.
+                let keep = chooser.clone();
+                chooser.connect_response(move |ch, resp| {
+                    if resp == gtk::ResponseType::Accept {
+                        if let Some(path) = ch.file().and_then(|f| f.path()) {
+                            let _ = std::fs::write(path, &text);
+                        }
+                    }
+                    ch.destroy();
+                    let _ = &keep;
+                });
+                chooser.show();
             });
         }
 
@@ -666,6 +724,7 @@ impl Component for SettingsWindow {
             level_bar,
             mic_devices_cell,
             spk_devices_cell,
+            stats_cell,
         };
 
         let widgets = SettingsWindowWidgets {
@@ -759,6 +818,8 @@ impl Component for SettingsWindow {
                 } else {
                     widgets.stats_label.set_text(&text);
                 }
+                // Cache for the Copy/Save buttons (act on the latest snapshot).
+                *self.stats_cell.borrow_mut() = text;
             }
         }
     }

@@ -668,21 +668,6 @@ impl AppModel {
 
                 return;
             }
-            SettingsOutput::LogVoiceStats => {
-                let text = self
-                    .session
-                    .as_ref()
-                    .map(|s| format_voice_stats(&s.voice_stats()))
-                    .unwrap_or_default();
-
-                if text.is_empty() {
-                    eprintln!("[voice-stats] no active voice call");
-                } else {
-                    eprintln!("[voice-stats]\n{text}");
-                }
-
-                return;
-            }
         }
 
         let was_demoted = !matches!(orig_profile, VoiceProfile::Custom)
