@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod presence;
+pub mod seed;
 pub mod security;
 pub mod signaling;
 pub mod state;

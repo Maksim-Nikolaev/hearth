@@ -7,6 +7,16 @@ async fn main() {
     let _ = dotenvy::dotenv();
 
     let config = AppConfig::from_env();
+
+    // `hearth-backend seed` bootstraps the dev users (alice/bob) then exits.
+    if std::env::args().nth(1).as_deref() == Some("seed") {
+        let pool = db::connect(&config.database_url).await;
+        hearth_backend::seed::seed_dev_users(&pool)
+            .await
+            .expect("seed dev users");
+        return;
+    }
+
     let pool = db::connect(&config.database_url).await;
     let state = AppState { pool, config, presence: PresenceRegistry::new(), signaling: SignalingHub::default() };
 
