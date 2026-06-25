@@ -43,6 +43,22 @@ if (-not (Test-Path "$repo\.git")) {
     git -C $repo sparse-checkout init --no-cone
     git -C $repo sparse-checkout set "/*" "!/net/webrtc/examples"
     git -C $repo checkout
+
+    # Cargo parses every workspace member's manifest before building anything,
+    # so the [[example]] targets in net/webrtc (whose sources we just excluded)
+    # make the parse fail even though gtk4 never touches webrtc. Drop them.
+    $webrtcManifest = Join-Path $repo 'net\webrtc\Cargo.toml'
+    $lines = Get-Content $webrtcManifest
+    $out = New-Object System.Collections.Generic.List[string]
+    $skip = $false
+    foreach ($line in $lines) {
+        if ($line -match '^\[\[example\]\]') { $skip = $true; continue }
+        if ($skip) {
+            if ($line -match '^\[' ) { $skip = $false } else { continue }
+        }
+        $out.Add($line)
+    }
+    Set-Content -Path $webrtcManifest -Value $out
 }
 
 Write-Host "Building gst-plugin-gtk4 (release)..." -ForegroundColor Cyan
