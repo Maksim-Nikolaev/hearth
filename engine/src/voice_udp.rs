@@ -100,19 +100,6 @@ fn voice_playback_sink() -> Result<gst::Element> {
     }
 }
 
-/// Best-effort local IPv4 the peer can reach us on. Uses the route to a public
-/// address to discover the LAN interface (no packet is sent). Falls back to
-/// loopback, which still works for same-machine testing.
-fn local_ip() -> String {
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect("8.8.8.8:80")?;
-            s.local_addr()
-        })
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
-}
-
 /// One peer's bidirectional voice transport. Built immediately (the receiver
 /// starts listening on an ephemeral port); the sender's destination is filled in
 /// by [`set_remote`] once the peer's endpoint arrives over signaling.
@@ -290,7 +277,7 @@ impl VoiceUdpPeer {
 
     /// The `ip:port` we receive on — carried to the peer in the Offer/Answer.
     pub fn local_endpoint(&self) -> String {
-        format!("{}:{}", local_ip(), self.local_port)
+        format!("{}:{}", crate::net::advertised_ip(), self.local_port)
     }
 
     /// Point the sender at the peer's `ip:port` (from their Offer/Answer).

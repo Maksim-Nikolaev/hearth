@@ -579,7 +579,7 @@ impl NativeVoice {
 
         self.targets.lock().unwrap().push(target.clone());
         self.peers.insert(peer, Peer { source_id, target, stop, handle: Some(handle) });
-        Ok(format!("{}:{}", local_ip(), local_port))
+        Ok(format!("{}:{}", crate::net::advertised_ip(), local_port))
     }
 
     /// Point our sender for `peer` at their `"ip:port"`.
@@ -621,17 +621,6 @@ impl NativeVoice {
     pub fn is_empty(&self) -> bool {
         self.peers.is_empty()
     }
-}
-
-/// Best-effort LAN IP (UDP-connect trick, no packet sent); loopback fallback.
-fn local_ip() -> String {
-    std::net::UdpSocket::bind("0.0.0.0:0")
-        .and_then(|s| {
-            s.connect("8.8.8.8:80")?;
-            s.local_addr()
-        })
-        .map(|a| a.ip().to_string())
-        .unwrap_or_else(|_| "127.0.0.1".to_string())
 }
 
 /// Closed-gate gain floor (~-54 dBFS) — the gate's "range". Resting at a faint
