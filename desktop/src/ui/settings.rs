@@ -15,6 +15,8 @@ pub enum SettingsOutput {
     OutputVolume(f64),
     NoiseSuppression(NsLevel),
     EchoCancellation(bool),
+    /// Residual-echo suppression strength (0–100).
+    EchoStrength(u8),
     Agc(bool),
     Vad(bool),
     InputSensitivity(f32),
@@ -71,6 +73,7 @@ pub struct SettingsWindowWidgets {
     output_vol_scale: gtk::Scale,
     ns_dropdown: gtk::DropDown,
     ec_switch: gtk::Switch,
+    ec_strength_scale: gtk::Scale,
     agc_switch: gtk::Switch,
     vad_switch: gtk::Switch,
     activation_dropdown: gtk::DropDown,
@@ -91,6 +94,7 @@ pub struct SettingsWindowWidgets {
     output_vol_id: SignalHandlerId,
     ns_selected_id: SignalHandlerId,
     ec_active_id: SignalHandlerId,
+    ec_strength_id: SignalHandlerId,
     agc_active_id: SignalHandlerId,
     vad_active_id: SignalHandlerId,
     activation_selected_id: SignalHandlerId,
@@ -241,6 +245,18 @@ impl Component for SettingsWindow {
             "Cancels speaker echo picked up by the mic (speexdsp). Not needed with a headset. May add ~10 ms latency.",
         ));
         root_box.append(&hrow("Echo cancellation", 180, &ec_switch));
+
+        let ec_strength_scale =
+            gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 5.0);
+        ec_strength_scale.set_hexpand(true);
+        ec_strength_scale.set_draw_value(true);
+        ec_strength_scale.set_value_pos(gtk::PositionType::Right);
+        ec_strength_scale.set_value(f64::from(engine::audio::dsp::DEFAULT_ECHO_STRENGTH));
+        ec_strength_scale.set_tooltip_text(Some(
+            "How hard echo cancellation suppresses residual echo. Lower = more \
+             natural voice; higher = removes more echo (native audio engine only).",
+        ));
+        root_box.append(&hrow("Echo cancel strength", 180, &ec_strength_scale));
 
         let agc_switch = gtk::Switch::new();
         agc_switch.set_active(true);
@@ -401,6 +417,13 @@ impl Component for SettingsWindow {
             let s = sender.clone();
             ec_switch.connect_active_notify(move |sw| {
                 let _ = s.output(SettingsOutput::EchoCancellation(sw.is_active()));
+            })
+        };
+
+        let ec_strength_id = {
+            let s = sender.clone();
+            ec_strength_scale.connect_value_changed(move |sc| {
+                let _ = s.output(SettingsOutput::EchoStrength(sc.value().round() as u8));
             })
         };
 
@@ -581,6 +604,7 @@ impl Component for SettingsWindow {
             output_vol_scale,
             ns_dropdown,
             ec_switch,
+            ec_strength_scale,
             agc_switch,
             vad_switch,
             activation_dropdown,
@@ -597,6 +621,7 @@ impl Component for SettingsWindow {
             output_vol_id,
             ns_selected_id,
             ec_active_id,
+            ec_strength_id,
             agc_active_id,
             vad_active_id,
             activation_selected_id,
@@ -716,6 +741,7 @@ impl SettingsWindow {
         widgets.output_vol_scale.block_signal(&widgets.output_vol_id);
         widgets.ns_dropdown.block_signal(&widgets.ns_selected_id);
         widgets.ec_switch.block_signal(&widgets.ec_active_id);
+        widgets.ec_strength_scale.block_signal(&widgets.ec_strength_id);
         widgets.agc_switch.block_signal(&widgets.agc_active_id);
         widgets.vad_switch.block_signal(&widgets.vad_active_id);
         widgets.activation_dropdown.block_signal(&widgets.activation_selected_id);
@@ -738,6 +764,7 @@ impl SettingsWindow {
         widgets.ns_dropdown.set_selected(ns_idx);
 
         widgets.ec_switch.set_active(s.echo_cancellation);
+        widgets.ec_strength_scale.set_value(f64::from(s.echo_cancel_strength));
         widgets.agc_switch.set_active(s.agc);
         widgets.vad_switch.set_active(s.vad);
 
@@ -796,6 +823,7 @@ impl SettingsWindow {
         widgets.output_vol_scale.unblock_signal(&widgets.output_vol_id);
         widgets.ns_dropdown.unblock_signal(&widgets.ns_selected_id);
         widgets.ec_switch.unblock_signal(&widgets.ec_active_id);
+        widgets.ec_strength_scale.unblock_signal(&widgets.ec_strength_id);
         widgets.agc_switch.unblock_signal(&widgets.agc_active_id);
         widgets.vad_switch.unblock_signal(&widgets.vad_active_id);
         widgets.activation_dropdown.unblock_signal(&widgets.activation_selected_id);

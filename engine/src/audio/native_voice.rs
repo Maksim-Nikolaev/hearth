@@ -16,21 +16,10 @@ use super::gate::Gate;
 use super::native::{NativeCapture, NativePlayback};
 use crate::session::SessionEvent;
 use anyhow::{anyhow, Result};
-use aec_rs::Aec;
+use super::speex_aec::SpeexAec;
 use audiopus::{coder::Decoder, coder::Encoder, Application, Channels, SampleRate};
 use earshot::{VoiceActivityDetector, VoiceActivityProfile};
 use nnnoiseless::DenoiseState;
-
-/// speexdsp's `Aec` holds raw pointers; it lives entirely on the capture thread,
-/// so wrap it to move into that thread's closure. The method (rather than field
-/// access) keeps closures capturing the whole wrapper, not the inner `Aec`.
-struct SendAec(Aec);
-unsafe impl Send for SendAec {}
-impl SendAec {
-    fn cancel(&mut self, mic: &[i16], far: &[i16], out: &mut [i16]) {
-        self.0.cancel_echo(mic, far, out);
-    }
-}
 
 /// AEC frame (10 ms) and adaptive-filter tail (~100 ms of room echo) at 48 kHz.
 const AEC_FRAME: usize = 480;
@@ -86,6 +75,8 @@ pub struct NativeVoice {
     agc: Arc<AtomicBool>,
     /// speexdsp AEC on/off.
     ec: Arc<AtomicBool>,
+    /// Residual-echo suppression strength (0–100), applied live.
+    ec_strength: Arc<AtomicU32>,
     next_source: u64,
 }
 
@@ -101,6 +92,7 @@ impl NativeVoice {
         vad: bool,
         agc: bool,
         ec: bool,
+        ec_strength: u8,
         voice_status: crate::session::VoiceStatus,
     ) -> Result<Self> {
         #[cfg(windows)]
@@ -163,11 +155,16 @@ impl NativeVoice {
         let ec_enabled = Arc::new(AtomicBool::new(ec));
         let ec_cb = ec_enabled.clone();
         let far_ring = playback.far_end();
-        let mut aec = SendAec(Aec::new(AEC_FRAME, AEC_FILTER_LEN, 48000));
+        let aec = SpeexAec::new(AEC_FRAME, AEC_FILTER_LEN, 48000, ec_strength);
         let mut aec_in: Vec<f32> = Vec::with_capacity(AEC_FRAME * 2);
+        // Residual-echo suppression strength, adjusted live from Settings. The
+        // closure re-applies it to `aec` only when it changes.
+        let ec_strength_state = Arc::new(AtomicU32::new(ec_strength as u32));
+        let ec_strength_cb = ec_strength_state.clone();
+        let mut last_strength = ec_strength;
 
         eprintln!(
-            "[native-voice] filters: ns_wet={} vad={vad} agc={agc} ec={ec}",
+            "[native-voice] filters: ns_wet={} vad={vad} agc={agc} ec={ec} ec_strength={ec_strength}",
             ns_wet.load(Ordering::Relaxed)
         );
 
@@ -175,6 +172,13 @@ impl NativeVoice {
             // AEC first (on the raw mic), so NS/AGC see echo-free audio. When off,
             // `src` is the mic untouched.
             let ec_on = ec_cb.load(Ordering::Relaxed);
+            if ec_on {
+                let cur = ec_strength_cb.load(Ordering::Relaxed) as u8;
+                if cur != last_strength {
+                    aec.set_strength(cur);
+                    last_strength = cur;
+                }
+            }
             let cleaned: Vec<f32> = if ec_on {
                 aec_in.extend_from_slice(mono);
                 let mut out = Vec::with_capacity(aec_in.len());
@@ -325,6 +329,7 @@ impl NativeVoice {
             vad: vad_enabled,
             agc: agc_enabled,
             ec: ec_enabled,
+            ec_strength: ec_strength_state,
             next_source: 0,
         })
     }
@@ -332,6 +337,11 @@ impl NativeVoice {
     /// Toggle acoustic echo cancellation. Live.
     pub fn set_echo_cancel(&self, on: bool) {
         self.ec.store(on, Ordering::Relaxed);
+    }
+
+    /// Set residual-echo suppression strength (0–100). Applied on the next frame.
+    pub fn set_echo_cancel_strength(&self, strength: u8) {
+        self.ec_strength.store(strength as u32, Ordering::Relaxed);
     }
 
     /// Toggle earshot VAD (Voice-activity gating + speaking detection). Live.

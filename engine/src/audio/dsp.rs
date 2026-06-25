@@ -12,10 +12,17 @@ pub enum NsLevel {
     High,
 }
 
+/// Default residual-echo suppression strength (0–100) for the native speex AEC.
+/// Gentle enough to keep the voice natural; the Settings slider overrides it.
+pub const DEFAULT_ECHO_STRENGTH: u8 = 40;
+
 /// Runtime-configurable DSP settings.
 #[derive(Debug, Clone)]
 pub struct DspConfig {
     pub echo_cancel: bool,
+    /// Residual-echo suppression strength (0–100) for the native speex AEC.
+    /// Ignored by the GStreamer/webrtc DSP path.
+    pub echo_cancel_strength: u8,
     pub noise_suppression: NsLevel,
     pub agc: bool,
     pub vad: bool,
@@ -160,6 +167,7 @@ mod tests {
         let mut dsp = Dsp::new().expect("create dsp");
         dsp.set_config(&DspConfig {
             echo_cancel: true,
+            echo_cancel_strength: DEFAULT_ECHO_STRENGTH,
             noise_suppression: NsLevel::High,
             agc: true,
             vad: true,
@@ -180,6 +188,7 @@ mod tests {
         for ns in [NsLevel::Off, NsLevel::Low, NsLevel::Moderate, NsLevel::High] {
             dsp.set_config(&DspConfig {
                 echo_cancel: false,
+                echo_cancel_strength: DEFAULT_ECHO_STRENGTH,
                 noise_suppression: ns,
                 agc: false,
                 vad: false,

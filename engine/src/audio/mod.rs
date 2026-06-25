@@ -25,6 +25,10 @@ pub mod native;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod native_voice;
 
+// Tuned speexdsp echo canceller used by the native voice path.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub mod speex_aec;
+
 /// Microphone capture source element for this platform. Linux/macOS use
 /// PulseAudio (`pulsesrc`); Windows uses WASAPI (`wasapi2src`). Both accept a
 /// `device` property whose value is the id returned by [`devices::list_devices`].

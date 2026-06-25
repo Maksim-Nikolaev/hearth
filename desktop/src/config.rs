@@ -65,6 +65,10 @@ pub struct Settings {
     pub output_volume: f64,
     pub noise_suppression: NsLevel,
     pub echo_cancellation: bool,
+    /// Residual-echo suppression strength (0–100) for the native speex AEC.
+    /// `serde(default)` keeps older saved settings loadable.
+    #[serde(default = "default_echo_strength")]
+    pub echo_cancel_strength: u8,
     pub agc: bool,
     pub vad: bool,
     pub input_sensitivity: f32,
@@ -90,6 +94,10 @@ fn default_jitter_ms() -> u32 {
     20
 }
 
+fn default_echo_strength() -> u8 {
+    engine::audio::dsp::DEFAULT_ECHO_STRENGTH
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -99,6 +107,7 @@ impl Default for Settings {
             output_volume: 1.0,
             noise_suppression: NsLevel::Off,
             echo_cancellation: false,
+            echo_cancel_strength: default_echo_strength(),
             agc: false,
             vad: false,
             input_sensitivity: -40.0,
@@ -150,6 +159,7 @@ fn to_engine_profile(p: VoiceProfile) -> engine::audio::profile::VoiceProfile {
 pub fn settings_custom_dsp(s: &Settings) -> engine::audio::dsp::DspConfig {
     engine::audio::dsp::DspConfig {
         echo_cancel: s.echo_cancellation,
+        echo_cancel_strength: s.echo_cancel_strength,
         noise_suppression: to_engine_ns(s.noise_suppression),
         agc: s.agc,
         vad: s.vad,
@@ -160,6 +170,7 @@ pub fn settings_custom_dsp(s: &Settings) -> engine::audio::dsp::DspConfig {
 /// Write an engine `DspConfig` back into the flag fields (display + demote).
 pub fn write_dsp(s: &mut Settings, d: &engine::audio::dsp::DspConfig) {
     s.echo_cancellation = d.echo_cancel;
+    s.echo_cancel_strength = d.echo_cancel_strength;
     s.noise_suppression = from_engine_ns(d.noise_suppression);
     s.agc = d.agc;
     s.vad = d.vad;

@@ -27,6 +27,10 @@ earshot = "0.1"
 # Acoustic echo cancellation (speexdsp). Build needs cmake + libclang +
 # /D_USE_MATH_DEFINES — win-env.ps1 sets all three.
 aec-rs = "0.1"
+# Direct speexdsp bindings: our `SpeexAec` wrapper tunes the echo canceller
+# (disables speex's redundant denoise/AGC, configurable residual suppression)
+# beyond what the `aec-rs` convenience wrapper exposes.
+aec-rs-sys = "0.1"
 hearth-protocol = { path = "../protocol" }
 
 # Voice DSP (AEC/NS/AGC/VAD). The `bundled` build uses autotools and only links
