@@ -1,36 +1,21 @@
+# Postgres-only, for the fast `cargo run -p hearth-backend` inner loop.
+# The full stack (backend in Docker) lives in compose.yml.
 services:
   postgres:
     image: postgres:18
     environment:
-      POSTGRES_USER: hearth
-      POSTGRES_PASSWORD: hearth
-      POSTGRES_DB: hearth
+      POSTGRES_USER: ${POSTGRES_USER:-hearth}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hearth}
+      POSTGRES_DB: ${POSTGRES_DB:-hearth}
     ports:
       - "5433:5432"
     volumes:
-      - hearth_pg:/var/lib/postgresql
+      - hearth_pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U hearth -d hearth"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hearth} -d ${POSTGRES_DB:-hearth}"]
       interval: 5s
       timeout: 3s
       retries: 10
 
-  backend:
-    build:
-      context: .
-      dockerfile: backend/Dockerfile
-    environment:
-      # Reaches Postgres over the compose network (service name + internal port).
-      DATABASE_URL: postgres://hearth:hearth@postgres:5432/hearth
-      JWT_SECRET: dev-only-change-me-min-32-bytes-long-secret
-      ACCESS_TTL_SECS: "900"
-      REFRESH_TTL_SECS: "2592000"
-      RUST_LOG: info
-    ports:
-      - "8080:8080"
-    depends_on:
-      postgres:
-        condition: service_healthy
-
 volumes:
-  hearth_pg:
+  hearth_pgdata:
