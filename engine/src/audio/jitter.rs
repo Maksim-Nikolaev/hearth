@@ -25,11 +25,14 @@ use std::collections::HashMap;
 /// native framing — beyond this, PLC is audible garbage and skipping is cleaner.
 const MAX_CONCEAL_FRAMES: u16 = 8;
 
-/// Headroom above `target` before the safety net drops the oldest frame. Sized
-/// generously (~30 ms at the 5 ms native framing) so it sits well above the depth
-/// the drift servo holds: a routine arrival burst is absorbed rather than dropped,
-/// and only a real overrun (a stalled consumer, a far-faster sender) trims it.
-const SAFETY_MARGIN_FRAMES: usize = 6;
+/// Headroom above `target` before the safety net drops the oldest frame. Sized to
+/// swallow a full arrival burst: the sender hands the receiver a whole capture
+/// quantum's worth of frames back-to-back, and two coalescing quanta can briefly
+/// stack ~60 ms on top of the depth the drift servo holds. ~60 ms here (12 frames
+/// at the 5 ms native framing) absorbs that. It is a *ceiling*, not a target — the
+/// servo keeps the steady depth at `target`, so a wider cap costs no latency and
+/// only stops bursts from clipping; only a genuine overrun ever reaches it.
+const SAFETY_MARGIN_FRAMES: usize = 12;
 
 /// Smallest meaningful prebuffer/target — one frame is just a reorder slot.
 const MIN_TARGET_FRAMES: usize = 1;
@@ -338,18 +341,20 @@ mod tests {
     fn safety_net_bounds_depth_only_on_real_overrun() {
         // A burst within `target + SAFETY_MARGIN_FRAMES` is fully absorbed — no
         // drop. Only a burst past the cap trims the oldest and skips ahead.
-        let mut jb = JitterBuffer::new(2); // cap = 2 + 6 = 8 frames
+        let target = 2usize;
+        let cap = target + SAFETY_MARGIN_FRAMES;
+        let mut jb = JitterBuffer::new(target);
 
-        for s in 0..8u16 {
+        for s in 0..cap as u16 {
             jb.push(s, &[s as u8]);
         }
         assert_eq!(jb.counters().overfill_dropped, 0, "a burst up to the cap is absorbed");
-        assert_eq!(jb.depth(), 8);
+        assert_eq!(jb.depth(), cap);
 
         // Two more push past the cap: the oldest are dropped, depth pinned at cap.
-        jb.push(8, &[8]);
-        jb.push(9, &[9]);
-        assert_eq!(jb.depth(), 8, "depth bounded at the cap");
+        jb.push(cap as u16, &[0]);
+        jb.push(cap as u16 + 1, &[0]);
+        assert_eq!(jb.depth(), cap, "depth bounded at the cap");
         assert_eq!(jb.counters().overfill_dropped, 2);
 
         // Playback resumes at the live edge, not the stale dropped frames.
