@@ -262,6 +262,9 @@ impl Component for SettingsWindow {
              latency; WebRTC (AEC3) cancels harder. WebRTC is Linux-only — Windows \
              always uses Speex.",
         ));
+        // WebRTC AEC3 is Speex's only alternative and it can't build on Windows,
+        // so the selector has nothing to choose there — hide it.
+        #[cfg(not(target_os = "windows"))]
         root_box.append(&hrow("AEC method", 180, &ec_method_dropdown));
 
         let ec_strength_scale =

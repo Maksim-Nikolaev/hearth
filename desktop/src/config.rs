@@ -76,7 +76,7 @@ pub struct Settings {
     /// Echo-canceller algorithm for the native path (Speex / WebRTC). Only
     /// applies when `echo_cancellation` is on. `serde(default)` keeps older saved
     /// settings loadable.
-    #[serde(default)]
+    #[serde(default = "default_aec_method")]
     pub aec_method: AecMethodKind,
     /// Residual-echo suppression strength (0–100) for the native speex AEC.
     /// `serde(default)` keeps older saved settings loadable.
@@ -111,6 +111,16 @@ fn default_echo_strength() -> u8 {
     engine::audio::dsp::DEFAULT_ECHO_STRENGTH
 }
 
+/// WebRTC AEC3 is the default where it's available; Windows can't build it, so
+/// it falls back to Speex there.
+fn default_aec_method() -> AecMethodKind {
+    if cfg!(target_os = "windows") {
+        AecMethodKind::Speex
+    } else {
+        AecMethodKind::Webrtc
+    }
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -120,7 +130,7 @@ impl Default for Settings {
             output_volume: 1.0,
             noise_suppression: NsLevel::Off,
             echo_cancellation: false,
-            aec_method: AecMethodKind::Speex,
+            aec_method: default_aec_method(),
             echo_cancel_strength: default_echo_strength(),
             agc: false,
             vad: false,
