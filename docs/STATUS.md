@@ -1,6 +1,6 @@
 # Hearth – Status
 
-_Living status doc. Last updated: 2026-06-24._
+_Living status doc. Last updated: 2026-06-25._
 
 Self-hosted, low-latency voice + high-fidelity screenshare + webcam for 2–3 close
 friends over a P2P mesh with a small Rust control server. Stack: **pure-Rust
@@ -228,13 +228,49 @@ Re-probe button. 6 TDD tasks + post-verify fixes, all on main (engine 63 + deskt
 form factor) → Unknown→Headset, manual selector is the guarantee. Volume sliders
 still not wired to the live session (pre-existing). Mic/speaker volume setter TODO.
 
-## ACTIVE NEXT: native PipeWire low-latency capture
+## Native PipeWire voice landed — audio work complete (2026-06-25, on main)
 
-Decided 2026-06-24: replace `pulsesrc` with **`pipewiresrc`** (small quantum, RT
-graph) to cut the voice **send hop** (~16–26 ms, load-dependent because our
-`pulsesrc` is untuned and the capture thread is non-RT). This is the proper Linux
-low-latency path and the "cleanest results always" target. Own spec/branch. The
-`pulsesrc` path stays as the compatibility fallback.
+Linux voice now **defaults to the native path** (not GStreamer): a full
+**pipewire-rs** capture/playback backend (`engine/src/audio/native/native_pw.rs`)
+behind the same `NativeCapture`/`NativePlayback` API as Windows WASAPI, so the
+whole `native_voice.rs` chain (DSP → Opus → UDP) runs on Linux unchanged.
+Measured **~6–14 ms** acoustic mouth-to-ear (corr>0.95) — this **supersedes the
+earlier "native PipeWire is a robustness nicety, not the latency win"
+assumption**: the pinned quantum both fixes the long-session drift (old pulsesrc
+crept to ~70 ms) and lands well under the old DSP-on numbers.
+
+- **Best-driver-with-fallback (both platforms):** native by default; native
+  construction failure auto-falls-through to the generic GStreamer `voice_udp`
+  path for the session; `HEARTH_GSTREAMER_VOICE=1` forces generic. Live backend
+  shown in Settings ("Audio engine: Native (PipeWire) / Generic (GStreamer)").
+- **Selectable + tuned AEC:** `SpeexAec` (our `aec-rs-sys` wrapper; speex's own
+  denoise/AGC off; strength is a wet/dry mix, 0 = off → 100 = full) vs **WebRTC
+  AEC3** (`webrtc_aec.rs`); **WebRTC is the default where supported** (Unix-only
+  build → Windows native uses Speex, selector hidden there). Strength + method
+  apply live; the mic test runs the full chain so AEC is audible in-test.
+- **pipewire-rs gotchas fixed:** honor `buffer.requested()` (else lane over-drain
+  → garble), request stereo out + duplicate mono (else front-left only), pinned
+  `node.latency=256/48000` (env `HEARTH_PW_QUANTUM`), `pipewire` feature
+  `v0_3_65`, build dep `libpipewire-0.3-dev`.
+- Spec/plan: `docs/superpowers/{specs,plans}/2026-06-24-native-pipewire-voice*`;
+  findings + verification in `docs/findings/voice-latency-linux.md`.
+
+**This concludes the Audio workstream.** Voice on Linux + Windows is native,
+low-latency, with auto-fallback and user-tunable echo cancellation.
+
+> Note: the OBS two-track latency harness (`scripts/measure/`) is unreliable below
+> ~15 ms — per-source buffering swamps the signal and a working AEC decorrelates
+> the tracks (negative/low-corr readings). Trust corr>0.95 only; for sub-15 ms use
+> same-clock hardware loopback.
+
+## ACTIVE NEXT: Wayland screenshare GPU capture
+
+With audio done, the next major workstream is **screenshare GPU capture on
+Wayland** via xdg-desktop-portal ScreenCast + `pipewiresrc` behind the
+`CaptureBackend` seam (DMABuf-with-modifier → direct VA import, which works on
+Wayland unlike the X11 spike). X11 stays CPU `ximagesrc` ≤60fps. See
+`docs/superpowers/plans/2026-06-23-hearth-m8-screenshare-gpu-capture.md` and the
+X11 GPU-capture NO-GO spike findings.
 
 ## Next candidates
 
