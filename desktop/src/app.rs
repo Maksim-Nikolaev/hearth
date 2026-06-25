@@ -516,6 +516,13 @@ impl AppModel {
                 }
                 settings.echo_cancellation = b;
             }
+            SettingsOutput::AecMethod(m) => {
+                if !matches!(settings.profile, VoiceProfile::Custom) {
+                    let kind = output_kind_for(&settings);
+                    crate::config::demote_to_custom(&mut settings, kind);
+                }
+                settings.aec_method = m;
+            }
             SettingsOutput::EchoStrength(v) => {
                 if !matches!(settings.profile, VoiceProfile::Custom) {
                     let kind = output_kind_for(&settings);

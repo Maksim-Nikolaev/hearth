@@ -16,10 +16,22 @@ pub enum NsLevel {
 /// Gentle enough to keep the voice natural; the Settings slider overrides it.
 pub const DEFAULT_ECHO_STRENGTH: u8 = 40;
 
+/// Which echo canceller the native voice path runs when `echo_cancel` is on.
+/// `Webrtc` is unavailable on Windows (the bundled `webrtc-audio-processing`
+/// build is Unix-only) and falls back to `Speex` there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AecMethod {
+    #[default]
+    Speex,
+    Webrtc,
+}
+
 /// Runtime-configurable DSP settings.
 #[derive(Debug, Clone)]
 pub struct DspConfig {
     pub echo_cancel: bool,
+    /// Echo canceller to use on the native path when `echo_cancel` is on.
+    pub aec_method: AecMethod,
     /// Residual-echo suppression strength (0–100) for the native speex AEC.
     /// Ignored by the GStreamer/webrtc DSP path.
     pub echo_cancel_strength: u8,
@@ -167,6 +179,7 @@ mod tests {
         let mut dsp = Dsp::new().expect("create dsp");
         dsp.set_config(&DspConfig {
             echo_cancel: true,
+            aec_method: AecMethod::Speex,
             echo_cancel_strength: DEFAULT_ECHO_STRENGTH,
             noise_suppression: NsLevel::High,
             agc: true,
@@ -188,6 +201,7 @@ mod tests {
         for ns in [NsLevel::Off, NsLevel::Low, NsLevel::Moderate, NsLevel::High] {
             dsp.set_config(&DspConfig {
                 echo_cancel: false,
+                aec_method: AecMethod::Speex,
                 echo_cancel_strength: DEFAULT_ECHO_STRENGTH,
                 noise_suppression: ns,
                 agc: false,

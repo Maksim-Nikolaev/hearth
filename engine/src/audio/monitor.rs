@@ -212,6 +212,7 @@ mod tests {
         let mut dsp = Dsp::new().expect("create dsp");
         dsp.set_config(&DspConfig {
             echo_cancel: false,
+            aec_method: crate::audio::dsp::AecMethod::Speex,
             echo_cancel_strength: crate::audio::dsp::DEFAULT_ECHO_STRENGTH,
             noise_suppression: crate::audio::dsp::NsLevel::Off,
             agc: false,

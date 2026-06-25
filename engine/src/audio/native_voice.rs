@@ -16,7 +16,10 @@ use super::gate::Gate;
 use super::native::{NativeCapture, NativePlayback};
 use crate::session::SessionEvent;
 use anyhow::{anyhow, Result};
+use super::dsp::AecMethod;
 use super::speex_aec::SpeexAec;
+#[cfg(not(target_os = "windows"))]
+use super::webrtc_aec::WebrtcAec;
 use audiopus::{coder::Decoder, coder::Encoder, Application, Channels, SampleRate};
 use earshot::{VoiceActivityDetector, VoiceActivityProfile};
 use nnnoiseless::DenoiseState;
@@ -26,7 +29,7 @@ const AEC_FRAME: usize = 480;
 const AEC_FILTER_LEN: i32 = 4800;
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
@@ -54,6 +57,80 @@ struct Peer {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// The active echo canceller, chosen by [`AecMethod`]. Rebuilt when the method
+/// changes (rare); `set_strength` adjusts the current one live. On Windows the
+/// `Webrtc` variant is unavailable, so `build` falls back to speex there.
+enum AecImpl {
+    Speex(SpeexAec),
+    #[cfg(not(target_os = "windows"))]
+    Webrtc(WebrtcAec),
+}
+
+impl AecImpl {
+    fn build(method: AecMethod, strength: u8) -> Self {
+        match method {
+            AecMethod::Speex => AecImpl::speex(strength),
+            #[cfg(not(target_os = "windows"))]
+            AecMethod::Webrtc => match WebrtcAec::new(strength) {
+                Ok(w) => AecImpl::Webrtc(w),
+                Err(e) => {
+                    eprintln!("[native-voice] WebRTC AEC init failed ({e}); using speex");
+                    AecImpl::speex(strength)
+                }
+            },
+            #[cfg(target_os = "windows")]
+            AecMethod::Webrtc => AecImpl::speex(strength),
+        }
+    }
+
+    fn speex(strength: u8) -> Self {
+        AecImpl::Speex(SpeexAec::new(AEC_FRAME, AEC_FILTER_LEN, 48000, strength))
+    }
+
+    fn set_strength(&mut self, strength: u8) {
+        match self {
+            AecImpl::Speex(a) => a.set_strength(strength),
+            #[cfg(not(target_os = "windows"))]
+            AecImpl::Webrtc(a) => a.set_strength(strength),
+        }
+    }
+
+    /// Cancel echo on one [`AEC_FRAME`]-sample mic frame, appending the cleaned
+    /// f32 samples to `out`. `far` is the matching rendered playback frame.
+    fn cancel_frame(&mut self, mic: &[f32], far: &mut [f32; AEC_FRAME], out: &mut Vec<f32>) {
+        match self {
+            AecImpl::Speex(a) => {
+                let to_i16 = |s: &f32| (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+                let far_i: Vec<i16> = far.iter().map(to_i16).collect();
+                let mic_i: Vec<i16> = mic.iter().map(to_i16).collect();
+                let mut out_i = [0i16; AEC_FRAME];
+                a.cancel(&mic_i, &far_i, &mut out_i);
+                out.extend(out_i.iter().map(|s| *s as f32 / 32768.0));
+            }
+            #[cfg(not(target_os = "windows"))]
+            AecImpl::Webrtc(a) => {
+                let mut mic_buf: Vec<f32> = mic.to_vec();
+                a.cancel(&mut mic_buf, far);
+                out.extend_from_slice(&mic_buf);
+            }
+        }
+    }
+}
+
+/// `AecMethod` as an atomic-friendly u8 and back.
+fn method_to_u8(m: AecMethod) -> u8 {
+    match m {
+        AecMethod::Speex => 0,
+        AecMethod::Webrtc => 1,
+    }
+}
+fn method_from_u8(v: u8) -> AecMethod {
+    match v {
+        1 => AecMethod::Webrtc,
+        _ => AecMethod::Speex,
+    }
+}
+
 pub struct NativeVoice {
     _capture: NativeCapture,
     playback: Arc<NativePlayback>,
@@ -77,6 +154,8 @@ pub struct NativeVoice {
     ec: Arc<AtomicBool>,
     /// Residual-echo suppression strength (0–100), applied live.
     ec_strength: Arc<AtomicU32>,
+    /// Active echo-canceller method (speex/webrtc) as a u8, applied live.
+    aec_method: Arc<AtomicU8>,
     next_source: u64,
 }
 
@@ -93,6 +172,7 @@ impl NativeVoice {
         agc: bool,
         ec: bool,
         ec_strength: u8,
+        aec_method: AecMethod,
         voice_status: crate::session::VoiceStatus,
     ) -> Result<Self> {
         #[cfg(windows)]
@@ -155,16 +235,20 @@ impl NativeVoice {
         let ec_enabled = Arc::new(AtomicBool::new(ec));
         let ec_cb = ec_enabled.clone();
         let far_ring = playback.far_end();
-        let aec = SpeexAec::new(AEC_FRAME, AEC_FILTER_LEN, 48000, ec_strength);
+        let mut aec = AecImpl::build(aec_method, ec_strength);
         let mut aec_in: Vec<f32> = Vec::with_capacity(AEC_FRAME * 2);
-        // Residual-echo suppression strength, adjusted live from Settings. The
-        // closure re-applies it to `aec` only when it changes.
+        // Echo-canceller method + residual strength, adjusted live from Settings.
+        // The closure rebuilds `aec` on a method change and re-applies strength on
+        // a strength change.
+        let aec_method_state = Arc::new(AtomicU8::new(method_to_u8(aec_method)));
+        let aec_method_cb = aec_method_state.clone();
         let ec_strength_state = Arc::new(AtomicU32::new(ec_strength as u32));
         let ec_strength_cb = ec_strength_state.clone();
         let mut last_strength = ec_strength;
+        let mut last_method = aec_method;
 
         eprintln!(
-            "[native-voice] filters: ns_wet={} vad={vad} agc={agc} ec={ec} ec_strength={ec_strength}",
+            "[native-voice] filters: ns_wet={} vad={vad} agc={agc} ec={ec} ec_strength={ec_strength} aec={aec_method:?}",
             ns_wet.load(Ordering::Relaxed)
         );
 
@@ -173,8 +257,14 @@ impl NativeVoice {
             // `src` is the mic untouched.
             let ec_on = ec_cb.load(Ordering::Relaxed);
             if ec_on {
+                // Apply live method/strength changes to the active canceller.
                 let cur = ec_strength_cb.load(Ordering::Relaxed) as u8;
-                if cur != last_strength {
+                let method = method_from_u8(aec_method_cb.load(Ordering::Relaxed));
+                if method != last_method {
+                    aec = AecImpl::build(method, cur);
+                    last_method = method;
+                    last_strength = cur;
+                } else if cur != last_strength {
                     aec.set_strength(cur);
                     last_strength = cur;
                 }
@@ -184,18 +274,16 @@ impl NativeVoice {
                 let mut out = Vec::with_capacity(aec_in.len());
                 while aec_in.len() >= AEC_FRAME {
                     let mic_f: Vec<f32> = aec_in.drain(..AEC_FRAME).collect();
-                    let mut far = [0i16; AEC_FRAME];
+                    // Far-end (rendered playback) frame as f32; speex converts to
+                    // i16 internally, WebRTC consumes f32 directly.
+                    let mut far_f = [0.0f32; AEC_FRAME];
                     {
                         let mut fr = far_ring.lock().unwrap();
-                        for d in far.iter_mut() {
-                            *d = fr.pop_front().map_or(0, |v: f32| (v.clamp(-1.0, 1.0) * 32767.0) as i16);
+                        for d in far_f.iter_mut() {
+                            *d = fr.pop_front().unwrap_or(0.0);
                         }
                     }
-                    let mic_i: Vec<i16> =
-                        mic_f.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16).collect();
-                    let mut out_i = [0i16; AEC_FRAME];
-                    aec.cancel(&mic_i, &far, &mut out_i);
-                    out.extend(out_i.iter().map(|s| *s as f32 / 32768.0));
+                    aec.cancel_frame(&mic_f, &mut far_f, &mut out);
                 }
                 out
             } else {
@@ -330,6 +418,7 @@ impl NativeVoice {
             agc: agc_enabled,
             ec: ec_enabled,
             ec_strength: ec_strength_state,
+            aec_method: aec_method_state,
             next_source: 0,
         })
     }
@@ -342,6 +431,12 @@ impl NativeVoice {
     /// Set residual-echo suppression strength (0–100). Applied on the next frame.
     pub fn set_echo_cancel_strength(&self, strength: u8) {
         self.ec_strength.store(strength as u32, Ordering::Relaxed);
+    }
+
+    /// Switch the echo-canceller method. The capture thread rebuilds the canceller
+    /// on the next frame.
+    pub fn set_aec_method(&self, method: AecMethod) {
+        self.aec_method.store(method_to_u8(method), Ordering::Relaxed);
     }
 
     /// Toggle earshot VAD (Voice-activity gating + speaking detection). Live.

@@ -29,6 +29,10 @@ pub mod native_voice;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod speex_aec;
 
+// Alternative WebRTC AEC3 canceller for the native path (Unix-only build).
+#[cfg(not(target_os = "windows"))]
+pub mod webrtc_aec;
+
 /// Microphone capture source element for this platform. Linux/macOS use
 /// PulseAudio (`pulsesrc`); Windows uses WASAPI (`wasapi2src`). Both accept a
 /// `device` property whose value is the id returned by [`devices::list_devices`].

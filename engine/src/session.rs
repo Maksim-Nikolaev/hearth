@@ -618,6 +618,7 @@ pub struct Session {
 fn default_dsp_config() -> DspConfig {
     DspConfig {
         echo_cancel: true,
+        aec_method: crate::audio::dsp::AecMethod::Speex,
         echo_cancel_strength: crate::audio::dsp::DEFAULT_ECHO_STRENGTH,
         noise_suppression: NsLevel::Moderate,
         agc: true,
@@ -831,6 +832,7 @@ impl Session {
                 self.dsp_config.agc,
                 self.dsp_config.echo_cancel,
                 self.dsp_config.echo_cancel_strength,
+                self.dsp_config.aec_method,
                 self.voice_status.clone(),
             ) {
                 Ok(nv) => {
@@ -1219,6 +1221,7 @@ impl Session {
             nv.set_agc(cfg.agc);
             nv.set_echo_cancel(cfg.echo_cancel);
             nv.set_echo_cancel_strength(cfg.echo_cancel_strength);
+            nv.set_aec_method(cfg.aec_method);
         }
 
         if let Some(vc) = self.voice_capture.as_ref() {

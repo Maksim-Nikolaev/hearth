@@ -1,4 +1,4 @@
-use crate::config::{ActivationKind, NsLevel, Settings, VoiceProfile};
+use crate::config::{AecMethodKind, ActivationKind, NsLevel, Settings, VoiceProfile};
 use crate::ui::meter::LevelBar;
 use engine::audio::devices::{AudioDevice, DeviceKind};
 use gtk::glib::SignalHandlerId;
@@ -15,6 +15,8 @@ pub enum SettingsOutput {
     OutputVolume(f64),
     NoiseSuppression(NsLevel),
     EchoCancellation(bool),
+    /// Echo-canceller algorithm (Speex / WebRTC).
+    AecMethod(AecMethodKind),
     /// Residual-echo suppression strength (0–100).
     EchoStrength(u8),
     Agc(bool),
@@ -73,6 +75,7 @@ pub struct SettingsWindowWidgets {
     output_vol_scale: gtk::Scale,
     ns_dropdown: gtk::DropDown,
     ec_switch: gtk::Switch,
+    ec_method_dropdown: gtk::DropDown,
     ec_strength_scale: gtk::Scale,
     agc_switch: gtk::Switch,
     vad_switch: gtk::Switch,
@@ -94,6 +97,7 @@ pub struct SettingsWindowWidgets {
     output_vol_id: SignalHandlerId,
     ns_selected_id: SignalHandlerId,
     ec_active_id: SignalHandlerId,
+    ec_method_id: SignalHandlerId,
     ec_strength_id: SignalHandlerId,
     agc_active_id: SignalHandlerId,
     vad_active_id: SignalHandlerId,
@@ -245,6 +249,14 @@ impl Component for SettingsWindow {
             "Cancels speaker echo picked up by the mic (speexdsp). Not needed with a headset. May add ~10 ms latency.",
         ));
         root_box.append(&hrow("Echo cancellation", 180, &ec_switch));
+
+        let ec_method_dropdown = gtk::DropDown::from_strings(&["Speex (low-latency)", "WebRTC (AEC3)"]);
+        ec_method_dropdown.set_tooltip_text(Some(
+            "Echo-canceller algorithm (native audio engine). Speex is lowest \
+             latency; WebRTC (AEC3) cancels harder. WebRTC is Linux-only — Windows \
+             always uses Speex.",
+        ));
+        root_box.append(&hrow("AEC method", 180, &ec_method_dropdown));
 
         let ec_strength_scale =
             gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 5.0);
@@ -417,6 +429,17 @@ impl Component for SettingsWindow {
             let s = sender.clone();
             ec_switch.connect_active_notify(move |sw| {
                 let _ = s.output(SettingsOutput::EchoCancellation(sw.is_active()));
+            })
+        };
+
+        let ec_method_id = {
+            let s = sender.clone();
+            ec_method_dropdown.connect_selected_notify(move |dd| {
+                let method = match dd.selected() {
+                    1 => AecMethodKind::Webrtc,
+                    _ => AecMethodKind::Speex,
+                };
+                let _ = s.output(SettingsOutput::AecMethod(method));
             })
         };
 
@@ -604,6 +627,7 @@ impl Component for SettingsWindow {
             output_vol_scale,
             ns_dropdown,
             ec_switch,
+            ec_method_dropdown,
             ec_strength_scale,
             agc_switch,
             vad_switch,
@@ -621,6 +645,7 @@ impl Component for SettingsWindow {
             output_vol_id,
             ns_selected_id,
             ec_active_id,
+            ec_method_id,
             ec_strength_id,
             agc_active_id,
             vad_active_id,
@@ -741,6 +766,7 @@ impl SettingsWindow {
         widgets.output_vol_scale.block_signal(&widgets.output_vol_id);
         widgets.ns_dropdown.block_signal(&widgets.ns_selected_id);
         widgets.ec_switch.block_signal(&widgets.ec_active_id);
+        widgets.ec_method_dropdown.block_signal(&widgets.ec_method_id);
         widgets.ec_strength_scale.block_signal(&widgets.ec_strength_id);
         widgets.agc_switch.block_signal(&widgets.agc_active_id);
         widgets.vad_switch.block_signal(&widgets.vad_active_id);
@@ -764,6 +790,10 @@ impl SettingsWindow {
         widgets.ns_dropdown.set_selected(ns_idx);
 
         widgets.ec_switch.set_active(s.echo_cancellation);
+        widgets.ec_method_dropdown.set_selected(match s.aec_method {
+            AecMethodKind::Speex => 0,
+            AecMethodKind::Webrtc => 1,
+        });
         widgets.ec_strength_scale.set_value(f64::from(s.echo_cancel_strength));
         widgets.agc_switch.set_active(s.agc);
         widgets.vad_switch.set_active(s.vad);
@@ -823,6 +853,7 @@ impl SettingsWindow {
         widgets.output_vol_scale.unblock_signal(&widgets.output_vol_id);
         widgets.ns_dropdown.unblock_signal(&widgets.ns_selected_id);
         widgets.ec_switch.unblock_signal(&widgets.ec_active_id);
+        widgets.ec_method_dropdown.unblock_signal(&widgets.ec_method_id);
         widgets.ec_strength_scale.unblock_signal(&widgets.ec_strength_id);
         widgets.agc_switch.unblock_signal(&widgets.agc_active_id);
         widgets.vad_switch.unblock_signal(&widgets.vad_active_id);

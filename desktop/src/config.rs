@@ -55,6 +55,14 @@ pub enum VoiceProfile {
     Auto,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AecMethodKind {
+    #[default]
+    Speex,
+    Webrtc,
+}
+
 // ── Settings ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +73,11 @@ pub struct Settings {
     pub output_volume: f64,
     pub noise_suppression: NsLevel,
     pub echo_cancellation: bool,
+    /// Echo-canceller algorithm for the native path (Speex / WebRTC). Only
+    /// applies when `echo_cancellation` is on. `serde(default)` keeps older saved
+    /// settings loadable.
+    #[serde(default)]
+    pub aec_method: AecMethodKind,
     /// Residual-echo suppression strength (0–100) for the native speex AEC.
     /// `serde(default)` keeps older saved settings loadable.
     #[serde(default = "default_echo_strength")]
@@ -107,6 +120,7 @@ impl Default for Settings {
             output_volume: 1.0,
             noise_suppression: NsLevel::Off,
             echo_cancellation: false,
+            aec_method: AecMethodKind::Speex,
             echo_cancel_strength: default_echo_strength(),
             agc: false,
             vad: false,
@@ -145,6 +159,20 @@ fn from_engine_ns(n: engine::audio::dsp::NsLevel) -> NsLevel {
     }
 }
 
+fn to_engine_aec(m: AecMethodKind) -> engine::audio::dsp::AecMethod {
+    match m {
+        AecMethodKind::Speex => engine::audio::dsp::AecMethod::Speex,
+        AecMethodKind::Webrtc => engine::audio::dsp::AecMethod::Webrtc,
+    }
+}
+
+fn from_engine_aec(m: engine::audio::dsp::AecMethod) -> AecMethodKind {
+    match m {
+        engine::audio::dsp::AecMethod::Speex => AecMethodKind::Speex,
+        engine::audio::dsp::AecMethod::Webrtc => AecMethodKind::Webrtc,
+    }
+}
+
 fn to_engine_profile(p: VoiceProfile) -> engine::audio::profile::VoiceProfile {
     use engine::audio::profile::VoiceProfile as E;
     match p {
@@ -159,6 +187,7 @@ fn to_engine_profile(p: VoiceProfile) -> engine::audio::profile::VoiceProfile {
 pub fn settings_custom_dsp(s: &Settings) -> engine::audio::dsp::DspConfig {
     engine::audio::dsp::DspConfig {
         echo_cancel: s.echo_cancellation,
+        aec_method: to_engine_aec(s.aec_method),
         echo_cancel_strength: s.echo_cancel_strength,
         noise_suppression: to_engine_ns(s.noise_suppression),
         agc: s.agc,
@@ -170,6 +199,7 @@ pub fn settings_custom_dsp(s: &Settings) -> engine::audio::dsp::DspConfig {
 /// Write an engine `DspConfig` back into the flag fields (display + demote).
 pub fn write_dsp(s: &mut Settings, d: &engine::audio::dsp::DspConfig) {
     s.echo_cancellation = d.echo_cancel;
+    s.aec_method = from_engine_aec(d.aec_method);
     s.echo_cancel_strength = d.echo_cancel_strength;
     s.noise_suppression = from_engine_ns(d.noise_suppression);
     s.agc = d.agc;

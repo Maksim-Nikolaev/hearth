@@ -23,6 +23,7 @@ pub enum OutputKind {
 pub fn headset_preset() -> DspConfig {
     DspConfig {
         echo_cancel: false,
+        aec_method: crate::audio::dsp::AecMethod::Speex,
         echo_cancel_strength: crate::audio::dsp::DEFAULT_ECHO_STRENGTH,
         noise_suppression: NsLevel::Moderate,
         agc: true,
@@ -36,6 +37,7 @@ pub fn headset_preset() -> DspConfig {
 pub fn speaker_preset() -> DspConfig {
     DspConfig {
         echo_cancel: true,
+        aec_method: crate::audio::dsp::AecMethod::Speex,
         echo_cancel_strength: 70,
         noise_suppression: NsLevel::Moderate,
         agc: true,
@@ -79,6 +81,7 @@ mod tests {
     fn custom_passes_through_untouched() {
         let custom = DspConfig {
             echo_cancel: false,
+            aec_method: crate::audio::dsp::AecMethod::Speex,
             echo_cancel_strength: 40,
             noise_suppression: NsLevel::Off,
             agc: true,
@@ -102,7 +105,8 @@ mod tests {
     #[test]
     fn explicit_presets_ignore_classification() {
         let custom = DspConfig {
-            echo_cancel: false, echo_cancel_strength: 40, noise_suppression: NsLevel::Off,
+            echo_cancel: false, aec_method: crate::audio::dsp::AecMethod::Speex,
+            echo_cancel_strength: 40, noise_suppression: NsLevel::Off,
             agc: false, vad: false, high_pass: false,
         };
         assert!(!effective(VoiceProfile::Headset, &custom, OutputKind::Speakers).echo_cancel);
