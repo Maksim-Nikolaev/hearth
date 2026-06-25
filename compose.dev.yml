@@ -1,5 +1,4 @@
-# Postgres-only, for the fast `cargo run -p hearth-backend` inner loop.
-# The full stack (backend in Docker) lives in compose.yml.
+# Postgres-only for the `cargo run` inner loop; full stack is in compose.yml.
 services:
   postgres:
     image: postgres:18
@@ -10,7 +9,7 @@ services:
     ports:
       - "5433:5432"
     volumes:
-      - hearth_pgdata:/var/lib/postgresql/data
+      - hearth_pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hearth} -d ${POSTGRES_DB:-hearth}"]
       interval: 5s

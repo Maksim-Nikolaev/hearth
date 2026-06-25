@@ -1,26 +1,19 @@
-# Backend image. Build context is the REPO ROOT (workspace path deps); build via
-# compose, or: docker build -f backend/Dockerfile -t hearth-backend .
-# cargo-chef caches the dependency build so a code change only recompiles
-# hearth-backend, not all of its deps.
-
-# ---- chef ------------------------------------------------------------------
+# Backend image. Build context = repo root (workspace path deps). cargo-chef
+# caches the dependency build so code changes only recompile hearth-backend.
 FROM rust:1-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
-# ---- planner: compute the dependency recipe --------------------------------
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-# ---- builder: cook deps (cached), then build the backend -------------------
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release -p hearth-backend --recipe-path recipe.json
 COPY . .
 RUN cargo build --release -p hearth-backend --locked
 
-# ---- runtime ---------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \

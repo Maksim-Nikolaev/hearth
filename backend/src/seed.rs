@@ -1,7 +1,5 @@
-//! Dev-only user bootstrap: seed alice (admin) / bob (user) idempotently,
-//! passwords `pw-<name>`. Shared by the `seed` binary subcommand and the
-//! `seed_dev` example. Users are otherwise admin-provisioned (`POST /users`),
-//! a chicken-and-egg on a fresh DB.
+//! Dev-only bootstrap: seed alice (admin) / bob (user) idempotently, passwords
+//! `pw-<name>`. Shared by the `seed` subcommand and the `seed_dev` example.
 
 use crate::{
     security::password,
