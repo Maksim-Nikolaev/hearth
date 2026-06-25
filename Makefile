@@ -30,13 +30,12 @@ psql: ## Open a psql shell in the Postgres container
 seed: ## Seed dev users (alice/bob) in the running stack's DB
 	docker compose run --rm backend seed
 
-secrets-encrypt: ## Encrypt .env -> .env.age (needs AGE_RECIPIENTS)
-	@command -v age >/dev/null || { echo "install age: https://github.com/FiloSottile/age"; exit 1; }
-	@test -n "$(AGE_RECIPIENTS)" || { echo "set AGE_RECIPIENTS (path to a recipients file, one age1... per line)"; exit 1; }
-	age -R "$(AGE_RECIPIENTS)" -o .env.age .env
-	@echo "encrypted .env -> .env.age"
+secrets-encrypt: ## Encrypt .env -> .env.enc (sops + age, recipient from .sops.yaml)
+	@command -v sops >/dev/null || { echo "install sops: https://github.com/getsops/sops"; exit 1; }
+	sops --encrypt --input-type dotenv --output-type dotenv .env > .env.enc
+	@echo "encrypted .env -> .env.enc"
 
-secrets-decrypt: ## Decrypt .env.age -> .env (needs AGE_KEY_FILE)
-	@command -v age >/dev/null || { echo "install age: https://github.com/FiloSottile/age"; exit 1; }
-	age -d -i "$(AGE_KEY_FILE)" -o .env .env.age
-	@echo "decrypted .env.age -> .env"
+secrets-decrypt: ## Decrypt .env.enc -> .env (needs the age key in AGE_KEY_FILE)
+	@command -v sops >/dev/null || { echo "install sops: https://github.com/getsops/sops"; exit 1; }
+	SOPS_AGE_KEY_FILE="$(AGE_KEY_FILE)" sops --decrypt --input-type dotenv --output-type dotenv .env.enc > .env
+	@echo "decrypted .env.enc -> .env"

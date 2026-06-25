@@ -13,7 +13,7 @@ upcoming private-network cross-machine test runs against.
 ## Scope
 
 - **In:** a deployable full stack (backend in Docker, Postgres internal),
-  persistence, auto-restart, `.env` secrets with **age encrypt/decrypt**, fast
+  persistence, auto-restart, `.env` secrets with **sops+age encrypt/decrypt**, fast
   cached rebuilds, a `seed` path, helper `Makefile`, a one-line README pointer.
 - **Out (deferred, per `docs/STATUS.md`):** TLS / Traefik reverse-proxy, coturn,
   Grafana/Loki observability, image registry / CI publishing.
@@ -42,7 +42,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - hearth_pgdata:/var/lib/postgresql/data   # conventional PGDATA mount
+      - hearth_pgdata:/var/lib/postgresql   # postgres:18 requires the parent dir
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
@@ -71,8 +71,9 @@ volumes:
   hearth_pgdata:
 ```
 
-A fresh volume name (`hearth_pgdata`) at the conventional `/var/lib/postgresql/data`
-path; the old `hearth_pg` volume can be removed. The dev DB re-seeds once
+A fresh volume name (`hearth_pgdata`) at `/var/lib/postgresql` (postgres:18 stores
+data in a subdir and rejects a `.../data` mount); the old `hearth_pg`
+volume can be removed. The dev DB re-seeds once
 (`make seed`).
 
 ### 2. `compose.dev.yml` — Postgres-only (trim)
@@ -81,7 +82,7 @@ Remove the `backend` service; keep only `postgres` (host port `5433:5432`, env
 from `.env`, same `hearth_pgdata` volume + healthcheck) for the fast `cargo run
 -p hearth-backend` inner loop. Never run both Postgres containers at once.
 
-### 3. Secrets — `.env` + age encryption
+### 3. Secrets — `.env` + sops/age encryption
 
 Runtime config lives in `.env` (gitignored): `POSTGRES_USER`,
 `POSTGRES_PASSWORD`, `POSTGRES_DB`, `JWT_SECRET` (real, ≥32 bytes),
@@ -89,21 +90,20 @@ Runtime config lives in `.env` (gitignored): `POSTGRES_USER`,
 (localhost:5433, for the cargo-run path). `.env.example` lists all of these with
 safe placeholders and `# JWT_SECRET: generate with: openssl rand -base64 48`.
 
-**Secrets management = age** (the `.gitignore` already ignores `*.age` and
-`secrets.dec.*`). `.env` is encrypted to `.env.age` with plain `age` (the `.age`
-extension is `age`, not sops); the encrypted blob is the source of truth carried
-to production **encrypted** and decrypted on the box. Both `.env` and `.env.age`
-stay out of git (existing convention); the `.age` is distributed out of band.
+**Secrets management = sops + age.** A committed `.sops.yaml` names the age
+recipient (public key); `.env` is encrypted to `.env.enc` (dotenv-formatted,
+values `ENC[…]`). `.env.enc` is the source of truth carried to production
+**encrypted** and decrypted on the box. `.env` and `.env.enc` are gitignored
+(`.env.*`); only the public `.sops.yaml` is committed.
 
-- `make secrets-encrypt` → `age -R "$AGE_RECIPIENTS" -o .env.age .env`
-- `make secrets-decrypt` → `age -d -i "$AGE_KEY_FILE" -o .env .env.age`
+- `make secrets-encrypt` → `sops --encrypt --input-type dotenv --output-type dotenv .env > .env.enc`
+- `make secrets-decrypt` → `SOPS_AGE_KEY_FILE=$AGE_KEY_FILE sops --decrypt … .env.enc > .env`
 
-`AGE_RECIPIENTS` (a recipients file or `age1...` pubkey) and `AGE_KEY_FILE` (the
-age identity, default `${SOPS_AGE_KEY_FILE:-$HOME/.config/age/keys.txt}`) come
-from the environment so no key material is hardcoded. If `age` isn't installed
-the targets print an install hint and exit non-zero.
+The recipient comes from `.sops.yaml` (no hardcoded keys); the age identity for
+decrypt is `AGE_KEY_FILE` (default `${SOPS_AGE_KEY_FILE:-$HOME/.config/age/keys.txt}`).
+If `sops` isn't installed the targets print an install hint and exit non-zero.
 
-**Deferred:** a separate `.env.prod` (+ `.env.prod.age`) for the real production
+**Deferred:** a separate `.env.prod` (+ its `.env.prod.enc`) for the real production
 deployment lands with the later deployment workstream — this sub-project sets up
 the mechanism, not the prod values.
 
@@ -181,7 +181,7 @@ and restarts it. Postgres data persists in the `hearth_pgdata` volume.
 - Reboot (or `docker restart`) → stack auto-starts.
 - `make update` after a backend code change → fast rebuild (deps cached).
 - `make secrets-encrypt` then `make secrets-decrypt` round-trips `.env`
-  identically (with a test age key); `.env.age` is non-plaintext.
+  identically (with a test age key); `.env.enc` is non-plaintext.
 
 ## Non-goals
 
