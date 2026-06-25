@@ -4,6 +4,7 @@ pub mod encoders;
 pub mod flow;
 pub mod flow_peer;
 pub mod hotkey;
+pub mod net;
 pub mod screen;
 pub mod session;
 pub mod signaling;
