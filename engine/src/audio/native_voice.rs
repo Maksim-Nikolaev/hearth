@@ -49,9 +49,12 @@ const FRAME_US: u64 = FRAME as u64 * 1_000_000 / 48_000;
 /// live by the Settings "Jitter buffer (ms)" slider via [`NativeVoice::set_jitter_ms`].
 const DEFAULT_JITTER_MS: u32 = 20;
 
-/// Device-lane cushion the receive servo keeps filled (~10 ms). The jitter buffer
-/// holds the network cushion; this is just deep enough that the render thread
-/// never drains the lane dry between servo polls.
+/// Device-lane cushion the refill loop keeps filled (~10 ms). The jitter buffer
+/// holds the network cushion; this only has to outlast the gap between refills so
+/// the render thread never drains the lane dry. The release thread raises the OS
+/// timer resolution to 1 ms (see `TimerResolutionGuard`) so `LANE_POLL_MS` sleeps
+/// are honored on Windows too, keeping two frames enough without the silence gaps
+/// the default ~15.6 ms Windows tick caused.
 const TARGET_LANE_FRAMES: usize = 2;
 
 /// Receive servo poll period — short enough that the lane can't fall below the
@@ -697,6 +700,10 @@ impl NativeVoice {
             std::thread::Builder::new()
                 .name(format!("native-voice-tx-{source_id}"))
                 .spawn(move || {
+                    // Hold 1 ms OS timer resolution for the call so the short
+                    // LANE_POLL_MS sleeps below are honored (no Windows silence gaps).
+                    let _timer_res = TimerResolutionGuard::new();
+
                     let mut dec = match Decoder::new(SampleRate::Hz48000, Channels::Mono) {
                         Ok(d) => d,
                         Err(e) => {
@@ -717,7 +724,7 @@ impl NativeVoice {
                     // playout speed ~1%, and varispeed-resample the decoded audio to
                     // match. Recomputed once per poll; the same speed resamples every
                     // frame decoded that tick.
-                    let mut servo = DriftServo::new(TARGET_LANE_FRAMES as f32);
+                    let mut servo = DriftServo::new(ms_to_frames(DEFAULT_JITTER_MS) as f32);
                     let mut vari = Varispeed::new();
                     let mut speed = 1.0f32;
 
@@ -727,22 +734,17 @@ impl NativeVoice {
                         let deaf_now =
                             deaf.load(Ordering::Relaxed) || suspended.load(Ordering::Relaxed);
 
-                        // Servo the playout speed off the current buffered depth. Held
-                        // flat while deaf (nothing renders); resumes on unmute. The
-                        // setpoint is the buffer's *actual* operating depth (the
-                        // adaptive jitter target, which sits at the floor on a clean
-                        // link) + the lane cushion — not the slider ceiling, which the
-                        // depth-capped buffer can never reach (the servo would peg).
+                        // Servo the playout speed off the jitter-buffer depth — the
+                        // one freely controllable cushion (the lane is pinned at its
+                        // own target by the refill loop below, so it carries no drift
+                        // signal). The setpoint is the buffer's prebuffer target, which
+                        // it now actually holds. Held flat while deaf (nothing renders);
+                        // resumes on unmute.
                         if !deaf_now {
-                            let (jb_frames, jb_target) = {
-                                let jb = jitter.lock().unwrap();
-                                (jb.depth() as f32, jb.current_target() as f32)
-                            };
-                            let lane_frames =
-                                playback.lane_samples(source_id) as f32 / FRAME as f32;
+                            let jb_frames = jitter.lock().unwrap().depth() as f32;
 
-                            servo.set_target(TARGET_LANE_FRAMES as f32 + jb_target);
-                            speed = servo.observe(lane_frames + jb_frames);
+                            servo.set_target(ms_to_frames(jitter_ms.load(Ordering::Relaxed)) as f32);
+                            speed = servo.observe(jb_frames);
                         }
 
                         loop {
@@ -855,6 +857,36 @@ pub(crate) fn ramp_gain(buf: &mut [f32], env: &mut f32, target: f32) {
             *env = target; // settle exactly: unity when open, floor when closed
         }
         *s *= *env;
+    }
+}
+
+/// Raises the OS multimedia-timer resolution to 1 ms for its lifetime, then
+/// restores it on drop. The receive release loop sleeps in `LANE_POLL_MS` (3 ms)
+/// steps; on stock Windows a plain `sleep` rounds up to the ~15.6 ms default timer
+/// tick, draining the playback lane to silence. Holding 1 ms resolution while a
+/// call runs makes the short sleeps accurate. No-op off Windows.
+struct TimerResolutionGuard;
+
+impl TimerResolutionGuard {
+    fn new() -> TimerResolutionGuard {
+        #[cfg(target_os = "windows")]
+        // SAFETY: `timeBeginPeriod` is always safe to call; it is paired with the
+        // matching `timeEndPeriod` in `Drop` (the API is reference-counted).
+        unsafe {
+            windows::Win32::Media::timeBeginPeriod(1);
+        }
+
+        TimerResolutionGuard
+    }
+}
+
+impl Drop for TimerResolutionGuard {
+    fn drop(&mut self) {
+        #[cfg(target_os = "windows")]
+        // SAFETY: balances the `timeBeginPeriod(1)` from `new`.
+        unsafe {
+            windows::Win32::Media::timeEndPeriod(1);
+        }
     }
 }
 
