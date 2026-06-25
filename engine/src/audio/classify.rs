@@ -1,9 +1,17 @@
-use crate::audio::devices::device_to_info;
 use crate::audio::profile::OutputKind;
+
+// Only the Linux/macOS `classify_output` queries GStreamer devices; the Windows
+// build stubs it out, so these would otherwise read as unused there.
+#[cfg(not(target_os = "windows"))]
+use crate::audio::devices::device_to_info;
+#[cfg(not(target_os = "windows"))]
 use gstreamer as gst;
+#[cfg(not(target_os = "windows"))]
 use gstreamer::prelude::*;
 
-/// Classify a string against known form-factor / name hints.
+/// Classify a string against known form-factor / name hints. Used by the
+/// non-Windows `classify_output` (and the tests); the Windows stub never calls it.
+#[cfg(any(not(target_os = "windows"), test))]
 pub(crate) fn kind_from(form_factor: Option<&str>, label: &str) -> OutputKind {
     let ff = form_factor.unwrap_or("").to_ascii_lowercase();
     if ff.contains("head") || ff.contains("hands-free") || ff.contains("earbud") {

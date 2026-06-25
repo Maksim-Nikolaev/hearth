@@ -1,4 +1,6 @@
-/// Parse the soft "Max realtime priority" limit out of `/proc/self/limits`.
+/// Parse the soft "Max realtime priority" limit out of `/proc/self/limits`. Only
+/// the Linux `realtime_available` reads it (and the tests); other targets don't.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn parse_rtprio_limit(proc_limits: &str) -> Option<u64> {
     let line = proc_limits
         .lines()
