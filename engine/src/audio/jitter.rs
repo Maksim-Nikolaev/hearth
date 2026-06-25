@@ -30,6 +30,12 @@ const GROW_FRAMES: usize = 2;
 /// the 5 ms native framing), so the buffer shrinks once a link settles.
 const DECAY_CLEAN_POPS: usize = 200;
 
+/// Headroom above the adaptive target the live depth may reach before the oldest
+/// frame is dropped (skip-ahead). Bounds depth to `target + slack`, so a startup
+/// burst or a faster-than-us sender clock can't pin latency high — depth tracks
+/// the target down instead of riding a ceiling-sized cap.
+const DEPTH_SLACK_FRAMES: usize = 2;
+
 /// One frame's worth of release decision from [`JitterBuffer::pop`].
 pub(crate) enum JitterOut {
     /// Decode and play this Opus payload.
@@ -147,12 +153,11 @@ impl JitterBuffer {
         self.buf.insert(seq, payload.to_vec());
         self.counters.accepted += 1;
 
-        // Bound the depth so a burst or a faster-than-us sender clock can't grow
-        // playout latency without limit over a long call. Sized off the ceiling
-        // (the max allowed buffering), not the live adaptive target, so normal
-        // reordering within the window isn't dropped. Drop the oldest frames
-        // (closest to the play cursor) and skip the cursor past them.
-        let cap = self.ceiling * 2;
+        // Bound the depth to the adaptive target plus headroom, so it tracks the
+        // target *down* — a startup burst or a faster-than-us sender clock can't
+        // pin latency at a ceiling-sized cap. Drop the oldest frames (closest to
+        // the play cursor) and skip the cursor past them.
+        let cap = self.target + DEPTH_SLACK_FRAMES;
         while self.buf.len() > cap {
             let Some(next) = self.next_seq else { break };
             let oldest = *self.buf.keys().min_by_key(|k| k.wrapping_sub(next)).unwrap();
@@ -398,15 +403,33 @@ mod tests {
         // A burst, or a sender clock running faster than our playback, fills the
         // buffer faster than it drains. Depth must stay bounded (no creeping
         // latency over a long call), dropping the oldest and skipping ahead.
-        let mut jb = JitterBuffer::new(2); // target 2 → cap 4
+        let mut jb = JitterBuffer::new(2); // target starts at floor 1 → cap 3
         for s in 0..100u16 {
             jb.push(s, &[s as u8]);
         }
 
-        assert!(jb.buf.len() <= 4, "depth must stay bounded, got {}", jb.buf.len());
+        assert!(jb.buf.len() <= 3, "depth must stay bounded, got {}", jb.buf.len());
 
         // Playback resumes at the live edge, not the stale seq 0.
         assert!(payload(jb.pop())[0] >= 96, "skipped the stale backlog to the live edge");
+    }
+
+    #[test]
+    fn depth_tracks_the_low_target_not_the_ceiling() {
+        // Regression: with a high ceiling but a clean link (target at the floor),
+        // an accumulated backlog must trim down to `target + slack`, not pin near
+        // the ceiling. Pre-fix, the cap was 2×ceiling, so depth rode ~16 frames.
+        let mut jb = JitterBuffer::new(8); // generous ceiling
+        for s in 0..50u16 {
+            jb.push(s, &[0]); // contiguous → no jitter events, target stays at floor
+        }
+
+        assert_eq!(jb.current_target(), FLOOR_FRAMES, "clean link keeps target at the floor");
+        assert!(
+            jb.depth() <= FLOOR_FRAMES + DEPTH_SLACK_FRAMES,
+            "depth tracks the low target, not the ceiling: {}",
+            jb.depth()
+        );
     }
 
     #[test]

@@ -35,7 +35,7 @@ fn format_voice_stats(stats: &[engine::audio::native_voice::PeerStatsSnapshot]) 
             let c = s.counters;
 
             format!(
-                "peer {peer}  RTT {rtt}  buffer {}+{} ms  loss {:.1}% ({}/{}+{})  late {}  resync {}",
+                "peer {peer}  RTT {rtt}  buffer {}+{} ms  loss {:.1}% ({}/{}+{})  late {}  drops {}  resync {}",
                 s.jitter_ms,
                 s.lane_ms,
                 s.loss_pct(),
@@ -43,6 +43,7 @@ fn format_voice_stats(stats: &[engine::audio::native_voice::PeerStatsSnapshot]) 
                 c.accepted,
                 c.concealed,
                 c.late_dropped,
+                c.overfill_dropped,
                 c.resynced,
             )
         })
