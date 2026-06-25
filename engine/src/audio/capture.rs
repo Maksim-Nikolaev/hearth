@@ -33,6 +33,14 @@ pub fn f32_to_i16(src: &[f32], dst: &mut [i16]) {
     }
 }
 
+/// Scale every sample in place by `gain` (a linear multiplier). Used for the
+/// user mic/speaker volume; `gain` is expected pre-clamped to `[0.0, 1.0]`.
+pub(crate) fn apply_gain(frame: &mut [f32], gain: f32) {
+    for s in frame.iter_mut() {
+        *s *= gain;
+    }
+}
+
 /// RMS level of a frame in dBFS. Silence yields a very negative floor
 /// (clamped at -120 dB); a full-scale constant or sine sits near 0 dB.
 pub fn rms_dbfs(frame: &[f32]) -> f32 {
@@ -500,6 +508,19 @@ mod tests {
             let got = i16::from_le_bytes([re_encoded[i * 2], re_encoded[i * 2 + 1]]);
             assert!((s - got).abs() <= 1, "sample {i}: {s} vs {got}");
         }
+    }
+
+    #[test]
+    fn apply_gain_identity_half_zero() {
+        let mut f = vec![1.0f32, -0.5, 0.25];
+        apply_gain(&mut f, 1.0);
+        assert_eq!(f, vec![1.0, -0.5, 0.25]);
+
+        apply_gain(&mut f, 0.5);
+        assert_eq!(f, vec![0.5, -0.25, 0.125]);
+
+        apply_gain(&mut f, 0.0);
+        assert_eq!(f, vec![0.0, 0.0, 0.0]);
     }
 
     #[test]
