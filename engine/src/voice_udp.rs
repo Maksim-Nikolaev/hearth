@@ -126,6 +126,7 @@ pub(crate) struct VoiceUdpPeer {
     jitter: gst::Element,
     voice_appsrc: gst_app::AppSrc,
     spk_valve: gst::Element,
+    spk_volume: gst::Element,
 }
 
 impl VoiceUdpPeer {
@@ -162,6 +163,11 @@ impl VoiceUdpPeer {
             .build()?;
         let rconv = gst::ElementFactory::make("audioconvert").build()?;
         let rresample = gst::ElementFactory::make("audioresample").build()?;
+        // Master speaker volume for this peer (user output-volume slider). Live.
+        let spk_volume = gst::ElementFactory::make("volume")
+            .name("spk_volume")
+            .property("volume", 1.0f64)
+            .build()?;
         // deafen gate: drop=true silences incoming audio without tearing down.
         let spk_valve = gst::ElementFactory::make("valve")
             .name("spk_valve")
@@ -169,8 +175,8 @@ impl VoiceUdpPeer {
             .build()?;
         let sink = voice_playback_sink()?;
 
-        pipeline.add_many([&udpsrc, &jitter, &depay, &dec, &rconv, &rresample, &spk_valve, &sink])?;
-        gst::Element::link_many([&udpsrc, &jitter, &depay, &dec, &rconv, &rresample, &spk_valve, &sink])?;
+        pipeline.add_many([&udpsrc, &jitter, &depay, &dec, &rconv, &rresample, &spk_volume, &spk_valve, &sink])?;
+        gst::Element::link_many([&udpsrc, &jitter, &depay, &dec, &rconv, &rresample, &spk_volume, &spk_valve, &sink])?;
 
         // ── send: appsrc(PCM) → opusenc → rtpopuspay → udpsink ──
         let pcm_caps = gst::Caps::builder("audio/x-raw")
@@ -266,7 +272,13 @@ impl VoiceUdpPeer {
             jitter,
             voice_appsrc: appsrc,
             spk_valve,
+            spk_volume,
         })
+    }
+
+    /// Master speaker volume for this peer's playback (0.0–1.0). Live.
+    pub fn set_output_volume(&self, v: f64) {
+        self.spk_volume.set_property("volume", v);
     }
 
     /// Live-update the receive jitter buffer depth (ms). Lets the Voice-settings

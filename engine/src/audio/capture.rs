@@ -6,6 +6,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use std::sync::mpsc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -76,6 +77,8 @@ pub struct VoiceCapture {
     monitor_pipeline: Mutex<Option<gst::Pipeline>>,
     /// Output device id for the self-monitor sink (the chosen speaker).
     output: Option<String>,
+    /// User mic volume (pre-amp, f32 bits, 0.0–1.0), applied in the `cap` callback.
+    input_volume: Arc<AtomicU32>,
 }
 
 impl VoiceCapture {
@@ -91,6 +94,7 @@ impl VoiceCapture {
         let peers: Arc<Mutex<Vec<gst_app::AppSrc>>> = Arc::new(Mutex::new(Vec::new()));
         let pending_config: Arc<Mutex<Option<DspConfig>>> = Arc::new(Mutex::new(None));
         let self_monitor: Arc<Mutex<Option<gst_app::AppSrc>>> = Arc::new(Mutex::new(None));
+        let input_volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
 
         // The self-monitor sink plays on the chosen speaker; keep the id since
         // `output` is consumed building the AEC reference below.
@@ -123,6 +127,7 @@ impl VoiceCapture {
             pending_config.clone(),
             self_monitor.clone(),
             ref_rx,
+            input_volume.clone(),
             evt,
         )?;
 
@@ -139,7 +144,13 @@ impl VoiceCapture {
             self_monitor,
             monitor_pipeline: Mutex::new(None),
             output: monitor_output,
+            input_volume,
         })
+    }
+
+    /// Set mic input volume (0.0–1.0). Live, applied as a pre-amp on capture.
+    pub fn set_input_volume(&self, v: f64) {
+        self.input_volume.store((v as f32).to_bits(), Ordering::Relaxed);
     }
 
     /// Toggle the in-call self-monitor (hear yourself through the live capture).
@@ -252,6 +263,7 @@ fn build_mic_pipeline(
     pending_config: Arc<Mutex<Option<DspConfig>>>,
     self_monitor: Arc<Mutex<Option<gst_app::AppSrc>>>,
     ref_rx: mpsc::Receiver<Vec<f32>>,
+    input_volume: Arc<AtomicU32>,
     evt: UnboundedSender<SessionEvent>,
 ) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::new();
@@ -310,6 +322,12 @@ fn build_mic_pipeline(
 
                 if mic.len() != FRAME_SAMPLES {
                     return Ok(gst::FlowSuccess::Ok);
+                }
+
+                // Mic pre-amp (user input volume) before DSP.
+                let in_vol = f32::from_bits(input_volume.load(Ordering::Relaxed));
+                if (in_vol - 1.0).abs() > f32::EPSILON {
+                    apply_gain(&mut mic, in_vol);
                 }
 
                 if let Some(new_cfg) = pending_config.lock().unwrap().take() {
