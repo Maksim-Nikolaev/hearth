@@ -39,6 +39,13 @@ impl SimpleComponent for LoginForm {
             gtk::Entry {
                 set_placeholder_text: Some("username"),
                 set_width_request: 240,
+                // Enter from either field submits, matching the Log in button.
+                connect_activate[sender, password_entry] => move |entry| {
+                    let _ = sender.output(LoginOutput::Submit {
+                        username: entry.text().to_string(),
+                        password: password_entry.text().to_string(),
+                    });
+                },
             },
 
             #[name = "password_entry"]
@@ -46,7 +53,12 @@ impl SimpleComponent for LoginForm {
                 set_placeholder_text: Some("password"),
                 set_visibility: false,
                 set_width_request: 240,
-                connect_activate => LoginInput::SetStatus(String::new()),
+                connect_activate[sender, username_entry] => move |entry| {
+                    let _ = sender.output(LoginOutput::Submit {
+                        username: username_entry.text().to_string(),
+                        password: entry.text().to_string(),
+                    });
+                },
             },
 
             gtk::Button {
