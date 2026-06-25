@@ -18,6 +18,18 @@ use std::collections::HashMap;
 /// native framing — beyond this, PLC is audible garbage and skipping is cleaner.
 const MAX_CONCEAL_FRAMES: u16 = 8;
 
+/// Adaptive prebuffer floor — the depth held on a clean link, for minimal
+/// latency. One frame (~5 ms) is just a reorder slot.
+const FLOOR_FRAMES: usize = 1;
+
+/// Frames added to the adaptive target on each observed jitter event (a hole, a
+/// late arrival, or a resync), up to the ceiling.
+const GROW_FRAMES: usize = 2;
+
+/// Clean releases between each one-frame decay back toward the floor (~1 s at
+/// the 5 ms native framing), so the buffer shrinks once a link settles.
+const DECAY_CLEAN_POPS: usize = 200;
+
 /// One frame's worth of release decision from [`JitterBuffer::pop`].
 pub(crate) enum JitterOut {
     /// Decode and play this Opus payload.
@@ -47,8 +59,14 @@ pub struct JitterCounters {
 }
 
 pub(crate) struct JitterBuffer {
-    /// Prebuffer depth: hold this many frames before the first release.
+    /// Current adaptive prebuffer depth (frames), within `[FLOOR_FRAMES, ceiling]`.
+    /// Grows on observed jitter, decays toward the floor on a clean link.
     target: usize,
+    /// Upper bound on `target` — the user's jitter-slider value. The slider caps
+    /// the adaptive depth rather than fixing it, so a quiet link stays low-latency.
+    ceiling: usize,
+    /// Consecutive clean releases, driving the slow decay back toward the floor.
+    clean_pops: usize,
     buf: HashMap<u16, Vec<u8>>,
     /// Sequence to release next; `None` until the first packet sets the origin.
     next_seq: Option<u16>,
@@ -58,13 +76,38 @@ pub(crate) struct JitterBuffer {
 }
 
 impl JitterBuffer {
-    pub fn new(target_frames: usize) -> JitterBuffer {
+    pub fn new(ceiling_frames: usize) -> JitterBuffer {
         JitterBuffer {
-            target: target_frames.max(1),
+            target: FLOOR_FRAMES,
+            ceiling: ceiling_frames.max(FLOOR_FRAMES),
+            clean_pops: 0,
             buf: HashMap::new(),
             next_seq: None,
             playing: false,
             counters: JitterCounters::default(),
+        }
+    }
+
+    /// Current adaptive prebuffer depth in frames.
+    #[cfg(test)]
+    pub fn current_target(&self) -> usize {
+        self.target
+    }
+
+    /// Grow the target toward the ceiling on an observed jitter event.
+    fn note_jitter(&mut self) {
+        self.target = (self.target + GROW_FRAMES).min(self.ceiling);
+        self.clean_pops = 0;
+    }
+
+    /// A clean release: after a run of them, decay one frame toward the floor.
+    fn note_clean(&mut self) {
+        self.clean_pops += 1;
+        if self.clean_pops >= DECAY_CLEAN_POPS {
+            self.clean_pops = 0;
+            if self.target > FLOOR_FRAMES {
+                self.target -= 1;
+            }
         }
     }
 
@@ -78,16 +121,12 @@ impl JitterBuffer {
         self.buf.len()
     }
 
-    /// Change the prebuffer depth live (e.g. the user moved the jitter slider).
-    /// Dropping the play latch re-runs the prebuffer at the new depth: a deeper
-    /// buffer holds back until the larger cushion refills (inserting the extra
-    /// latency), a shallower one re-latches as soon as the next frame is ready.
-    pub fn set_target(&mut self, target_frames: usize) {
-        let target = target_frames.max(1);
-        if target != self.target {
-            self.target = target;
-            self.playing = false;
-        }
+    /// Set the adaptive ceiling live (the user moved the jitter slider). The
+    /// slider is an upper bound, not a fixed latency: a quiet link sits near the
+    /// floor and only climbs toward the ceiling under real jitter.
+    pub fn set_target(&mut self, ceiling_frames: usize) {
+        self.ceiling = ceiling_frames.max(FLOOR_FRAMES);
+        self.target = self.target.min(self.ceiling);
     }
 
     pub fn push(&mut self, seq: u16, payload: &[u8]) {
@@ -99,6 +138,7 @@ impl JitterBuffer {
             // misread as a future frame.
             Some(next) if (seq.wrapping_sub(next) as i16) < 0 => {
                 self.counters.late_dropped += 1;
+                self.note_jitter(); // a late arrival means we under-buffered
                 return;
             }
             Some(_) => {}
@@ -108,9 +148,11 @@ impl JitterBuffer {
         self.counters.accepted += 1;
 
         // Bound the depth so a burst or a faster-than-us sender clock can't grow
-        // playout latency without limit over a long call. Drop the oldest frames
+        // playout latency without limit over a long call. Sized off the ceiling
+        // (the max allowed buffering), not the live adaptive target, so normal
+        // reordering within the window isn't dropped. Drop the oldest frames
         // (closest to the play cursor) and skip the cursor past them.
-        let cap = (self.target * 2).max(self.target + 1);
+        let cap = self.ceiling * 2;
         while self.buf.len() > cap {
             let Some(next) = self.next_seq else { break };
             let oldest = *self.buf.keys().min_by_key(|k| k.wrapping_sub(next)).unwrap();
@@ -135,13 +177,18 @@ impl JitterBuffer {
 
         if let Some(payload) = self.buf.remove(&seq) {
             self.next_seq = Some(seq.wrapping_add(1));
+            self.note_clean();
 
             return JitterOut::Packet(payload);
         }
 
-        // The expected frame is absent. An empty buffer is just an underrun:
-        // hold the slot and play silence until packets resume.
+        // The expected frame is absent. An empty buffer is a genuine underrun:
+        // play silence, and drop the play latch so the next fills re-prebuffer to
+        // the current (possibly grown) target — rebuilding the cushion only after
+        // a real gap, when the audio is already interrupted.
         if self.buf.is_empty() {
+            self.playing = false;
+
             return JitterOut::Starve;
         }
 
@@ -157,12 +204,14 @@ impl JitterBuffer {
             let payload = self.buf.remove(&earliest).unwrap();
             self.next_seq = Some(earliest.wrapping_add(1));
             self.counters.resynced += 1;
+            self.note_jitter();
 
             return JitterOut::Packet(payload);
         }
 
         self.next_seq = Some(seq.wrapping_add(1));
         self.counters.concealed += 1;
+        self.note_jitter(); // a hole means jitter — grow the cushion
 
         JitterOut::Conceal
     }
@@ -181,22 +230,20 @@ mod tests {
     }
 
     #[test]
-    fn prebuffers_then_releases_in_order() {
-        let mut jb = JitterBuffer::new(3);
+    fn starts_at_floor_and_releases_in_order() {
+        // A clean link starts at the floor (1 frame), not the ceiling, so there's
+        // no needless startup latency. The first frame releases immediately.
+        let mut jb = JitterBuffer::new(8);
+        assert_eq!(jb.current_target(), 1, "begins at the floor, not the ceiling");
+
         jb.push(0, &[10]);
+        assert_eq!(payload(jb.pop()), [10], "one buffered frame is enough to start");
+
         jb.push(1, &[11]);
-
-        // Below the target depth: still prebuffering, nothing released yet.
-        assert!(matches!(jb.pop(), JitterOut::Starve));
-
         jb.push(2, &[12]);
-
-        // Target reached → release every buffered frame in sequence order.
-        assert_eq!(payload(jb.pop()), [10]);
         assert_eq!(payload(jb.pop()), [11]);
         assert_eq!(payload(jb.pop()), [12]);
 
-        // Drained: back to starving.
         assert!(matches!(jb.pop(), JitterOut::Starve));
     }
 
@@ -282,20 +329,68 @@ mod tests {
     }
 
     #[test]
-    fn raising_target_reprebuffers_for_more_cushion() {
-        let mut jb = JitterBuffer::new(1);
+    fn slider_sets_ceiling_not_fixed_latency() {
+        let mut jb = JitterBuffer::new(2);
+        assert_eq!(jb.current_target(), 1);
+
+        // Raising the slider only raises the ceiling — a quiet link stays at the
+        // floor, so the user doesn't pay latency they aren't using.
+        jb.set_target(10);
+        assert_eq!(jb.current_target(), 1, "raising the slider adds no latency on a clean link");
+
+        // Grow the target via a hole, then lowering the ceiling clamps it.
+        jb.push(1, &[0]);
+        jb.push(3, &[0]);
+        assert_eq!(payload(jb.pop()), [0]); // seq 1
+        assert!(matches!(jb.pop(), JitterOut::Conceal)); // hole at seq 2
+        assert_eq!(jb.current_target(), 3);
+
+        jb.set_target(2);
+        assert_eq!(jb.current_target(), 2, "lowering the ceiling clamps the target");
+    }
+
+    #[test]
+    fn grows_toward_ceiling_under_repeated_loss() {
+        let mut jb = JitterBuffer::new(8);
         jb.push(0, &[0]);
-        assert_eq!(payload(jb.pop()), [0]); // playing, next expected is 1
+        assert_eq!(payload(jb.pop()), [0]);
 
-        // Deepening the buffer mid-stream holds playback back until the larger
-        // cushion refills, so the extra latency is actually inserted.
-        jb.set_target(3);
-        jb.push(1, &[1]);
-        assert!(matches!(jb.pop(), JitterOut::Starve), "only 1 of 3 frames buffered");
+        // Each iteration leaves a one-frame hole, forcing a conceal that grows
+        // the cushion. Repeated loss climbs toward the ceiling.
+        let mut seq = 2u16;
+        for _ in 0..4 {
+            jb.push(seq, &[0]);
+            assert!(matches!(jb.pop(), JitterOut::Conceal));
+            assert_eq!(payload(jb.pop())[0], 0);
+            seq += 2;
+        }
 
-        jb.push(2, &[2]);
-        jb.push(3, &[3]);
-        assert_eq!(payload(jb.pop()), [1]); // cushion full → resume in order
+        assert!(jb.current_target() > 1, "grew under loss");
+        assert!(jb.current_target() <= 8, "never past the ceiling");
+    }
+
+    #[test]
+    fn decays_toward_floor_when_link_is_clean() {
+        let mut jb = JitterBuffer::new(8);
+
+        // Grow the target with one hole.
+        jb.push(0, &[0]);
+        assert_eq!(payload(jb.pop()), [0]);
+        jb.push(2, &[0]);
+        assert!(matches!(jb.pop(), JitterOut::Conceal));
+        assert_eq!(payload(jb.pop())[0], 0);
+        let grown = jb.current_target();
+        assert!(grown > 1, "target grew");
+
+        // A long run of clean, contiguous frames decays it back to the floor.
+        let mut seq = 3u16;
+        for _ in 0..(DECAY_CLEAN_POPS * grown) {
+            jb.push(seq, &[0]);
+            let _ = jb.pop();
+            seq = seq.wrapping_add(1);
+        }
+
+        assert_eq!(jb.current_target(), 1, "decays to the floor on a clean link");
     }
 
     #[test]
