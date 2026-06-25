@@ -331,18 +331,27 @@ fn run_playback(
         .add_local_listener_with_user_data(())
         .process(move |stream, _| {
             let Some(mut buffer) = stream.dequeue_buffer() else { return };
+            // Frames the graph wants this cycle. The mapped buffer (`data()`) is
+            // sized to the max quantum, which is usually larger; producing the
+            // whole map drains the mixer lanes faster than realtime → underrun
+            // glitches. Read it before the mutable `datas_mut()` borrow.
+            let requested = buffer.requested() as usize;
             let datas = buffer.datas_mut();
             let Some(data) = datas.first_mut() else { return };
 
-            let stride = std::mem::size_of::<f32>();
+            // Stereo output: a mono stream maps to front-left only on a stereo
+            // sink, so we render 2 channels and duplicate the mono mix into both.
+            const CHANNELS: usize = 2;
+            let stride = std::mem::size_of::<f32>() * CHANNELS; // bytes per frame
             let n_frames = match data.data() {
                 Some(slice) => {
-                    let n = slice.len() / stride;
+                    let avail = slice.len() / stride;
+                    let n = if requested > 0 { requested.min(avail) } else { avail };
                     let out: &mut [f32] = bytemuck::cast_slice_mut(&mut slice[..n * stride]);
 
                     rendered.clear();
                     let mut src = sources.lock().unwrap();
-                    for o in out.iter_mut() {
+                    for frame in out.chunks_exact_mut(CHANNELS) {
                         // Mix: sum one sample from every source lane (silence on underrun).
                         let mut v = 0.0f32;
                         for q in src.values_mut() {
@@ -351,7 +360,9 @@ fn run_playback(
                             }
                         }
                         v = crate::audio::native::soft_clip(v); // gentle limiter
-                        *o = v;
+                        for ch in frame.iter_mut() {
+                            *ch = v; // mono mix -> both channels
+                        }
                         rendered.push(v);
                     }
                     drop(src);
@@ -381,7 +392,7 @@ fn run_playback(
         })
         .register()?;
 
-    let values = audio_format_param(1);
+    let values = audio_format_param(2); // stereo out; mono mix duplicated to both
     let mut params = [Pod::from_bytes(&values).unwrap()];
     stream.connect(
         spa::utils::Direction::Output,
