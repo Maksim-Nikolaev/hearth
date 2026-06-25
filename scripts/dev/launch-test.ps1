@@ -33,7 +33,9 @@ $ErrorActionPreference = 'Stop'
 $root = Resolve-Path "$PSScriptRoot\..\.."
 Set-Location $root
 
-$base = if ($env:HEARTH_HTTP) { $env:HEARTH_HTTP } else { 'http://localhost:8080' }
+# Local two-window test always targets the local dev backend (the desktop's
+# server is set in the login box now), so a stale HEARTH_HTTP can't redirect it.
+$base = 'http://localhost:8080'
 $profile = if ($Release) { 'release' } else { 'debug' }
 $bin = Join-Path $root "target\$profile\desktop.exe"
 

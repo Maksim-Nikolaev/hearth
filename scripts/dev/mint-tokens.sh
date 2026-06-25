@@ -3,7 +3,9 @@
 # Usage: bash scripts/dev/mint-tokens.sh   (backend must be running on :8080)
 set -euo pipefail
 
-BASE="${HEARTH_HTTP:-http://localhost:8080}"
+# The dev users live on the local backend; don't read HEARTH_HTTP so a stale
+# LAN export can't point token-minting at the wrong server.
+BASE="http://localhost:8080"
 
 for u in alice bob; do
   # Heredoc body is NOT indented on purpose, so Python never sees stray

@@ -36,7 +36,10 @@ for arg in "$@"; do
 done
 
 export DISPLAY="${DISPLAY:-:0}"
-BASE="${HEARTH_HTTP:-http://localhost:8080}"
+# Local two-window test always targets the local dev backend. The desktop's
+# server is set in the login box now, so we don't read HEARTH_HTTP (a stale
+# export from a LAN test must not redirect this local run).
+BASE="http://localhost:8080"
 if [ "$RELEASE" = true ]; then
   BIN="./target/release/desktop"
 else
