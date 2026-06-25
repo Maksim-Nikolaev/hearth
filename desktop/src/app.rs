@@ -155,9 +155,11 @@ impl Component for AppModel {
             .unwrap_or_else(|_| "Hearth".into());
 
         let login = LoginForm::builder()
-            .launch(())
+            .launch(crate::config::initial_server())
             .forward(sender.input_sender(), |out| match out {
-                LoginOutput::Submit { username, password } => AppMsg::Login { username, password },
+                LoginOutput::Submit { username, password } => {
+                    AppMsg::Login { username, password }
+                }
             });
 
         let screens: Screens = Rc::new(RefCell::new(HashMap::new()));
@@ -215,8 +217,12 @@ impl Component for AppModel {
                 self.screen = Screen::Connecting;
                 let _ = self.login.sender().send(LoginInput::SetStatus(String::new()));
 
-                let http = self.config.http.clone();
-                let ws = self.config.ws.clone();
+                // Endpoints come from the saved server (set in the login →
+                // Connection dialog), seeded by env / localhost. No scripts needed.
+                let (http, ws) = crate::config::endpoints_from_server(&crate::config::initial_server());
+                self.config.http = http.clone();
+                self.config.ws = ws.clone();
+
                 sender.oneshot_command(async move {
                     match Session::open(&http, &ws, &username, &password).await {
                         Ok(c) => Cmd::Opened(c),

@@ -307,6 +307,62 @@ impl Config {
     }
 }
 
+/// Host:port to pre-fill the login Server field: the saved value, else the
+/// `HEARTH_HTTP` host (env seed for dev), else localhost.
+pub fn initial_server() -> String {
+    if let Some(s) = saved_server() {
+        return s;
+    }
+    if let Ok(http) = std::env::var("HEARTH_HTTP") {
+        let host = host_of(&http);
+        if !host.is_empty() {
+            return host;
+        }
+    }
+    "127.0.0.1:8080".to_string()
+}
+
+/// The persisted login server (host:port), if any.
+pub fn saved_server() -> Option<String> {
+    server_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Remember the login server so the next launch pre-fills it.
+pub fn save_server(server: &str) {
+    let Some(path) = server_file() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, server.trim());
+}
+
+/// Derive the HTTP and WS base URLs from a `host:port`. Any scheme the user
+/// typed is stripped; LAN / private-network mode uses plain `http`/`ws`.
+pub fn endpoints_from_server(server: &str) -> (String, String) {
+    let host = host_of(server);
+    (format!("http://{host}"), format!("ws://{host}"))
+}
+
+/// Strip any URL scheme and trailing slash, leaving the bare `host:port`.
+fn host_of(s: &str) -> String {
+    let s = s.trim().trim_end_matches('/');
+    for scheme in ["https://", "http://", "wss://", "ws://"] {
+        if let Some(rest) = s.strip_prefix(scheme) {
+            return rest.to_string();
+        }
+    }
+    s.to_string()
+}
+
+fn server_file() -> Option<PathBuf> {
+    directories::ProjectDirs::from("dev", "hearth", "hearth").map(|d| d.config_dir().join("server"))
+}
+
 fn token_file() -> Option<PathBuf> {
     directories::ProjectDirs::from("dev", "hearth", "hearth").map(|d| d.config_dir().join("token"))
 }
@@ -319,6 +375,23 @@ fn settings_file() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn endpoints_derive_http_and_ws_and_strip_scheme() {
+        assert_eq!(
+            endpoints_from_server("192.168.178.35:8080"),
+            ("http://192.168.178.35:8080".into(), "ws://192.168.178.35:8080".into()),
+        );
+        // A pasted scheme or trailing slash is tolerated.
+        assert_eq!(
+            endpoints_from_server("  http://host:9/ "),
+            ("http://host:9".into(), "ws://host:9".into()),
+        );
+        assert_eq!(
+            endpoints_from_server("ws://host:9"),
+            ("http://host:9".into(), "ws://host:9".into()),
+        );
+    }
 
     #[test]
     fn settings_round_trip_via_json() {

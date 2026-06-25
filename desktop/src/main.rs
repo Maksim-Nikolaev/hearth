@@ -8,18 +8,26 @@ use relm4::RelmApp;
 fn main() {
     install_panic_logger();
 
-    // The native low-latency backend (WASAPI IAudioClient3) exists only on
-    // Windows; everywhere else voice always runs the GStreamer `voice_udp` path
-    // (pulsesrc + Opus/RTP/UDP), and `HEARTH_GSTREAMER_VOICE` is a no-op.
+    // Native low-latency I/O (WASAPI on Windows, PipeWire on Linux) is the
+    // default; `HEARTH_GSTREAMER_VOICE=1` forces the generic GStreamer
+    // `voice_udp` path. This is the startup hint — the live call re-announces the
+    // actual backend (it can fall back if native construction fails).
     #[cfg(target_os = "windows")]
     let backend = if std::env::var_os("HEARTH_GSTREAMER_VOICE").is_some() {
         "GStreamer voice_udp (HEARTH_GSTREAMER_VOICE set)"
     } else {
         "native WASAPI IAudioClient3 + Opus (set HEARTH_GSTREAMER_VOICE=1 to revert)"
     };
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    let backend = if std::env::var_os("HEARTH_GSTREAMER_VOICE").is_some() {
+        "GStreamer voice_udp (HEARTH_GSTREAMER_VOICE set)"
+    } else {
+        "native PipeWire + Opus (set HEARTH_GSTREAMER_VOICE=1 to revert)"
+    };
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let backend = "GStreamer voice_udp (pulsesrc + Opus/RTP/UDP)";
 
+    eprintln!("[hearth] build {}", env!("HEARTH_GIT_SHA"));
     eprintln!("[hearth] voice backend: {backend}");
 
     setup_portable_runtime();
