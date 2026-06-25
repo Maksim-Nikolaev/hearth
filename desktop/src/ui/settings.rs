@@ -33,6 +33,9 @@ pub enum SettingsOutput {
     Close,
     /// Voice processing profile changed (Custom / Headset / Speaker / Auto).
     Profile(VoiceProfile),
+    /// "Log voice stats" pressed — dump the current per-peer diagnostics to the
+    /// console (the app formats them, where peer names are known).
+    LogVoiceStats,
 }
 
 // ── Input ─────────────────────────────────────────────────────────────────────
@@ -51,6 +54,9 @@ pub enum SettingsInput {
     SetMicTestActive(bool),
     /// Display which voice backend went live (e.g. "Native (PipeWire)").
     SetVoiceBackend(String),
+    /// Replace the live voice-stats readout (preformatted, multi-line). Empty
+    /// string restores the idle "No active voice call." placeholder.
+    SetVoiceStats(String),
 }
 
 // ── Model ─────────────────────────────────────────────────────────────────────
@@ -82,6 +88,8 @@ pub struct SettingsWindowWidgets {
     activation_dropdown: gtk::DropDown,
     ptt_btn: gtk::Button,
     jitter_spin: gtk::SpinButton,
+    // Live per-peer voice diagnostics, refreshed via SetVoiceStats.
+    stats_label: gtk::Label,
     mic_test_btn: gtk::ToggleButton,
     profile_dropdown: gtk::DropDown,
     // Kept alive so the closure can set its text; never accessed after init.
@@ -327,11 +335,36 @@ impl Component for SettingsWindow {
         root_box.append(&section_label("NETWORK"));
 
         // Jitter buffer depth (ms). Lower = less latency, more sensitive to
-        // network jitter. Applies to the GStreamer fallback transport; the native
-        // voice path (default on Windows) uses its own fixed mixer lane.
+        // network jitter. Live on the native voice path (the per-peer dejitter
+        // buffer retunes mid-call); the GStreamer fallback applies it on the next
+        // voice connect.
         let jitter_spin = gtk::SpinButton::with_range(0.0, 500.0, 5.0);
         jitter_spin.set_value(20.0);
         root_box.append(&hrow("Jitter buffer (ms)", 180, &jitter_spin));
+
+        // Live per-peer voice diagnostics (RTT, added latency, packet loss),
+        // refreshed ~1/s while a call is active. The button also dumps a snapshot
+        // to the console for copy-paste.
+        root_box.append(&section_label("VOICE STATS"));
+
+        let stats_label = gtk::Label::new(Some("No active voice call."));
+        stats_label.set_xalign(0.0);
+        stats_label.set_wrap(false);
+        stats_label.set_selectable(true);
+        stats_label.add_css_class("monospace");
+        stats_label.add_css_class("dim-label");
+        root_box.append(&stats_label);
+
+        let stats_log_btn = gtk::Button::with_label("Log voice stats to console");
+        stats_log_btn.set_halign(gtk::Align::Start);
+        root_box.append(&stats_log_btn);
+
+        {
+            let s = sender.clone();
+            stats_log_btn.connect_clicked(move |_| {
+                let _ = s.output(SettingsOutput::LogVoiceStats);
+            });
+        }
 
         // Bottom action row. Settings apply immediately (no Save); "Discard"
         // reverts to the values as they were when the window opened.
@@ -649,6 +682,7 @@ impl Component for SettingsWindow {
             activation_dropdown,
             ptt_btn,
             jitter_spin,
+            stats_label,
             mic_test_btn,
             profile_dropdown,
             reprobe_label,
@@ -717,6 +751,14 @@ impl Component for SettingsWindow {
 
             SettingsInput::SetVoiceBackend(label) => {
                 widgets.engine_label.set_text(&format!("Audio engine: {label}"));
+            }
+
+            SettingsInput::SetVoiceStats(text) => {
+                if text.is_empty() {
+                    widgets.stats_label.set_text("No active voice call.");
+                } else {
+                    widgets.stats_label.set_text(&text);
+                }
             }
         }
     }

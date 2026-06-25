@@ -1332,6 +1332,16 @@ impl Session {
         }
     }
 
+    /// Per-peer voice diagnostics (RTT, playout buffering, packet loss) for the
+    /// stats readout. Empty when no native voice transport is active (e.g. the
+    /// GStreamer fallback path, which has its own internal jitter buffer).
+    pub fn voice_stats(&self) -> Vec<crate::audio::native_voice::PeerStatsSnapshot> {
+        self.native_voice
+            .as_ref()
+            .map(|nv| nv.stats_snapshot())
+            .unwrap_or_default()
+    }
+
     /// Mute / unmute the mic via the shared gate.
     pub fn set_muted(&self, muted: bool) {
         self.gate.lock().unwrap().set_muted(muted);

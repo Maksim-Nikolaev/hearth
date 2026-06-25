@@ -24,6 +24,32 @@ enum Screen {
     Workspace,
 }
 
+/// Format per-peer voice diagnostics into one line each for the stats panel and
+/// the console dump. Empty input → empty string (the idle placeholder).
+fn format_voice_stats(stats: &[engine::audio::native_voice::PeerStatsSnapshot]) -> String {
+    stats
+        .iter()
+        .map(|s| {
+            let rtt = s.rtt_ms.map_or_else(|| "n/a".to_string(), |r| format!("{r} ms"));
+            let peer = &s.peer.to_string()[..8];
+            let c = s.counters;
+
+            format!(
+                "peer {peer}  RTT {rtt}  buffer {}+{} ms  loss {:.1}% ({}/{}+{})  late {}  resync {}",
+                s.jitter_ms,
+                s.lane_ms,
+                s.loss_pct(),
+                c.concealed,
+                c.accepted,
+                c.concealed,
+                c.late_dropped,
+                c.resynced,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub struct AppModel {
     config: Config,
     title: String,
@@ -54,6 +80,8 @@ pub enum AppMsg {
     Workspace(WorkspaceOutput),
     Settings(SettingsOutput),
     Picker(PickerOutput),
+    /// Periodic tick (~1/s) to refresh the Settings voice-stats panel.
+    PollVoiceStats,
 }
 
 /// Async/command results. Manual `Debug` because `Connection` is opaque.
@@ -165,6 +193,16 @@ impl Component for AppModel {
         let login_widget = model.login.widget();
         let workspace_widget = model.workspace.widget();
 
+        // Drive the Settings voice-stats panel: a 1 s tick polls the live session
+        // snapshot and forwards it to the (possibly hidden) settings window.
+        {
+            let isender = sender.input_sender().clone();
+            gtk::glib::timeout_add_seconds_local(1, move || {
+                let _ = isender.send(AppMsg::PollVoiceStats);
+                gtk::glib::ControlFlow::Continue
+            });
+        }
+
         let widgets = view_output!();
 
         ComponentParts { model, widgets }
@@ -269,6 +307,18 @@ impl Component for AppModel {
                         }
                     }
                 }
+            }
+            AppMsg::PollVoiceStats => {
+                // Empty snapshot → the panel resets to its idle placeholder.
+                let text = self
+                    .session
+                    .as_ref()
+                    .map(|s| format_voice_stats(&s.voice_stats()))
+                    .unwrap_or_default();
+                let _ = self
+                    .settings_window
+                    .sender()
+                    .send(SettingsInput::SetVoiceStats(text));
             }
             AppMsg::Settings(out) => {
                 self.apply_settings_output(out);
@@ -615,6 +665,21 @@ impl AppModel {
 
                 let _ = self.settings_window.sender()
                     .send(SettingsInput::SetSettings(defaults));
+
+                return;
+            }
+            SettingsOutput::LogVoiceStats => {
+                let text = self
+                    .session
+                    .as_ref()
+                    .map(|s| format_voice_stats(&s.voice_stats()))
+                    .unwrap_or_default();
+
+                if text.is_empty() {
+                    eprintln!("[voice-stats] no active voice call");
+                } else {
+                    eprintln!("[voice-stats]\n{text}");
+                }
 
                 return;
             }
