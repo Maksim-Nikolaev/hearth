@@ -33,6 +33,9 @@ pub struct Workspace {
     self_muted: bool,
     self_deafened: bool,
     self_speaking: bool,
+    /// Mic test in progress: show our own row as muted+deafened (matching what the
+    /// room sees) without touching the real `self_muted`/`self_deafened` intent.
+    self_testing: bool,
     sharers: Vec<Uuid>,
     selected: Option<Uuid>,
     screens: Screens,
@@ -55,6 +58,9 @@ pub enum WorkspaceInput {
     VoiceLeft { user: Uuid },
     PeerVoiceState { user: Uuid, muted: bool, deafened: bool, speaking: bool },
     SelfSpeaking(bool),
+    /// Local mic test started (true) / stopped (false). Mirrors the room-visible
+    /// muted+deafened state onto our own member row for the test's duration.
+    SelfTesting(bool),
     ShareStarted { user: Uuid },
     ShareStopped { user: Uuid },
     ChatHistory(Vec<ChatEntry>),
@@ -190,6 +196,7 @@ impl SimpleComponent for Workspace {
             voice_state: HashMap::new(),
             self_muted: false,
             self_deafened: false,
+            self_testing: false,
             self_speaking: false,
             sharers: Vec::new(),
             selected: None,
@@ -249,6 +256,7 @@ impl SimpleComponent for Workspace {
                 self.voice_state.insert(user, (muted, deafened, speaking));
             }
             WorkspaceInput::SelfSpeaking(on) => self.self_speaking = on,
+            WorkspaceInput::SelfTesting(on) => self.self_testing = on,
             WorkspaceInput::ShareStarted { user } => {
                 if !self.sharers.contains(&user) {
                     self.sharers.push(user);
@@ -403,7 +411,13 @@ impl Workspace {
                 let is_self = *id == self.self_id;
                 // Status icon (Discord-style): deafened > muted > speaking > idle.
                 let (muted, deafened, speaking) = if is_self {
-                    (self.self_muted, self.self_deafened, self.self_speaking)
+                    // Mic test reads as muted+deafened (and never speaking), the
+                    // same state the room sees, without altering the real intent.
+                    (
+                        self.self_muted || self.self_testing,
+                        self.self_deafened || self.self_testing,
+                        self.self_speaking && !self.self_testing,
+                    )
                 } else {
                     self.voice_state.get(id).copied().unwrap_or((false, false, false))
                 };

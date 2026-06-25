@@ -646,6 +646,7 @@ impl AppModel {
                 if let Some(s) = self.session.as_mut() {
                     s.stop_mic_test();
                 }
+                let _ = self.workspace.sender().send(WorkspaceInput::SelfTesting(false));
                 let _ = self.settings_window.sender().send(SettingsInput::SetMicTestActive(false));
                 self.settings_window.widget().set_visible(false);
                 return;
@@ -659,6 +660,10 @@ impl AppModel {
                         s.stop_mic_test();
                     }
                 }
+
+                // Reflect the room-visible muted+deafened state on our own row.
+                let _ = self.workspace.sender().send(WorkspaceInput::SelfTesting(on));
+
                 return; // mic-test is not persisted
             }
             SettingsOutput::ResetDefaults => {
