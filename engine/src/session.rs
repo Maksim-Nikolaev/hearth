@@ -589,10 +589,6 @@ pub struct Session {
     /// Standalone loopback monitor for the Settings mic-test. Runs only when
     /// NOT in a call; `start_mic_test`/`stop_mic_test` gate it.
     mic_monitor: Option<Monitor>,
-    /// Native (WASAPI) mic-test monitor, used in place of `mic_monitor` when the
-    /// native voice backend is selected.
-    #[cfg(any(target_os = "windows", target_os = "linux"))]
-    native_monitor: Option<crate::audio::native::NativeMonitor>,
     /// Mic test in progress — survives a device-change rebuild.
     mic_testing: bool,
     /// Whether we've already told the UI which voice backend is live this call.
@@ -712,8 +708,6 @@ impl Session {
             native_voice_failed: false,
             voice_capture: None,
             mic_monitor: None,
-            #[cfg(any(target_os = "windows", target_os = "linux"))]
-            native_monitor: None,
             mic_testing: false,
             voice_backend_announced: false,
             gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
@@ -1461,7 +1455,6 @@ impl Session {
         self.voice_status.set_testing(false); // re-broadcast real status
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
-            self.native_monitor = None;
             if let Some(nv) = self.native_voice.as_ref() {
                 nv.set_self_monitor(false);
             }
@@ -1640,10 +1633,8 @@ mod tests {
                 native_voice_failed: false,
                 voice_capture: None,
                 mic_monitor: None,
-                #[cfg(any(target_os = "windows", target_os = "linux"))]
-                native_monitor: None,
                 mic_testing: false,
-            voice_backend_announced: false,
+                voice_backend_announced: false,
                 gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
                 dsp_config: default_dsp_config(),
                 input_device: None,
