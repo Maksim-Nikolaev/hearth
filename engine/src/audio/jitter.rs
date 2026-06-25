@@ -94,8 +94,9 @@ impl JitterBuffer {
         }
     }
 
-    /// Current adaptive prebuffer depth in frames.
-    #[cfg(test)]
+    /// Current adaptive prebuffer depth in frames — the depth the buffer actually
+    /// operates at (floor on a clean link, higher under jitter). The drift servo
+    /// targets this, not the ceiling, so its setpoint is reachable.
     pub fn current_target(&self) -> usize {
         self.target
     }

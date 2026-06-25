@@ -12,6 +12,7 @@
 //! `"ip:port"`. The session drives [`add_peer`](NativeVoice::add_peer) /
 //! [`set_remote`](NativeVoice::set_remote) / [`remove_peer`](NativeVoice::remove_peer).
 
+use super::drift::{DriftServo, Varispeed};
 use super::gate::Gate;
 use super::jitter::{JitterBuffer, JitterCounters, JitterOut};
 use super::native::{NativeCapture, NativePlayback};
@@ -704,14 +705,45 @@ impl NativeVoice {
                         }
                     };
                     let mut out = vec![0.0f32; FRAME];
+                    let mut resampled: Vec<f32> = Vec::with_capacity(FRAME * 2);
                     let target_lane = TARGET_LANE_FRAMES * FRAME;
                     let poll = Duration::from_millis(LANE_POLL_MS);
+
+                    // Clock-drift compensation: a steady sender/receiver sample-clock
+                    // skew slowly fills or drains the buffer, and the dejitter buffer
+                    // would otherwise drop a frame (or starve) every second or so —
+                    // each one an audible click. Instead, hold the total buffered
+                    // depth (device lane + jitter buffer) at a setpoint by nudging the
+                    // playout speed ~1%, and varispeed-resample the decoded audio to
+                    // match. Recomputed once per poll; the same speed resamples every
+                    // frame decoded that tick.
+                    let mut servo = DriftServo::new(TARGET_LANE_FRAMES as f32);
+                    let mut vari = Varispeed::new();
+                    let mut speed = 1.0f32;
 
                     while !stop.load(Ordering::Relaxed) {
                         std::thread::sleep(poll);
 
                         let deaf_now =
                             deaf.load(Ordering::Relaxed) || suspended.load(Ordering::Relaxed);
+
+                        // Servo the playout speed off the current buffered depth. Held
+                        // flat while deaf (nothing renders); resumes on unmute. The
+                        // setpoint is the buffer's *actual* operating depth (the
+                        // adaptive jitter target, which sits at the floor on a clean
+                        // link) + the lane cushion — not the slider ceiling, which the
+                        // depth-capped buffer can never reach (the servo would peg).
+                        if !deaf_now {
+                            let (jb_frames, jb_target) = {
+                                let jb = jitter.lock().unwrap();
+                                (jb.depth() as f32, jb.current_target() as f32)
+                            };
+                            let lane_frames =
+                                playback.lane_samples(source_id) as f32 / FRAME as f32;
+
+                            servo.set_target(TARGET_LANE_FRAMES as f32 + jb_target);
+                            speed = servo.observe(lane_frames + jb_frames);
+                        }
 
                         loop {
                             // Stop once the lane holds its cushion. When deaf we
@@ -728,19 +760,23 @@ impl NativeVoice {
                                 jb.pop()
                             };
 
-                            match popped {
+                            // Decode in order (PLC on a concealed hole), then stretch
+                            // the frame by the drift ratio before it reaches the lane.
+                            let decoded = match popped {
                                 JitterOut::Starve => break,
                                 _ if deaf_now => continue,
                                 JitterOut::Packet(p) => {
-                                    if let Ok(frames) = dec.decode_float(Some(&p[..]), &mut out, false) {
-                                        playback.push(source_id, &out[..frames]);
-                                    }
+                                    dec.decode_float(Some(&p[..]), &mut out, false)
                                 }
                                 JitterOut::Conceal => {
-                                    if let Ok(frames) = dec.decode_float(None::<&[u8]>, &mut out, false) {
-                                        playback.push(source_id, &out[..frames]);
-                                    }
+                                    dec.decode_float(None::<&[u8]>, &mut out, false)
                                 }
+                            };
+
+                            if let Ok(frames) = decoded {
+                                resampled.clear();
+                                vari.process(&out[..frames], speed, &mut resampled);
+                                playback.push(source_id, &resampled);
                             }
                         }
                     }

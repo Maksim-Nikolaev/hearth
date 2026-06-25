@@ -2,6 +2,12 @@ pub mod capture;
 pub mod classify;
 pub mod devices;
 pub mod dsp;
+
+// Receive-side clock-drift compensation (varispeed playout + depth servo) for
+// the native voice transport.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub mod drift;
+
 pub mod gate;
 
 // Receive-side dejitter / reorder buffer for the native voice transport.
