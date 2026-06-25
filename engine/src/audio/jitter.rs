@@ -73,6 +73,17 @@ impl JitterBuffer {
         }
 
         self.buf.insert(seq, payload.to_vec());
+
+        // Bound the depth so a burst or a faster-than-us sender clock can't grow
+        // playout latency without limit over a long call. Drop the oldest frames
+        // (closest to the play cursor) and skip the cursor past them.
+        let cap = (self.target * 2).max(self.target + 1);
+        while self.buf.len() > cap {
+            let Some(next) = self.next_seq else { break };
+            let oldest = *self.buf.keys().min_by_key(|k| k.wrapping_sub(next)).unwrap();
+            self.buf.remove(&oldest);
+            self.next_seq = Some(oldest.wrapping_add(1));
+        }
     }
 
     pub fn pop(&mut self) -> JitterOut {
@@ -249,5 +260,21 @@ mod tests {
         jb.push(2, &[2]);
         jb.push(3, &[3]);
         assert_eq!(payload(jb.pop()), [1]); // cushion full → resume in order
+    }
+
+    #[test]
+    fn caps_depth_and_skips_to_live_edge_when_overfilled() {
+        // A burst, or a sender clock running faster than our playback, fills the
+        // buffer faster than it drains. Depth must stay bounded (no creeping
+        // latency over a long call), dropping the oldest and skipping ahead.
+        let mut jb = JitterBuffer::new(2); // target 2 → cap 4
+        for s in 0..100u16 {
+            jb.push(s, &[s as u8]);
+        }
+
+        assert!(jb.buf.len() <= 4, "depth must stay bounded, got {}", jb.buf.len());
+
+        // Playback resumes at the live edge, not the stale seq 0.
+        assert!(payload(jb.pop())[0] >= 96, "skipped the stale backlog to the live edge");
     }
 }

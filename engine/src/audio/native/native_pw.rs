@@ -287,6 +287,13 @@ impl NativePlayback {
         enqueue_trim(sources.entry(source).or_default(), mono, MAX_LANE_SAMPLES);
     }
 
+    /// Current queued sample count for `source`'s lane (0 if absent). Lets a
+    /// producer pace itself off how full the device-drained lane is, servoing to
+    /// the real render clock instead of a wall-clock timer that would slowly drift.
+    pub fn lane_samples(&self, source: u64) -> usize {
+        self.sources.lock().unwrap().get(&source).map_or(0, |q| q.len())
+    }
+
     /// Drop a source's lane (peer left).
     pub fn remove_source(&self, source: u64) {
         self.sources.lock().unwrap().remove(&source);

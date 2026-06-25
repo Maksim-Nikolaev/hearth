@@ -32,7 +32,7 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
@@ -46,6 +46,15 @@ const FRAME_US: u64 = FRAME as u64 * 1_000_000 / 48_000;
 /// Default receive jitter-buffer depth (≈20 ms at the 5 ms framing). Overridden
 /// live by the Settings "Jitter buffer (ms)" slider via [`NativeVoice::set_jitter_ms`].
 const DEFAULT_JITTER_MS: u32 = 20;
+
+/// Device-lane cushion the receive servo keeps filled (~10 ms). The jitter buffer
+/// holds the network cushion; this is just deep enough that the render thread
+/// never drains the lane dry between servo polls.
+const TARGET_LANE_FRAMES: usize = 2;
+
+/// Receive servo poll period — short enough that the lane can't fall below the
+/// cushion between checks while the device drains it at the hardware rate.
+const LANE_POLL_MS: u64 = 3;
 
 /// RNNoise frame: 10 ms @ 48 kHz. NS buffers this much (so enabling it adds
 /// ~10 ms of latency over the 5 ms Opus framing).
@@ -573,10 +582,12 @@ impl NativeVoice {
                 })?
         };
 
-        // Release: once per frame, retune the depth from the live slider, pop the
-        // next frame in order and decode it (PLC on a concealed hole), then feed
-        // the mixer lane. A starved tick pushes nothing — the mixer already plays
-        // silence on underrun, so the buffer absorbs jitter instead of clicking.
+        // Release: keep the device's mixer lane topped up to a small cushion. The
+        // render thread drains that lane at the true hardware clock, so refilling
+        // it to a fixed depth paces decode to the device — no wall-clock timer to
+        // drift against over a long call. Each refill pops the next frame in order
+        // and decodes it (PLC on a concealed hole). A starved buffer stops the
+        // refill; the mixer plays silence on underrun until packets resume.
         let release = {
             let jitter = jitter.clone();
             let jitter_ms = self.jitter_ms.clone();
@@ -595,36 +606,43 @@ impl NativeVoice {
                         }
                     };
                     let mut out = vec![0.0f32; FRAME];
-                    let frame_dur = Duration::from_micros(FRAME_US);
-                    let mut next_tick = Instant::now();
-                    while !stop.load(Ordering::Relaxed) {
-                        next_tick += frame_dur;
-                        match next_tick.checked_duration_since(Instant::now()) {
-                            Some(wait) => std::thread::sleep(wait),
-                            // Behind schedule (scheduler hiccup): resync the clock
-                            // so we don't burst a backlog into the lane.
-                            None => next_tick = Instant::now(),
-                        }
+                    let target_lane = TARGET_LANE_FRAMES * FRAME;
+                    let poll = Duration::from_millis(LANE_POLL_MS);
 
-                        let frames = {
-                            let mut jb = jitter.lock().unwrap();
-                            jb.set_target(ms_to_frames(jitter_ms.load(Ordering::Relaxed)));
-                            match jb.pop() {
-                                JitterOut::Packet(p) => {
-                                    dec.decode_float(Some(&p[..]), &mut out, false).ok()
-                                }
-                                JitterOut::Conceal => {
-                                    dec.decode_float(None::<&[u8]>, &mut out, false).ok()
-                                }
-                                JitterOut::Starve => None,
-                            }
-                        };
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(poll);
 
                         let deaf_now =
                             deaf.load(Ordering::Relaxed) || suspended.load(Ordering::Relaxed);
-                        if let Some(frames) = frames {
-                            if !deaf_now {
-                                playback.push(source_id, &out[..frames]);
+
+                        loop {
+                            // Stop once the lane holds its cushion. When deaf we
+                            // skip the cushion check and drain the buffer (without
+                            // rendering) to stay at the live edge, so unmuting
+                            // resumes current audio rather than a stale backlog.
+                            if !deaf_now && playback.lane_samples(source_id) >= target_lane {
+                                break;
+                            }
+
+                            let popped = {
+                                let mut jb = jitter.lock().unwrap();
+                                jb.set_target(ms_to_frames(jitter_ms.load(Ordering::Relaxed)));
+                                jb.pop()
+                            };
+
+                            match popped {
+                                JitterOut::Starve => break,
+                                _ if deaf_now => continue,
+                                JitterOut::Packet(p) => {
+                                    if let Ok(frames) = dec.decode_float(Some(&p[..]), &mut out, false) {
+                                        playback.push(source_id, &out[..frames]);
+                                    }
+                                }
+                                JitterOut::Conceal => {
+                                    if let Ok(frames) = dec.decode_float(None::<&[u8]>, &mut out, false) {
+                                        playback.push(source_id, &out[..frames]);
+                                    }
+                                }
                             }
                         }
                     }
