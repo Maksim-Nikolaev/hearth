@@ -58,57 +58,82 @@ struct Peer {
 }
 
 /// The active echo canceller, chosen by [`AecMethod`]. Rebuilt when the method
-/// changes (rare); `set_strength` adjusts the current one live. On Windows the
-/// `Webrtc` variant is unavailable, so `build` falls back to speex there.
-enum AecImpl {
+/// changes (rare); `set_strength` adjusts it live. On Windows the `Webrtc`
+/// variant is unavailable, so `build` falls back to speex there.
+enum AecInner {
     Speex(SpeexAec),
     #[cfg(not(target_os = "windows"))]
     Webrtc(WebrtcAec),
 }
 
+impl AecInner {
+    /// Speex at a fixed-aggressive internal config; the user-facing strength is
+    /// the wet/dry blend in [`AecImpl::cancel_frame`], not speex's residual knob.
+    fn speex() -> Self {
+        AecInner::Speex(SpeexAec::new(AEC_FRAME, AEC_FILTER_LEN, 48000, 100))
+    }
+}
+
+/// `strength` (0–100) as a 0.0–1.0 wet/dry fraction.
+fn wet_from(strength: u8) -> f32 {
+    strength.min(100) as f32 / 100.0
+}
+
+struct AecImpl {
+    inner: AecInner,
+    /// Speex wet/dry mix: 0 = raw mic (no cancellation, = off), 1 = fully
+    /// cancelled. Unused by WebRTC, whose `strength` drives its suppression level
+    /// while it always runs at full cancellation.
+    wet: f32,
+}
+
 impl AecImpl {
     fn build(method: AecMethod, strength: u8) -> Self {
-        match method {
-            AecMethod::Speex => AecImpl::speex(strength),
+        let inner = match method {
+            AecMethod::Speex => AecInner::speex(),
             #[cfg(not(target_os = "windows"))]
             AecMethod::Webrtc => match WebrtcAec::new(strength) {
-                Ok(w) => AecImpl::Webrtc(w),
+                Ok(w) => AecInner::Webrtc(w),
                 Err(e) => {
                     eprintln!("[native-voice] WebRTC AEC init failed ({e}); using speex");
-                    AecImpl::speex(strength)
+                    AecInner::speex()
                 }
             },
             #[cfg(target_os = "windows")]
-            AecMethod::Webrtc => AecImpl::speex(strength),
-        }
-    }
+            AecMethod::Webrtc => AecInner::speex(),
+        };
 
-    fn speex(strength: u8) -> Self {
-        AecImpl::Speex(SpeexAec::new(AEC_FRAME, AEC_FILTER_LEN, 48000, strength))
+        AecImpl { inner, wet: wet_from(strength) }
     }
 
     fn set_strength(&mut self, strength: u8) {
-        match self {
-            AecImpl::Speex(a) => a.set_strength(strength),
-            #[cfg(not(target_os = "windows"))]
-            AecImpl::Webrtc(a) => a.set_strength(strength),
+        self.wet = wet_from(strength);
+        // WebRTC ignores the blend; its strength is a suppression level.
+        #[cfg(not(target_os = "windows"))]
+        if let AecInner::Webrtc(a) = &mut self.inner {
+            a.set_strength(strength);
         }
     }
 
     /// Cancel echo on one [`AEC_FRAME`]-sample mic frame, appending the cleaned
     /// f32 samples to `out`. `far` is the matching rendered playback frame.
     fn cancel_frame(&mut self, mic: &[f32], far: &mut [f32; AEC_FRAME], out: &mut Vec<f32>) {
-        match self {
-            AecImpl::Speex(a) => {
+        let wet = self.wet;
+        match &mut self.inner {
+            AecInner::Speex(a) => {
                 let to_i16 = |s: &f32| (s.clamp(-1.0, 1.0) * 32767.0) as i16;
                 let far_i: Vec<i16> = far.iter().map(to_i16).collect();
                 let mic_i: Vec<i16> = mic.iter().map(to_i16).collect();
                 let mut out_i = [0i16; AEC_FRAME];
                 a.cancel(&mic_i, &far_i, &mut out_i);
-                out.extend(out_i.iter().map(|s| *s as f32 / 32768.0));
+                // Blend cancelled vs raw mic so strength spans off (0) → full (1).
+                for (i, c) in out_i.iter().enumerate() {
+                    let cancelled = *c as f32 / 32768.0;
+                    out.push(wet * cancelled + (1.0 - wet) * mic[i]);
+                }
             }
             #[cfg(not(target_os = "windows"))]
-            AecImpl::Webrtc(a) => {
+            AecInner::Webrtc(a) => {
                 let mut mic_buf: Vec<f32> = mic.to_vec();
                 a.cancel(&mut mic_buf, far);
                 out.extend_from_slice(&mic_buf);
