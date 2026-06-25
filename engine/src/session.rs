@@ -873,10 +873,12 @@ impl Session {
                     // feed your mic straight back to your ears). The device-change-
                     // during-test case re-applies it explicitly in set_*_device.
                     self.native_voice = Some(nv);
-                    // Apply the stored user volumes to the fresh instance.
+                    // Apply the stored user volumes and jitter depth to the fresh
+                    // instance, so values set before joining are honored.
                     if let Some(nv) = self.native_voice.as_ref() {
                         nv.set_input_volume(self.input_volume);
                         nv.set_output_volume(self.output_volume);
+                        nv.set_jitter_ms(crate::flow_peer::jitter_latency_ms());
                     }
                 }
                 Err(e) => {
@@ -1310,16 +1312,23 @@ impl Session {
     }
 
     /// Set the jitter-buffer depth (ms). Lower = less latency, more sensitive to
-    /// network jitter. `rtpjitterbuffer` only honours `latency` at startup, so a
-    /// live change takes effect on the next voice connect — leave/rejoin to test
-    /// a new value. (We still poke active peers as a best-effort.)
+    /// network jitter. The native path retunes its receive buffer live (every
+    /// peer's release loop re-reads the depth each frame). The GStreamer fallback
+    /// `rtpjitterbuffer` only honours `latency` at startup, so on that path a live
+    /// change takes full effect on the next voice connect — leave/rejoin to test.
     pub fn set_jitter_latency_ms(&self, ms: u32) {
         crate::flow_peer::set_jitter_latency_ms(ms);
+
+        if let Some(nv) = self.native_voice.as_ref() {
+            nv.set_jitter_ms(ms);
+        }
+
         for p in self.voice_peers.values() {
             p.set_jitter_ms(ms);
         }
+
         if !self.voice_peers.is_empty() {
-            eprintln!("[latency] jitter buffer -> {ms} ms (effective on next voice connect — leave/rejoin to apply)");
+            eprintln!("[latency] jitter buffer -> {ms} ms (native: live; GStreamer fallback: next voice connect)");
         }
     }
 

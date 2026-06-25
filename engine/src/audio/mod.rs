@@ -3,6 +3,11 @@ pub mod classify;
 pub mod devices;
 pub mod dsp;
 pub mod gate;
+
+// Receive-side dejitter / reorder buffer for the native voice transport.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub mod jitter;
+
 pub mod monitor;
 pub mod profile;
 pub mod rt;

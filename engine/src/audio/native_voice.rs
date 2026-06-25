@@ -13,6 +13,7 @@
 //! [`set_remote`](NativeVoice::set_remote) / [`remove_peer`](NativeVoice::remove_peer).
 
 use super::gate::Gate;
+use super::jitter::{JitterBuffer, JitterOut};
 use super::native::{NativeCapture, NativePlayback};
 use crate::session::SessionEvent;
 use anyhow::{anyhow, Result};
@@ -31,13 +32,20 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
 /// Opus frame: 5 ms @ 48 kHz mono. Smaller frame = less packetization delay and
 /// a shallower playback lane (one frame) than the 10 ms default.
 const FRAME: usize = 240;
+
+/// Frame duration in microseconds (`FRAME` / 48 kHz) — the receive release tick.
+const FRAME_US: u64 = FRAME as u64 * 1_000_000 / 48_000;
+
+/// Default receive jitter-buffer depth (≈20 ms at the 5 ms framing). Overridden
+/// live by the Settings "Jitter buffer (ms)" slider via [`NativeVoice::set_jitter_ms`].
+const DEFAULT_JITTER_MS: u32 = 20;
 
 /// RNNoise frame: 10 ms @ 48 kHz. NS buffers this much (so enabling it adds
 /// ~10 ms of latency over the 5 ms Opus framing).
@@ -54,7 +62,8 @@ struct Peer {
     source_id: u64,
     target: Arc<SendTarget>,
     stop: Arc<AtomicBool>,
-    handle: Option<std::thread::JoinHandle<()>>,
+    /// The peer's receive threads: the socket reader and the paced release loop.
+    handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 /// The active echo canceller, chosen by [`AecMethod`]. Rebuilt when the method
@@ -183,6 +192,9 @@ pub struct NativeVoice {
     input_volume: Arc<AtomicU32>,
     /// Active echo-canceller method (speex/webrtc) as a u8, applied live.
     aec_method: Arc<AtomicU8>,
+    /// Receive jitter-buffer depth in milliseconds, shared with every peer's
+    /// release loop so the Settings slider retunes the buffer mid-call.
+    jitter_ms: Arc<AtomicU32>,
     next_source: u64,
 }
 
@@ -462,6 +474,7 @@ impl NativeVoice {
             ec_strength: ec_strength_state,
             aec_method: aec_method_state,
             input_volume,
+            jitter_ms: Arc::new(AtomicU32::new(DEFAULT_JITTER_MS)),
             next_source: 0,
         })
     }
@@ -512,6 +525,12 @@ impl NativeVoice {
         self.self_monitor.store(on, Ordering::Relaxed);
     }
 
+    /// Set the receive jitter-buffer depth in milliseconds. Live — every peer's
+    /// release loop re-reads it each frame, so the change applies mid-call.
+    pub fn set_jitter_ms(&self, ms: u32) {
+        self.jitter_ms.store(ms, Ordering::Relaxed);
+    }
+
     /// Add a peer: bind a recv socket, start its decode→playback lane, and return
     /// our `"ip:port"` to advertise. Idempotent-ish — a re-add replaces the peer.
     pub fn add_peer(&mut self, peer: Uuid) -> Result<String> {
@@ -526,59 +545,95 @@ impl NativeVoice {
         self.next_source += 1;
         let stop = Arc::new(AtomicBool::new(false));
 
-        let playback = self.playback.clone();
-        let deaf = self.deaf.clone();
-        let suspended = self.suspended.clone();
-        let stop_thread = stop.clone();
-        let handle = std::thread::Builder::new()
-            .name(format!("native-voice-rx-{source_id}"))
-            .spawn(move || {
-                let mut dec = match Decoder::new(SampleRate::Hz48000, Channels::Mono) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        eprintln!("[native-voice] decoder init: {e}");
-                        return;
-                    }
-                };
-                let mut buf = [0u8; 4000];
-                let mut out = vec![0.0f32; FRAME];
-                let mut expected: Option<u16> = None;
-                while !stop_thread.load(Ordering::Relaxed) {
-                    let n = match sock.recv(&mut buf) {
-                        Ok(n) if n >= 3 => n,
-                        Ok(_) => continue,    // runt packet
-                        Err(_) => continue,   // read timeout — re-check stop
-                    };
-                    let seq = u16::from_be_bytes([buf[0], buf[1]]);
-                    let payload = &buf[2..n];
-                    let deaf_now = deaf.load(Ordering::Relaxed) || suspended.load(Ordering::Relaxed);
+        // Reorder/dejitter buffer shared between the socket reader (fills it by
+        // sequence) and the paced release loop (drains one frame per tick).
+        let jitter = Arc::new(Mutex::new(JitterBuffer::new(ms_to_frames(
+            self.jitter_ms.load(Ordering::Relaxed),
+        ))));
 
-                    if let Some(exp) = expected {
-                        let gap = seq.wrapping_sub(exp) as i16;
-                        if gap < 0 {
-                            continue; // late or duplicate — drop
+        // Reader: stamp arriving packets into the jitter buffer by sequence. No
+        // decode here — decoding rides the steady release clock, so playback
+        // timing is independent of how unevenly packets land off the network.
+        let reader = {
+            let jitter = jitter.clone();
+            let stop = stop.clone();
+            std::thread::Builder::new()
+                .name(format!("native-voice-rx-{source_id}"))
+                .spawn(move || {
+                    let mut buf = [0u8; 4000];
+                    while !stop.load(Ordering::Relaxed) {
+                        let n = match sock.recv(&mut buf) {
+                            Ok(n) if n >= 3 => n,
+                            Ok(_) => continue,  // runt packet
+                            Err(_) => continue, // read timeout — re-check stop
+                        };
+                        let seq = u16::from_be_bytes([buf[0], buf[1]]);
+                        jitter.lock().unwrap().push(seq, &buf[2..n]);
+                    }
+                })?
+        };
+
+        // Release: once per frame, retune the depth from the live slider, pop the
+        // next frame in order and decode it (PLC on a concealed hole), then feed
+        // the mixer lane. A starved tick pushes nothing — the mixer already plays
+        // silence on underrun, so the buffer absorbs jitter instead of clicking.
+        let release = {
+            let jitter = jitter.clone();
+            let jitter_ms = self.jitter_ms.clone();
+            let playback = self.playback.clone();
+            let deaf = self.deaf.clone();
+            let suspended = self.suspended.clone();
+            let stop = stop.clone();
+            std::thread::Builder::new()
+                .name(format!("native-voice-tx-{source_id}"))
+                .spawn(move || {
+                    let mut dec = match Decoder::new(SampleRate::Hz48000, Channels::Mono) {
+                        Ok(d) => d,
+                        Err(e) => {
+                            eprintln!("[native-voice] decoder init: {e}");
+                            return;
                         }
-                        // Conceal up to a bounded run of lost frames with Opus PLC.
-                        for _ in 0..(gap as usize).min(10) {
-                            if let Ok(frames) = dec.decode_float(None::<&[u8]>, &mut out, false) {
-                                if !deaf_now {
-                                    playback.push(source_id, &out[..frames]);
+                    };
+                    let mut out = vec![0.0f32; FRAME];
+                    let frame_dur = Duration::from_micros(FRAME_US);
+                    let mut next_tick = Instant::now();
+                    while !stop.load(Ordering::Relaxed) {
+                        next_tick += frame_dur;
+                        match next_tick.checked_duration_since(Instant::now()) {
+                            Some(wait) => std::thread::sleep(wait),
+                            // Behind schedule (scheduler hiccup): resync the clock
+                            // so we don't burst a backlog into the lane.
+                            None => next_tick = Instant::now(),
+                        }
+
+                        let frames = {
+                            let mut jb = jitter.lock().unwrap();
+                            jb.set_target(ms_to_frames(jitter_ms.load(Ordering::Relaxed)));
+                            match jb.pop() {
+                                JitterOut::Packet(p) => {
+                                    dec.decode_float(Some(&p[..]), &mut out, false).ok()
                                 }
+                                JitterOut::Conceal => {
+                                    dec.decode_float(None::<&[u8]>, &mut out, false).ok()
+                                }
+                                JitterOut::Starve => None,
+                            }
+                        };
+
+                        let deaf_now =
+                            deaf.load(Ordering::Relaxed) || suspended.load(Ordering::Relaxed);
+                        if let Some(frames) = frames {
+                            if !deaf_now {
+                                playback.push(source_id, &out[..frames]);
                             }
                         }
                     }
-
-                    if let Ok(frames) = dec.decode_float(Some(payload), &mut out, false) {
-                        if !deaf_now {
-                            playback.push(source_id, &out[..frames]);
-                        }
-                    }
-                    expected = Some(seq.wrapping_add(1));
-                }
-            })?;
+                })?
+        };
 
         self.targets.lock().unwrap().push(target.clone());
-        self.peers.insert(peer, Peer { source_id, target, stop, handle: Some(handle) });
+        self.peers
+            .insert(peer, Peer { source_id, target, stop, handles: vec![reader, release] });
         Ok(format!("{}:{}", crate::net::advertised_ip(), local_port))
     }
 
@@ -601,7 +656,7 @@ impl NativeVoice {
                 .lock()
                 .unwrap()
                 .retain(|t| !Arc::ptr_eq(t, &p.target));
-            if let Some(h) = p.handle.take() {
+            for h in p.handles.drain(..) {
                 let _ = h.join();
             }
             self.playback.remove_source(p.source_id);
@@ -646,6 +701,25 @@ pub(crate) fn ramp_gain(buf: &mut [f32], env: &mut f32, target: f32) {
             *env = target; // settle exactly: unity when open, floor when closed
         }
         *s *= *env;
+    }
+}
+
+/// Convert a jitter-buffer depth in milliseconds to whole 5 ms frames, clamped
+/// to at least one frame so the buffer always holds back a packet to reorder on.
+fn ms_to_frames(ms: u32) -> usize {
+    ((ms as u64 * 1000 / FRAME_US) as usize).max(1)
+}
+
+#[cfg(test)]
+mod jitter_depth_tests {
+    use super::ms_to_frames;
+
+    #[test]
+    fn converts_ms_to_whole_frames_with_a_one_frame_floor() {
+        assert_eq!(ms_to_frames(20), 4); // 20 ms / 5 ms
+        assert_eq!(ms_to_frames(5), 1);
+        assert_eq!(ms_to_frames(0), 1); // never zero — always hold one frame
+        assert_eq!(ms_to_frames(100), 20);
     }
 }
 
