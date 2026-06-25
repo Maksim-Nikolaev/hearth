@@ -263,33 +263,55 @@ low-latency, with auto-fallback and user-tunable echo cancellation.
 > the tracks (negative/low-corr readings). Trust corr>0.95 only; for sub-15 ms use
 > same-clock hardware loopback.
 
-## ACTIVE NEXT: Wayland screenshare GPU capture
+## Roadmap — phases (decided 2026-06-25)
 
-With audio done, the next major workstream is **screenshare GPU capture on
-Wayland** via xdg-desktop-portal ScreenCast + `pipewiresrc` behind the
-`CaptureBackend` seam (DMABuf-with-modifier → direct VA import, which works on
-Wayland unlike the X11 spike). X11 stays CPU `ximagesrc` ≤60fps. See
-`docs/superpowers/plans/2026-06-23-hearth-m8-screenshare-gpu-capture.md` and the
-X11 GPU-capture NO-GO spike findings.
+Recently landed on `main`: **mic/speaker volume wiring** (live, attenuate-only,
+both paths) and the **dockerized always-on backend + Postgres** (`compose.yml`,
+`make` targets, sops+age secrets, `seed` subcommand). Everything to date is
+verified **localhost / single-machine**; the remaining unknown is cross-machine.
 
-## Next candidates
+Phases run in order; deferred items are pulled in only when they bite.
 
-- **M4 Task 5** – cross-machine Windows↔Linux measurement (user-run; see
-  `engine/docs/windows-setup.md`).
-- **Voice + webcam in the UI** – voice works in the engine; wire the call UX and
-  add the webcam flow (additive to the per-flow framework).
-- **Multi-peer mesh** – media is 1:1 today (targets the first peer); presence
-  already shows everyone.
-- **Polish** – theming, scroll-to-bottom chat, token-restore UX. (The startup
-  GtkStack warning is fixed; presence verified race-free on simultaneous join.)
-- **Screenshare SFU** – server-side fan-out for 5–8 viewers, dropping into the
-  `ScreenTransport` seam; also fixes mutual same-pair screenshare via a per-stream
-  id in the protocol (see the M6 limitation above).
-- **Multiple voice channels / webcam flow** – the structure supports more Voice
-  channels and the per-flow `Webcam` variant; both deferred from M6.
-- **Deployment (later)** – Traefik proxy + coturn relay; packaging/auto-update.
-- **Post-M5 fixes landed:** re-share after Stop (replace-on-offer), GtkStack
-  startup warning, presence verified race-free.
+### Phase A — Private network *(ACTIVE NEXT; the de-risk)*
+A private overlay (**Headscale** self-hosted or **ZeroTier**) so two machines
+reach each other; run the dockerized backend on a node; verify **voice + existing
+screenshare cross-machine** with the current raw-UDP P2P — **no NAT-traversal
+code**. Load-bearing: it validates the whole architecture over a real network
+*and* defers public NAT traversal indefinitely (likely the real v1 deployment
+model). Effort: small–medium (overlay config + runbook; maybe a minor tweak so
+peers advertise their overlay IP to signaling).
+
+### Phase B — Screenshare GPU capture *(the big feature; two parts)*
+- **B1 capture (OBS/Vesktop per-source picker):** Wayland (`xdg-desktop-portal`
+  ScreenCast + `pipewiresrc` + DMABuf→VA, behind the `CaptureBackend` seam) and
+  Windows (WGC/DXGI + `d3d11`). X11 stays CPU `ximagesrc` ≤60 fps. The visible
+  win: Wayland support + low CPU + per-window/region/audio selection. See
+  `docs/superpowers/plans/2026-06-23-hearth-m8-screenshare-gpu-capture.md` and the
+  X11 GPU-capture NO-GO spike.
+- **B2 transport (Moonlight *recipe*, not dependency):** screen flow off
+  `webrtcbin` → HW-encode + UDP + FEC + HW-decode + frame pacing (mirrors voice's
+  Phase-1). After B1. Do **not** adopt Sunshine/Moonlight wholesale — it's
+  whole-desktop 1:1 and gives no per-source picker.
+
+### Phase C — Webcam flow
+Drop-in video flow into the per-flow framework once B's patterns exist. Low
+priority, small.
+
+### Phase D — UI/UX Discord-pass
+Continuous light touches anytime; the big redesign **last**, after features
+stabilize (so it isn't re-skinning a moving target).
+
+### Deferred / cross-cutting (pull in on-demand)
+- **Public NAT traversal** (STUN hole-punch + coturn TURN) — only if the private
+  overlay is outgrown. *Deferred by Phase A.*
+- **Screenshare SFU + per-stream id** — when >3 viewers, or the mutual same-pair
+  share bug (M6 limitation) bites.
+- **Multi-peer mesh hardening / 3-way** — naturally exercised in Phase A.
+- **Deployment hardening** — Traefik/TLS, coturn, Grafana/Loki; packaging/
+  auto-update.
+- **App rename** (Hearth → a candidate) — cosmetic, anytime.
+- **Chat persistence / attachments** (RustFS two-phase upload) — backend feature.
+- **Cross-machine Windows↔Linux measurement** (M4 Task 5) — folds into Phase A.
 
 ## How to resume / run
 
