@@ -1,9 +1,10 @@
 # Hearth media engine
 
-Cross-platform Rust media engine for Hearth: hardware-encoded P2P screenshare
-driven by the Hearth WebSocket signaling server (M3 protocol). This is product
-code – the future S2 engine that `flutter_rust_bridge` will wrap (it supersedes
-the throwaway `engine-spike/`).
+Cross-platform Rust media engine for Hearth: native low-latency **voice** and
+hardware-encoded P2P **screenshare**, driven by the Hearth WebSocket signaling
+server. The desktop client (`desktop/`) links it directly as a library; the CLI
+below covers the screenshare flow. (A future mobile app would wrap it via
+`flutter_rust_bridge`.)
 
 ## Modules
 
@@ -15,6 +16,14 @@ the throwaway `engine-spike/`).
   `ServerMessage` from `hearth-protocol`).
 - `peer` – `webrtcbin` pipeline wired to the signaling client; offerer/capture
   in `share` mode, answerer/display in `view` mode.
+- `audio` – **native low-latency voice** (default; GStreamer is the auto-fallback).
+  `audio/native/` is per-platform device I/O — pipewire-rs on Linux
+  (`native_pw.rs`), WASAPI `IAudioClient3` on Windows (`native_wasapi.rs`) —
+  behind one `NativeCapture`/`NativePlayback` API. `native_voice` runs the
+  capture → DSP → Opus chain; DSP is pure-Rust (`speex_aec` / `webrtc_aec` echo
+  cancellation, `nnnoiseless` NS, `earshot` VAD, envelope AGC, activation gate).
+  `dsp` / `capture` / `monitor` are the GStreamer `pulsesrc`/`wasapi2` fallback
+  path; `voice_udp` is the shared raw-RTP/Opus-over-UDP transport (no `webrtcbin`).
 
 ## CLI
 

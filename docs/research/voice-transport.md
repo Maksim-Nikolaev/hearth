@@ -1,8 +1,17 @@
 # Voice Transport Research — getting to < 50 ms
 
 _Goal (see `docs/VISION.md`): Mumble/TeamSpeak-class voice, < 50 ms mouth-to-ear
-on LAN, Rust-native, no WebRTC compromises. Today we measure **151 ms** on
-localhost. This documents why, and the options to fix it._
+on LAN, Rust-native, no WebRTC compromises. This documents why the old WebRTC
+path was 151 ms, and the options to fix it._
+
+> **STATUS (2026-06-25): IMPLEMENTED — both phases shipped on `main`.** Voice left
+> `webrtcbin` for raw RTP/Opus over UDP (Phase 1, Option A), then moved to native
+> per-platform device I/O (Phase 2): WASAPI `IAudioClient3` on Windows (~50–55 ms,
+> at the OS loopback floor) and **pipewire-rs on Linux (~6–14 ms)**, behind one
+> `NativeCapture`/`NativePlayback` API, with the GStreamer path kept as the
+> auto-fallback and selectable Speex / WebRTC AEC3 echo cancellation. The survey
+> below is the original research record; the recommended plan is done. Current
+> results live in `docs/STATUS.md` and `docs/findings/voice-latency-linux.md`.
 
 ## Headline finding: the 151 ms is WebRTC overhead
 
