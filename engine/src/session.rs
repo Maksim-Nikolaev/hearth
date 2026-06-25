@@ -731,6 +731,20 @@ impl Session {
             ));
         }
 
+        // Surface the backend the UI should expect before any call starts. The
+        // per-call path re-emits the actual backend (correcting on auto-fallback).
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        {
+            let expected = if native_voice_selected() {
+                VoiceBackendKind::Native
+            } else {
+                VoiceBackendKind::Generic
+            };
+            let _ = evt_tx.send(SessionEvent::VoiceBackend(expected));
+        }
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        let _ = evt_tx.send(SessionEvent::VoiceBackend(VoiceBackendKind::Generic));
+
         (session, conn.inbound, evt_rx)
     }
 
@@ -1318,22 +1332,35 @@ impl Session {
         }
     }
 
+    /// Apply a device change to a running native voice instance. Returns `true`
+    /// when the native path handled it (so the caller skips the GStreamer rebuild).
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    fn rebuild_native_for_device_change(&mut self) -> bool {
+        if self.native_voice.is_none() {
+            return false;
+        }
+        // A mic-test-only instance has no peers, so `rebuild_native_voice` (which
+        // recreates via peer re-offers) would leave it gone. Recreate it through
+        // the mic-test path instead; an in-call instance rebuilds + restores the
+        // self-monitor.
+        if self.mic_testing && self.native_voice.as_ref().is_some_and(|nv| nv.is_empty()) {
+            self.native_voice = None;
+            self.start_mic_test();
+        } else {
+            self.rebuild_native_voice();
+            self.reapply_mic_test_state();
+        }
+        true
+    }
+
     pub fn set_input_device(&mut self, dev: Option<String>) {
         if dev == self.input_device {
             return; // no change — don't rebuild (would drop self-monitor etc.)
         }
         self.input_device = dev;
         #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            if self.native_voice.is_some() {
-                self.rebuild_native_voice();
-                self.reapply_mic_test_state(); // only if a test is genuinely running
-                return;
-            }
-            if self.native_monitor.is_some() {
-                self.start_mic_test(); // restart the running mic test on the new device
-                return;
-            }
+        if self.rebuild_native_for_device_change() {
+            return;
         }
         self.restart_voice_capture();
     }
@@ -1346,16 +1373,8 @@ impl Session {
         }
         self.output_device = dev;
         #[cfg(any(target_os = "windows", target_os = "linux"))]
-        {
-            if self.native_voice.is_some() {
-                self.rebuild_native_voice();
-                self.reapply_mic_test_state();
-                return;
-            }
-            if self.native_monitor.is_some() {
-                self.start_mic_test();
-                return;
-            }
+        if self.rebuild_native_for_device_change() {
+            return;
         }
         self.restart_voice_capture();
     }
@@ -1403,23 +1422,12 @@ impl Session {
 
         #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
-            // In a native call: hear yourself through the live capture — no second
-            // mic open, and it tests the real processing chain.
-            if let Some(nv) = self.native_voice.as_ref() {
+            // Run the mic test through the full native chain (AEC/NS/gate) so it
+            // matches a real call and AEC tuning is audible. `ensure_native_voice`
+            // returns the in-call instance or spins up a peerless one; on failure
+            // it falls through to the GStreamer monitor below.
+            if let Some(nv) = self.ensure_native_voice() {
                 nv.set_self_monitor(true);
-                return;
-            }
-            // Native, not in a call: standalone WASAPI monitor, gated by mode.
-            if native_voice_selected() {
-                match crate::audio::native::NativeMonitor::start(
-                    self.gate.clone(),
-                    self.evt_tx.clone(),
-                    self.input_device.clone(),
-                    self.output_device.clone(),
-                ) {
-                    Ok(m) => self.native_monitor = Some(m),
-                    Err(e) => self.emit(SessionEvent::Error(format!("mic test: {e}"))),
-                }
                 return;
             }
         }
@@ -1456,6 +1464,11 @@ impl Session {
             self.native_monitor = None;
             if let Some(nv) = self.native_voice.as_ref() {
                 nv.set_self_monitor(false);
+            }
+            // If native voice was spun up only for the mic test (no call active),
+            // tear it down so capture/playback stop when the test ends.
+            if self.native_voice.as_ref().is_some_and(|nv| nv.is_empty()) {
+                self.native_voice = None;
             }
         }
     }

@@ -427,8 +427,14 @@ impl Component for SettingsWindow {
 
         let ec_active_id = {
             let s = sender.clone();
+            let method_dd = ec_method_dropdown.clone();
+            let strength = ec_strength_scale.clone();
             ec_switch.connect_active_notify(move |sw| {
-                let _ = s.output(SettingsOutput::EchoCancellation(sw.is_active()));
+                let on = sw.is_active();
+                // AEC sub-controls only matter when echo cancellation is on.
+                method_dd.set_sensitive(on);
+                strength.set_sensitive(on);
+                let _ = s.output(SettingsOutput::EchoCancellation(on));
             })
         };
 
@@ -795,6 +801,9 @@ impl SettingsWindow {
             AecMethodKind::Webrtc => 1,
         });
         widgets.ec_strength_scale.set_value(f64::from(s.echo_cancel_strength));
+        // Grey out the AEC sub-controls when echo cancellation is off.
+        widgets.ec_method_dropdown.set_sensitive(s.echo_cancellation);
+        widgets.ec_strength_scale.set_sensitive(s.echo_cancellation);
         widgets.agc_switch.set_active(s.agc);
         widgets.vad_switch.set_active(s.vad);
 
