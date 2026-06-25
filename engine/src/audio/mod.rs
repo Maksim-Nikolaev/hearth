@@ -8,6 +8,11 @@ pub mod gate;
 #[cfg(any(target_os = "windows", target_os = "linux"))]
 pub mod jitter;
 
+// Self-describing wire packet (tag + seq + optional RTT timestamps) for the
+// native voice transport.
+#[cfg(any(target_os = "windows", target_os = "linux"))]
+pub mod voice_packet;
+
 pub mod monitor;
 pub mod profile;
 pub mod rt;

@@ -29,6 +29,23 @@ pub(crate) enum JitterOut {
     Starve,
 }
 
+/// Running packet accounting for the receive path, the single source of truth
+/// for the voice-stats readout. Concealed ≈ frames that never arrived (loss);
+/// `late_dropped` and `overfill_dropped` are arrivals discarded by the buffer.
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct JitterCounters {
+    /// Packets buffered for playout (in-order or reordered, not late).
+    pub accepted: u64,
+    /// PLC frames emitted for missing sequences (network loss).
+    pub concealed: u64,
+    /// Arrivals dropped because their slot had already played.
+    pub late_dropped: u64,
+    /// Oldest frames dropped to bound depth (burst / faster sender clock).
+    pub overfill_dropped: u64,
+    /// Long-gap jumps to the live edge.
+    pub resynced: u64,
+}
+
 pub(crate) struct JitterBuffer {
     /// Prebuffer depth: hold this many frames before the first release.
     target: usize,
@@ -37,6 +54,7 @@ pub(crate) struct JitterBuffer {
     next_seq: Option<u16>,
     /// Latches true once `target` is first reached, then stays true.
     playing: bool,
+    counters: JitterCounters,
 }
 
 impl JitterBuffer {
@@ -46,7 +64,18 @@ impl JitterBuffer {
             buf: HashMap::new(),
             next_seq: None,
             playing: false,
+            counters: JitterCounters::default(),
         }
+    }
+
+    /// Snapshot the running packet accounting (for the voice-stats readout).
+    pub fn counters(&self) -> JitterCounters {
+        self.counters
+    }
+
+    /// Frames currently buffered awaiting release (the live playout depth).
+    pub fn depth(&self) -> usize {
+        self.buf.len()
     }
 
     /// Change the prebuffer depth live (e.g. the user moved the jitter slider).
@@ -68,11 +97,15 @@ impl JitterBuffer {
             // Discard anything whose slot has already been released (wrapping
             // signed distance < 0), so a late straggler can't replay or be
             // misread as a future frame.
-            Some(next) if (seq.wrapping_sub(next) as i16) < 0 => return,
+            Some(next) if (seq.wrapping_sub(next) as i16) < 0 => {
+                self.counters.late_dropped += 1;
+                return;
+            }
             Some(_) => {}
         }
 
         self.buf.insert(seq, payload.to_vec());
+        self.counters.accepted += 1;
 
         // Bound the depth so a burst or a faster-than-us sender clock can't grow
         // playout latency without limit over a long call. Drop the oldest frames
@@ -83,6 +116,7 @@ impl JitterBuffer {
             let oldest = *self.buf.keys().min_by_key(|k| k.wrapping_sub(next)).unwrap();
             self.buf.remove(&oldest);
             self.next_seq = Some(oldest.wrapping_add(1));
+            self.counters.overfill_dropped += 1;
         }
     }
 
@@ -122,11 +156,13 @@ impl JitterBuffer {
         if hole > MAX_CONCEAL_FRAMES {
             let payload = self.buf.remove(&earliest).unwrap();
             self.next_seq = Some(earliest.wrapping_add(1));
+            self.counters.resynced += 1;
 
             return JitterOut::Packet(payload);
         }
 
         self.next_seq = Some(seq.wrapping_add(1));
+        self.counters.concealed += 1;
 
         JitterOut::Conceal
     }
@@ -276,5 +312,26 @@ mod tests {
 
         // Playback resumes at the live edge, not the stale seq 0.
         assert!(payload(jb.pop())[0] >= 96, "skipped the stale backlog to the live edge");
+    }
+
+    #[test]
+    fn counts_accepted_concealed_late_and_resync() {
+        let mut jb = JitterBuffer::new(2);
+        jb.push(0, &[0]); // accepted
+        jb.push(1, &[1]); // accepted
+        jb.push(3, &[3]); // accepted (seq 2 will be a hole)
+
+        assert_eq!(payload(jb.pop()), [0]);
+        assert_eq!(payload(jb.pop()), [1]);
+        assert!(matches!(jb.pop(), JitterOut::Conceal)); // seq 2 hole
+        assert_eq!(payload(jb.pop()), [3]);
+
+        jb.push(1, &[1]); // already played → late drop
+
+        let c = jb.counters();
+        assert_eq!(c.accepted, 3, "three in-order arrivals buffered");
+        assert_eq!(c.concealed, 1, "one PLC frame for the seq-2 hole");
+        assert_eq!(c.late_dropped, 1, "one straggler discarded");
+        assert_eq!(c.resynced, 0, "no long-gap resync here");
     }
 }

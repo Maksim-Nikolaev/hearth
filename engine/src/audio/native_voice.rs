@@ -13,8 +13,9 @@
 //! [`set_remote`](NativeVoice::set_remote) / [`remove_peer`](NativeVoice::remove_peer).
 
 use super::gate::Gate;
-use super::jitter::{JitterBuffer, JitterOut};
+use super::jitter::{JitterBuffer, JitterCounters, JitterOut};
 use super::native::{NativeCapture, NativePlayback};
+use super::voice_packet::{self, Timing};
 use crate::session::SessionEvent;
 use anyhow::{anyhow, Result};
 use super::dsp::AecMethod;
@@ -32,7 +33,7 @@ use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 use uuid::Uuid;
 
@@ -65,6 +66,9 @@ const NS_FRAME: usize = DenoiseState::FRAME_SIZE; // 480
 struct SendTarget {
     sock: Arc<UdpSocket>,
     remote: Mutex<Option<SocketAddr>>,
+    /// Latest `send_ts` seen from this peer, echoed in our outbound timed packets
+    /// so the peer can compute RTT. 0 = none seen yet (also the stats-off value).
+    peer_send_ts: AtomicU32,
 }
 
 struct Peer {
@@ -73,6 +77,34 @@ struct Peer {
     stop: Arc<AtomicBool>,
     /// The peer's receive threads: the socket reader and the paced release loop.
     handles: Vec<std::thread::JoinHandle<()>>,
+    /// Receive jitter buffer (owns the packet counters) and the smoothed RTT in
+    /// ms (0 = unknown), both read by [`NativeVoice::stats_snapshot`].
+    jitter: Arc<Mutex<JitterBuffer>>,
+    rtt_ms: Arc<AtomicU32>,
+}
+
+/// Per-peer voice diagnostics snapshot (one row of the stats readout).
+#[derive(Clone, Copy)]
+pub struct PeerStatsSnapshot {
+    pub peer: Uuid,
+    /// Smoothed round-trip time, `None` until a timed echo returns.
+    pub rtt_ms: Option<u32>,
+    /// Current playout buffering: jitter-buffer depth + device-lane cushion (ms).
+    pub jitter_ms: u32,
+    pub lane_ms: u32,
+    pub counters: JitterCounters,
+}
+
+impl PeerStatsSnapshot {
+    /// Network loss fraction in percent: concealed / (accepted + concealed).
+    pub fn loss_pct(&self) -> f32 {
+        let denom = self.counters.accepted + self.counters.concealed;
+        if denom == 0 {
+            0.0
+        } else {
+            self.counters.concealed as f32 / denom as f32 * 100.0
+        }
+    }
 }
 
 /// The active echo canceller, chosen by [`AecMethod`]. Rebuilt when the method
@@ -204,6 +236,8 @@ pub struct NativeVoice {
     /// Receive jitter-buffer depth in milliseconds, shared with every peer's
     /// release loop so the Settings slider retunes the buffer mid-call.
     jitter_ms: Arc<AtomicU32>,
+    /// Monotonic origin for RTT timestamps (ms since this transport started).
+    epoch: Instant,
     next_source: u64,
 }
 
@@ -237,11 +271,16 @@ impl NativeVoice {
 
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::LowDelay)?;
         let mut acc: Vec<f32> = Vec::with_capacity(FRAME * 2);
-        // [seq: u16 BE | opus payload]. The 2-byte sequence lets the receiver
-        // detect loss and run Opus PLC, and drop late/duplicate packets.
-        let mut packet = vec![0u8; 4000];
+        // Opus payload is encoded once per frame, then `voice_packet::encode`
+        // frames it per peer (a different echo timestamp each). See `voice_packet`.
+        let mut payload = vec![0u8; 4000];
+        let mut packet = vec![0u8; 4096];
         let mut seq: u16 = 0;
         let targets_cb = targets.clone();
+
+        // RTT epoch (ms since start) and whether we stamp timing (default on).
+        let epoch = Instant::now();
+        let stats_on = voice_packet::stats_enabled();
 
         // NS pre-stage state (RNNoise works in 480-sample i16-range frames).
         let ns_wet_cb = ns_wet.clone();
@@ -454,17 +493,25 @@ impl NativeVoice {
                 // Ramp the send gain in/out for a click-free open/close, then encode
                 // the faded frame — resting at the gate floor once fully closed.
                 ramp_gain(&mut frame, &mut send_gain, if open { 1.0 } else { FLOOR_GAIN });
-                packet[..2].copy_from_slice(&seq.to_be_bytes());
-                let n = match encoder.encode_float(&frame, &mut packet[2..]) {
+                let pn = match encoder.encode_float(&frame, &mut payload) {
                     Ok(n) => n,
                     Err(_) => continue,
                 };
-                seq = seq.wrapping_add(1);
+
+                let send_ts = epoch.elapsed().as_millis() as u32;
                 for t in targets_cb.lock().unwrap().iter() {
                     if let Some(remote) = *t.remote.lock().unwrap() {
-                        let _ = t.sock.send_to(&packet[..2 + n], remote);
+                        // Echo this peer's latest send_ts so it can time the round
+                        // trip; plain format when stats are off.
+                        let timing = stats_on.then(|| Timing {
+                            send_ts,
+                            echo_ts: t.peer_send_ts.load(Ordering::Relaxed),
+                        });
+                        let n = voice_packet::encode(&mut packet, seq, timing, &payload[..pn]);
+                        let _ = t.sock.send_to(&packet[..n], remote);
                     }
                 }
+                seq = seq.wrapping_add(1);
             }
         })?;
 
@@ -484,6 +531,7 @@ impl NativeVoice {
             aec_method: aec_method_state,
             input_volume,
             jitter_ms: Arc::new(AtomicU32::new(DEFAULT_JITTER_MS)),
+            epoch,
             next_source: 0,
         })
     }
@@ -540,6 +588,32 @@ impl NativeVoice {
         self.jitter_ms.store(ms, Ordering::Relaxed);
     }
 
+    /// Per-peer voice diagnostics (RTT, playout buffering, packet counters) for
+    /// the stats readout. Cheap enough to poll ~once a second.
+    pub fn stats_snapshot(&self) -> Vec<PeerStatsSnapshot> {
+        let frame_ms = (FRAME_US / 1000) as u32; // 5 ms per frame
+
+        self.peers
+            .iter()
+            .map(|(peer, p)| {
+                let (counters, depth) = {
+                    let jb = p.jitter.lock().unwrap();
+                    (jb.counters(), jb.depth())
+                };
+                let rtt = p.rtt_ms.load(Ordering::Relaxed);
+                let lane = self.playback.lane_samples(p.source_id) as u32;
+
+                PeerStatsSnapshot {
+                    peer: *peer,
+                    rtt_ms: (rtt != 0).then_some(rtt),
+                    jitter_ms: depth as u32 * frame_ms,
+                    lane_ms: lane * 1000 / 48_000,
+                    counters,
+                }
+            })
+            .collect()
+    }
+
     /// Add a peer: bind a recv socket, start its decode→playback lane, and return
     /// our `"ip:port"` to advertise. Idempotent-ish — a re-add replaces the peer.
     pub fn add_peer(&mut self, peer: Uuid) -> Result<String> {
@@ -548,11 +622,16 @@ impl NativeVoice {
         let sock = Arc::new(UdpSocket::bind("0.0.0.0:0")?);
         sock.set_read_timeout(Some(Duration::from_millis(200)))?;
         let local_port = sock.local_addr()?.port();
-        let target = Arc::new(SendTarget { sock: sock.clone(), remote: Mutex::new(None) });
+        let target = Arc::new(SendTarget {
+            sock: sock.clone(),
+            remote: Mutex::new(None),
+            peer_send_ts: AtomicU32::new(0),
+        });
 
         let source_id = self.next_source;
         self.next_source += 1;
         let stop = Arc::new(AtomicBool::new(false));
+        let rtt_ms = Arc::new(AtomicU32::new(0));
 
         // Reorder/dejitter buffer shared between the socket reader (fills it by
         // sequence) and the paced release loop (drains one frame per tick).
@@ -560,24 +639,43 @@ impl NativeVoice {
             self.jitter_ms.load(Ordering::Relaxed),
         ))));
 
-        // Reader: stamp arriving packets into the jitter buffer by sequence. No
-        // decode here — decoding rides the steady release clock, so playback
-        // timing is independent of how unevenly packets land off the network.
+        // Reader: parse each datagram, stamp it into the jitter buffer by sequence,
+        // and (when timed) record the peer's send_ts to echo back and time the
+        // round trip. No decode here — decoding rides the steady release clock, so
+        // playback timing is independent of how unevenly packets land.
         let reader = {
             let jitter = jitter.clone();
             let stop = stop.clone();
+            let target = target.clone();
+            let rtt_ms = rtt_ms.clone();
+            let epoch = self.epoch;
             std::thread::Builder::new()
                 .name(format!("native-voice-rx-{source_id}"))
                 .spawn(move || {
                     let mut buf = [0u8; 4000];
                     while !stop.load(Ordering::Relaxed) {
                         let n = match sock.recv(&mut buf) {
-                            Ok(n) if n >= 3 => n,
-                            Ok(_) => continue,  // runt packet
+                            Ok(n) => n,
                             Err(_) => continue, // read timeout — re-check stop
                         };
-                        let seq = u16::from_be_bytes([buf[0], buf[1]]);
-                        jitter.lock().unwrap().push(seq, &buf[2..n]);
+                        let Some(pkt) = voice_packet::decode(&buf[..n]) else {
+                            continue; // runt / unknown tag
+                        };
+
+                        if let Some(t) = pkt.timing {
+                            // Echo this peer's send time in our outbound packets.
+                            target.peer_send_ts.store(t.send_ts, Ordering::Relaxed);
+
+                            // Our own send_ts came back as echo_ts → round trip.
+                            // 0 means the peer hasn't echoed one yet.
+                            if t.echo_ts != 0 {
+                                let now = epoch.elapsed().as_millis() as u32;
+                                let sample = now.wrapping_sub(t.echo_ts);
+                                rtt_ms.store(smooth_rtt(rtt_ms.load(Ordering::Relaxed), sample), Ordering::Relaxed);
+                            }
+                        }
+
+                        jitter.lock().unwrap().push(pkt.seq, pkt.payload);
                     }
                 })?
         };
@@ -650,8 +748,10 @@ impl NativeVoice {
         };
 
         self.targets.lock().unwrap().push(target.clone());
-        self.peers
-            .insert(peer, Peer { source_id, target, stop, handles: vec![reader, release] });
+        self.peers.insert(
+            peer,
+            Peer { source_id, target, stop, handles: vec![reader, release], jitter, rtt_ms },
+        );
         Ok(format!("{}:{}", crate::net::advertised_ip(), local_port))
     }
 
@@ -728,9 +828,27 @@ fn ms_to_frames(ms: u32) -> usize {
     ((ms as u64 * 1000 / FRAME_US) as usize).max(1)
 }
 
+/// Implausibly large RTT sample (ms) — a stale echo or wrapped timestamp. Ignored
+/// so one bad sample can't poison the smoothed value.
+const RTT_OUTLIER_MS: u32 = 10_000;
+
+/// Smooth a new RTT sample into the running estimate. Seeds on the first sample
+/// (`prev == 0`), then a 1/8-weight EMA; outliers are dropped.
+fn smooth_rtt(prev: u32, sample: u32) -> u32 {
+    if sample > RTT_OUTLIER_MS {
+        return prev;
+    }
+
+    if prev == 0 {
+        return sample;
+    }
+
+    prev - prev / 8 + sample / 8
+}
+
 #[cfg(test)]
 mod jitter_depth_tests {
-    use super::ms_to_frames;
+    use super::{ms_to_frames, smooth_rtt};
 
     #[test]
     fn converts_ms_to_whole_frames_with_a_one_frame_floor() {
@@ -738,6 +856,19 @@ mod jitter_depth_tests {
         assert_eq!(ms_to_frames(5), 1);
         assert_eq!(ms_to_frames(0), 1); // never zero — always hold one frame
         assert_eq!(ms_to_frames(100), 20);
+    }
+
+    #[test]
+    fn smooth_rtt_seeds_then_eases_toward_new_samples() {
+        assert_eq!(smooth_rtt(0, 40), 40, "first sample seeds the estimate");
+
+        let r = smooth_rtt(40, 80);
+        assert!(r > 40 && r < 80, "eases toward the new sample, got {r}");
+    }
+
+    #[test]
+    fn smooth_rtt_ignores_outliers() {
+        assert_eq!(smooth_rtt(40, 50_000), 40, "a stale/wrapped sample is dropped");
     }
 }
 
