@@ -61,12 +61,14 @@ impl SpeexAec {
     /// Residual-echo suppression strength, 0 – 100. The linear echo canceller
     /// always runs; this only scales the *residual* suppressor on top. At 0 the
     /// residual stage is a no-op (0 dB) — linear cancellation only, most natural
-    /// voice; at 100 it attenuates residual echo hard (idle −45 dB, during
-    /// near-end speech −25 dB). More negative = stronger. Live.
+    /// voice; at 100 it attenuates idle residual echo hard (−45 dB). The
+    /// during-speech attenuation is kept much gentler (max −12 dB) so near-end
+    /// voice isn't ducked when you talk over echo (speex's double-talk handling is
+    /// weaker than AEC3). More negative = stronger. Live.
     pub fn set_strength(&self, strength: u8) {
         let t = strength.min(100) as f32 / 100.0;
-        let suppress = (t * -45.0).round() as i32; // 0 .. -45
-        let active = (t * -25.0).round() as i32; // 0 .. -25
+        let suppress = (t * -45.0).round() as i32; // idle: 0 .. -45
+        let active = (t * -12.0).round() as i32; // during speech: 0 .. -12
 
         self.set_ctl(SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, suppress);
         self.set_ctl(SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE, active);
