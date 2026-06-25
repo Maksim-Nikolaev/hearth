@@ -58,13 +58,15 @@ impl SpeexAec {
         }
     }
 
-    /// Residual-echo suppression strength, 0 (gentle/most natural) – 100
-    /// (aggressive). Maps linearly to speex's attenuation in dB (more negative =
-    /// stronger): idle −15 → −45 dB, during near-end speech −10 → −25 dB. Live.
+    /// Residual-echo suppression strength, 0 – 100. The linear echo canceller
+    /// always runs; this only scales the *residual* suppressor on top. At 0 the
+    /// residual stage is a no-op (0 dB) — linear cancellation only, most natural
+    /// voice; at 100 it attenuates residual echo hard (idle −45 dB, during
+    /// near-end speech −25 dB). More negative = stronger. Live.
     pub fn set_strength(&self, strength: u8) {
         let t = strength.min(100) as f32 / 100.0;
-        let suppress = (-15.0 + t * -30.0).round() as i32; // -15 .. -45
-        let active = (-10.0 + t * -15.0).round() as i32; // -10 .. -25
+        let suppress = (t * -45.0).round() as i32; // 0 .. -45
+        let active = (t * -25.0).round() as i32; // 0 .. -25
 
         self.set_ctl(SPEEX_PREPROCESS_SET_ECHO_SUPPRESS, suppress);
         self.set_ctl(SPEEX_PREPROCESS_SET_ECHO_SUPPRESS_ACTIVE, active);
