@@ -13,8 +13,8 @@ upcoming private-network cross-machine test runs against.
 ## Scope
 
 - **In:** a deployable full stack (backend in Docker, Postgres internal),
-  persistence, auto-restart, `.env` secrets, fast cached rebuilds, a `seed`
-  path, helper `Makefile`, README run section.
+  persistence, auto-restart, `.env` secrets with **age encrypt/decrypt**, fast
+  cached rebuilds, a `seed` path, helper `Makefile`, a one-line README pointer.
 - **Out (deferred, per `docs/STATUS.md`):** TLS / Traefik reverse-proxy, coturn,
   Grafana/Loki observability, image registry / CI publishing.
 
@@ -81,13 +81,31 @@ Remove the `backend` service; keep only `postgres` (host port `5433:5432`, env
 from `.env`, same `hearth_pgdata` volume + healthcheck) for the fast `cargo run
 -p hearth-backend` inner loop. Never run both Postgres containers at once.
 
-### 3. `.env` / `.env.example`
+### 3. Secrets — `.env` + age encryption
 
-`.env` (gitignored) carries `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`,
-`JWT_SECRET` (real, ≥32 bytes), `ACCESS_TTL_SECS`, `REFRESH_TTL_SECS`,
-`BACKEND_PORT`, and `DATABASE_URL` (localhost:5433, for the cargo-run path).
-Update `.env.example` to list all of these with safe placeholders and a comment:
-`# JWT_SECRET: generate with: openssl rand -base64 48`.
+Runtime config lives in `.env` (gitignored): `POSTGRES_USER`,
+`POSTGRES_PASSWORD`, `POSTGRES_DB`, `JWT_SECRET` (real, ≥32 bytes),
+`ACCESS_TTL_SECS`, `REFRESH_TTL_SECS`, `BACKEND_PORT`, and `DATABASE_URL`
+(localhost:5433, for the cargo-run path). `.env.example` lists all of these with
+safe placeholders and `# JWT_SECRET: generate with: openssl rand -base64 48`.
+
+**Secrets management = age** (the `.gitignore` already ignores `*.age` and
+`secrets.dec.*`). `.env` is encrypted to `.env.age` with plain `age` (the `.age`
+extension is `age`, not sops); the encrypted blob is the source of truth carried
+to production **encrypted** and decrypted on the box. Both `.env` and `.env.age`
+stay out of git (existing convention); the `.age` is distributed out of band.
+
+- `make secrets-encrypt` → `age -R "$AGE_RECIPIENTS" -o .env.age .env`
+- `make secrets-decrypt` → `age -d -i "$AGE_KEY_FILE" -o .env .env.age`
+
+`AGE_RECIPIENTS` (a recipients file or `age1...` pubkey) and `AGE_KEY_FILE` (the
+age identity, default `${SOPS_AGE_KEY_FILE:-$HOME/.config/age/keys.txt}`) come
+from the environment so no key material is hardcoded. If `age` isn't installed
+the targets print an install hint and exit non-zero.
+
+**Deferred:** a separate `.env.prod` (+ `.env.prod.age`) for the real production
+deployment lands with the later deployment workstream — this sub-project sets up
+the mechanism, not the prod values.
 
 ### 4. `backend/Dockerfile` — `cargo-chef` dependency caching
 
@@ -135,13 +153,16 @@ Targets: `up` (`docker compose up -d`), `down` (`docker compose down`),
 `rebuild` (`docker compose build backend`), `update` (`docker compose up -d
 --build backend`), `logs` (`docker compose logs -f`), `ps`, `psql`
 (`docker compose exec postgres psql -U $$POSTGRES_USER -d $$POSTGRES_DB`),
-`seed` (`docker compose run --rm backend seed`). Load `.env` for the psql vars.
+`seed` (`docker compose run --rm backend seed`), `secrets-encrypt`,
+`secrets-decrypt` (§3). Load `.env` for the psql vars.
 
-### 7. README
+### 7. README — deferred
 
-Add a "Run the stack" section: `cp .env.example .env`, set a generated
-`JWT_SECRET`, `make up`, `make seed`, backend on `:8080`. Keep the existing
-`compose.dev.yml` + `cargo run` inner-loop instructions.
+The full "Run the stack" / useful-commands README pass is **deferred** (per the
+user) to a later docs sweep. This sub-project ships a one-paragraph pointer in the
+README ("Stack: `cp .env.example .env` → set `JWT_SECRET` → `make up` →
+`make seed`; see `Makefile` for all targets") so the commands are discoverable,
+with the full write-up later.
 
 ## How it runs
 
@@ -159,6 +180,8 @@ and restarts it. Postgres data persists in the `hearth_pgdata` volume.
 - `docker compose down && make up` → data persists (no re-seed needed).
 - Reboot (or `docker restart`) → stack auto-starts.
 - `make update` after a backend code change → fast rebuild (deps cached).
+- `make secrets-encrypt` then `make secrets-decrypt` round-trips `.env`
+  identically (with a test age key); `.env.age` is non-plaintext.
 
 ## Non-goals
 
