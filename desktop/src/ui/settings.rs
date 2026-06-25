@@ -5,6 +5,15 @@ use gtk::glib::SignalHandlerId;
 use gtk::prelude::*;
 use relm4::prelude::*;
 
+/// Cap on the rolling voice-stats history (~1 hour of 1/s single-peer samples).
+/// Bounds memory; oldest lines drop once exceeded.
+const HISTORY_MAX_LINES: usize = 3600;
+
+/// Join the rolling stats history (oldest first) into one exportable text block.
+fn join_history(history: &std::collections::VecDeque<String>) -> String {
+    history.iter().cloned().collect::<Vec<_>>().join("\n")
+}
+
 // ── Output ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -67,8 +76,11 @@ pub struct SettingsWindow {
     // the list without reconnecting the signal.
     mic_devices_cell: std::rc::Rc<std::cell::RefCell<Vec<AudioDevice>>>,
     spk_devices_cell: std::rc::Rc<std::cell::RefCell<Vec<AudioDevice>>>,
-    // Latest formatted voice-stats snapshot, shared with the Copy/Save closures.
-    stats_cell: std::rc::Rc<std::cell::RefCell<String>>,
+    // Rolling timestamped history of voice-stats samples, shared with the
+    // Copy/Save closures (which export the whole log, not just the latest line).
+    stats_history: std::rc::Rc<std::cell::RefCell<std::collections::VecDeque<String>>>,
+    // Monotonic origin for the history's mm:ss timestamps.
+    stats_start: std::time::Instant,
 }
 
 // ── Widget struct (named fields the macro generates) ─────────────────────────
@@ -354,10 +366,10 @@ impl Component for SettingsWindow {
         stats_label.add_css_class("dim-label");
         root_box.append(&stats_label);
 
-        // Latest formatted snapshot, refreshed by SetVoiceStats. The Copy/Save
-        // buttons act on this cached text — a single instant (one line per peer),
-        // not the accumulated 1/s stream, so it stays small on a long call.
-        let stats_cell = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        // Rolling, timestamped history of the 1/s samples (capped). The panel
+        // shows the latest line; Copy/Save export the whole accumulated log.
+        let stats_history =
+            std::rc::Rc::new(std::cell::RefCell::new(std::collections::VecDeque::<String>::new()));
 
         let stats_btn_row = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
@@ -371,10 +383,10 @@ impl Component for SettingsWindow {
         root_box.append(&stats_btn_row);
 
         {
-            let cell = stats_cell.clone();
+            let history = stats_history.clone();
             let btn = stats_copy_btn.clone();
             stats_copy_btn.connect_clicked(move |_| {
-                let text = cell.borrow().clone();
+                let text = join_history(&history.borrow());
                 if text.is_empty() {
                     return;
                 }
@@ -388,13 +400,13 @@ impl Component for SettingsWindow {
         }
 
         {
-            let cell = stats_cell.clone();
+            let history = stats_history.clone();
             let win = window.clone();
             // FileChooserNative (vs the 4.10 FileDialog) keeps the runtime GTK
             // floor at 4.0 — the bundled Windows GTK may predate 4.10.
             #[allow(deprecated)]
             stats_save_btn.connect_clicked(move |_| {
-                let text = cell.borrow().clone();
+                let text = join_history(&history.borrow());
                 if text.is_empty() {
                     return;
                 }
@@ -724,7 +736,8 @@ impl Component for SettingsWindow {
             level_bar,
             mic_devices_cell,
             spk_devices_cell,
-            stats_cell,
+            stats_history,
+            stats_start: std::time::Instant::now(),
         };
 
         let widgets = SettingsWindowWidgets {
@@ -817,9 +830,20 @@ impl Component for SettingsWindow {
                     widgets.stats_label.set_text("No active voice call.");
                 } else {
                     widgets.stats_label.set_text(&text);
+
+                    // Append each peer line to the rolling history with an mm:ss
+                    // timestamp; Copy/Save export the whole accumulated log.
+                    let secs = self.stats_start.elapsed().as_secs();
+                    let ts = format!("{:02}:{:02}", secs / 60, secs % 60);
+
+                    let mut hist = self.stats_history.borrow_mut();
+                    for line in text.lines() {
+                        hist.push_back(format!("[{ts}] {line}"));
+                    }
+                    while hist.len() > HISTORY_MAX_LINES {
+                        hist.pop_front();
+                    }
                 }
-                // Cache for the Copy/Save buttons (act on the latest snapshot).
-                *self.stats_cell.borrow_mut() = text;
             }
         }
     }
