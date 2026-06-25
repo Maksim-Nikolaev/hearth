@@ -12,6 +12,7 @@ use spa::param::audio::{AudioFormat, AudioInfoRaw};
 use spa::pod::{serialize::PodSerializer, Object, Pod, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -239,6 +240,8 @@ pub struct NativePlayback {
     quit_tx: pw::channel::Sender<()>,
     sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>>,
     far_end: Arc<Mutex<VecDeque<f32>>>,
+    /// Master speaker volume (f32 bits, 0.0–1.0), applied in the render loop.
+    volume: Arc<AtomicU32>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -246,21 +249,23 @@ impl NativePlayback {
     pub fn start(device: Option<String>) -> Result<Self> {
         let sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>> = Arc::new(Mutex::new(HashMap::new()));
         let far_end: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let (quit_tx, quit_rx) = pw::channel::channel::<()>();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
 
         let sources_t = sources.clone();
         let far_t = far_end.clone();
+        let volume_t = volume.clone();
         let handle = std::thread::Builder::new()
             .name("native-pw-playback".into())
             .spawn(move || {
-                if let Err(e) = run_playback(device, sources_t, far_t, quit_rx, &ready_tx) {
+                if let Err(e) = run_playback(device, sources_t, far_t, volume_t, quit_rx, &ready_tx) {
                     let _ = ready_tx.send(Err(e.to_string()));
                 }
             })?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { quit_tx, sources, far_end, handle: Some(handle) }),
+            Ok(Ok(())) => Ok(Self { quit_tx, sources, far_end, volume, handle: Some(handle) }),
             Ok(Err(e)) => bail!("native pw playback init: {e}"),
             Err(_) => bail!("native pw playback thread exited before init"),
         }
@@ -269,6 +274,11 @@ impl NativePlayback {
     /// The rendered speaker mix (AEC far-end reference).
     pub fn far_end(&self) -> Arc<Mutex<VecDeque<f32>>> {
         self.far_end.clone()
+    }
+
+    /// Set master speaker volume (0.0–1.0). Live.
+    pub fn set_volume(&self, v: f64) {
+        self.volume.store((v as f32).to_bits(), Ordering::Relaxed);
     }
 
     /// Queue mono f32 @ 48 kHz for `source`'s lane, trimmed to a tight target.
@@ -296,6 +306,7 @@ fn run_playback(
     device: Option<String>,
     sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>>,
     far_end: Arc<Mutex<VecDeque<f32>>>,
+    volume: Arc<AtomicU32>,
     quit_rx: pw::channel::Receiver<()>,
     ready: &mpsc::Sender<Result<(), String>>,
 ) -> Result<()> {
@@ -330,6 +341,7 @@ fn run_playback(
     let _listener = stream
         .add_local_listener_with_user_data(())
         .process(move |stream, _| {
+            let vol = f32::from_bits(volume.load(Ordering::Relaxed));
             let Some(mut buffer) = stream.dequeue_buffer() else { return };
             // Frames the graph wants this cycle. The mapped buffer (`data()`) is
             // sized to the max quantum, which is usually larger; producing the
@@ -359,7 +371,7 @@ fn run_playback(
                                 v += s;
                             }
                         }
-                        v = crate::audio::native::soft_clip(v); // gentle limiter
+                        v = crate::audio::native::soft_clip(v * vol); // master volume, then limiter
                         for ch in frame.iter_mut() {
                             *ch = v; // mono mix -> both channels
                         }

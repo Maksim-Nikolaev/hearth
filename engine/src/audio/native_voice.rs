@@ -179,6 +179,8 @@ pub struct NativeVoice {
     ec: Arc<AtomicBool>,
     /// Residual-echo suppression strength (0–100), applied live.
     ec_strength: Arc<AtomicU32>,
+    /// User mic volume (pre-amp, f32 bits, 0.0–1.0), applied live.
+    input_volume: Arc<AtomicU32>,
     /// Active echo-canceller method (speex/webrtc) as a u8, applied live.
     aec_method: Arc<AtomicU8>,
     next_source: u64,
@@ -208,6 +210,9 @@ impl NativeVoice {
         let targets: Arc<Mutex<Vec<Arc<SendTarget>>>> = Arc::new(Mutex::new(Vec::new()));
         let deaf = Arc::new(AtomicBool::new(false));
         let ns_wet = Arc::new(AtomicU32::new(ns_wet));
+        // User mic volume (pre-amp, f32 bits, 0.0–1.0); 1.0 = unity passthrough.
+        let input_volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
+        let input_vol_cb = input_volume.clone();
 
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::LowDelay)?;
         let mut acc: Vec<f32> = Vec::with_capacity(FRAME * 2);
@@ -278,6 +283,18 @@ impl NativeVoice {
         );
 
         let capture = NativeCapture::start(input_device, move |mono| {
+            // Mic pre-amp (user input volume) before AEC/DSP, so the gate/meter and
+            // everything downstream see the adjusted level.
+            let in_vol = f32::from_bits(input_vol_cb.load(Ordering::Relaxed));
+            let mut in_scaled: Vec<f32> = Vec::new();
+            let mono: &[f32] = if (in_vol - 1.0).abs() > f32::EPSILON {
+                in_scaled.extend_from_slice(mono);
+                crate::audio::capture::apply_gain(&mut in_scaled, in_vol);
+                &in_scaled
+            } else {
+                mono
+            };
+
             // AEC first (on the raw mic), so NS/AGC see echo-free audio. When off,
             // `src` is the mic untouched.
             let ec_on = ec_cb.load(Ordering::Relaxed);
@@ -444,6 +461,7 @@ impl NativeVoice {
             ec: ec_enabled,
             ec_strength: ec_strength_state,
             aec_method: aec_method_state,
+            input_volume,
             next_source: 0,
         })
     }
@@ -456,6 +474,16 @@ impl NativeVoice {
     /// Set residual-echo suppression strength (0–100). Applied on the next frame.
     pub fn set_echo_cancel_strength(&self, strength: u8) {
         self.ec_strength.store(strength as u32, Ordering::Relaxed);
+    }
+
+    /// Set mic input volume (0.0–1.0). Live, applied as a pre-amp on capture.
+    pub fn set_input_volume(&self, v: f64) {
+        self.input_volume.store((v as f32).to_bits(), Ordering::Relaxed);
+    }
+
+    /// Set master speaker volume (0.0–1.0). Live.
+    pub fn set_output_volume(&self, v: f64) {
+        self.playback.set_volume(v);
     }
 
     /// Switch the echo-canceller method. The capture thread rebuilds the canceller

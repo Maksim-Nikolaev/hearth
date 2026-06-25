@@ -11,7 +11,7 @@
 use crate::audio::native::{soft_clip, FAR_END_CAP, MAX_LANE_SAMPLES, SAMPLE_RATE};
 use anyhow::{bail, Result};
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use windows::core::HSTRING;
@@ -210,6 +210,8 @@ pub struct NativePlayback {
     sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>>,
     /// Rendered mono mix (the speaker signal) — the AEC far-end reference.
     far_end: Arc<Mutex<VecDeque<f32>>>,
+    /// Master speaker volume (f32 bits, 0.0–1.0), applied in the render loop.
+    volume: Arc<AtomicU32>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -218,16 +220,18 @@ impl NativePlayback {
         let stop = Arc::new(AtomicBool::new(false));
         let sources: Arc<Mutex<HashMap<u64, VecDeque<f32>>>> = Arc::new(Mutex::new(HashMap::new()));
         let far_end: Arc<Mutex<VecDeque<f32>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let volume = Arc::new(AtomicU32::new(1.0f32.to_bits()));
         let stop_thread = stop.clone();
         let sources_thread = sources.clone();
         let far_thread = far_end.clone();
+        let volume_thread = volume.clone();
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
 
         let handle = std::thread::Builder::new()
             .name("native-playback".into())
             .spawn(move || {
                 let r = unsafe {
-                    playback_loop(&stop_thread, device.as_deref(), &sources_thread, &far_thread, &ready_tx)
+                    playback_loop(&stop_thread, device.as_deref(), &sources_thread, &far_thread, &volume_thread, &ready_tx)
                 };
                 if let Err(e) = r {
                     let _ = ready_tx.send(Err(e.to_string()));
@@ -235,7 +239,7 @@ impl NativePlayback {
             })?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { stop, sources, far_end, handle: Some(handle) }),
+            Ok(Ok(())) => Ok(Self { stop, sources, far_end, volume, handle: Some(handle) }),
             Ok(Err(e)) => bail!("native playback init: {e}"),
             Err(_) => bail!("native playback thread exited before init"),
         }
@@ -245,6 +249,11 @@ impl NativePlayback {
     /// from this in lock-step with the mic to cancel echo.
     pub fn far_end(&self) -> Arc<Mutex<VecDeque<f32>>> {
         self.far_end.clone()
+    }
+
+    /// Set master speaker volume (0.0–1.0). Live.
+    pub fn set_volume(&self, v: f64) {
+        self.volume.store((v as f32).to_bits(), Ordering::Relaxed);
     }
 
     /// Queue mono f32 @ 48 kHz for `source`'s lane, trimmed to a tight target so
@@ -280,6 +289,7 @@ unsafe fn playback_loop(
     device: Option<&str>,
     sources: &Mutex<HashMap<u64, VecDeque<f32>>>,
     far_end: &Mutex<VecDeque<f32>>,
+    volume: &AtomicU32,
     ready: &mpsc::Sender<Result<(), String>>,
 ) -> Result<()> {
     let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -316,6 +326,7 @@ unsafe fn playback_loop(
         {
             let mut sources = sources.lock().unwrap();
             let mut far = far_end.lock().unwrap();
+            let vol = f32::from_bits(volume.load(Ordering::Relaxed));
             for f in 0..to_write as usize {
                 // mix: sum one sample from every source lane (silence on underrun)
                 let mut v = 0.0f32;
@@ -324,7 +335,7 @@ unsafe fn playback_loop(
                         v += s;
                     }
                 }
-                v = soft_clip(v); // gentle limiter, not a brick-wall clip
+                v = soft_clip(v * vol); // master volume, then limiter
                 for c in 0..ch {
                     out[f * ch + c] = v; // mono -> all channels
                 }
