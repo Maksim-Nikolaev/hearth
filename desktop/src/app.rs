@@ -498,8 +498,18 @@ impl AppModel {
         match out {
             SettingsOutput::InputDevice(id) => settings.input_device = id,
             SettingsOutput::OutputDevice(id) => settings.output_device = id,
-            SettingsOutput::InputVolume(v) => settings.input_volume = v,
-            SettingsOutput::OutputVolume(v) => settings.output_volume = v,
+            SettingsOutput::InputVolume(v) => {
+                settings.input_volume = v;
+                if let Some(s) = self.session.as_mut() {
+                    s.set_input_volume(v);
+                }
+            }
+            SettingsOutput::OutputVolume(v) => {
+                settings.output_volume = v;
+                if let Some(s) = self.session.as_mut() {
+                    s.set_output_volume(v);
+                }
+            }
             SettingsOutput::NoiseSuppression(ns) => {
                 // Editing a DSP flag while on a preset materializes the preset
                 // into the custom slot, then applies the user's change on top.
@@ -637,6 +647,9 @@ impl AppModel {
         };
 
         session.set_dsp(crate::config::effective_dsp(s, output_kind));
+
+        session.set_input_volume(s.input_volume);
+        session.set_output_volume(s.output_volume);
 
         session.set_activation(match s.activation {
             ActivationKind::Voice => ActivationMode::Voice { threshold: s.input_sensitivity },

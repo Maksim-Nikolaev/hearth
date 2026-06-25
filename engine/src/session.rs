@@ -175,6 +175,24 @@ pub(crate) fn pick_backend(force_generic: bool, native_failed: bool) -> bool {
     !force_generic && !native_failed
 }
 
+/// User volume sliders are attenuate-only; clamp to the unit range.
+pub(crate) fn clamp_volume(v: f64) -> f64 {
+    v.clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::clamp_volume;
+
+    #[test]
+    fn clamps_to_unit_range() {
+        assert_eq!(clamp_volume(-0.2), 0.0);
+        assert_eq!(clamp_volume(0.5), 0.5);
+        assert_eq!(clamp_volume(1.0), 1.0);
+        assert_eq!(clamp_volume(2.5), 1.0);
+    }
+}
+
 #[cfg(all(test, any(target_os = "windows", target_os = "linux")))]
 mod backend_tests {
     use super::pick_backend;
@@ -598,6 +616,10 @@ pub struct Session {
     /// Software activation gate, shared with the capture callback thread.
     gate: Arc<Mutex<Gate>>,
     dsp_config: DspConfig,
+    /// User mic/speaker volume (0.0–1.0), applied live to the active voice path
+    /// and re-applied to new peers / rebuilt instances.
+    input_volume: f64,
+    output_volume: f64,
     input_device: Option<String>,
     output_device: Option<String>,
     /// Active X11 global key grab for push-to-talk. Dropped (ungrab + thread
@@ -712,6 +734,8 @@ impl Session {
             voice_backend_announced: false,
             gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
             dsp_config: default_dsp_config(),
+            input_volume: 1.0,
+            output_volume: 1.0,
             input_device: None,
             output_device: None,
             ptt_grab: None,
@@ -849,6 +873,11 @@ impl Session {
                     // feed your mic straight back to your ears). The device-change-
                     // during-test case re-applies it explicitly in set_*_device.
                     self.native_voice = Some(nv);
+                    // Apply the stored user volumes to the fresh instance.
+                    if let Some(nv) = self.native_voice.as_ref() {
+                        nv.set_input_volume(self.input_volume);
+                        nv.set_output_volume(self.output_volume);
+                    }
                 }
                 Err(e) => {
                     // Best driver unavailable (no server / no RT / device error):
@@ -892,6 +921,9 @@ impl Session {
         let endpoint = p.local_endpoint();
         self.voice_peers.insert(peer, p);
         self.register_voice_send(peer);
+        if let Some(p) = self.voice_peers.get(&peer) {
+            p.set_output_volume(self.output_volume);
+        }
         self.announce_backend(VoiceBackendKind::Generic);
         let _ = self.out_tx.send(ClientMessage::Offer {
             to: peer,
@@ -941,6 +973,9 @@ impl Session {
                 let my_endpoint = p.local_endpoint();
                 self.voice_peers.insert(from, p);
                 self.register_voice_send(from);
+                if let Some(p) = self.voice_peers.get(&from) {
+                    p.set_output_volume(self.output_volume);
+                }
                 self.announce_backend(VoiceBackendKind::Generic);
                 let _ = self.out_tx.send(ClientMessage::Answer {
                     to: from,
@@ -1237,6 +1272,32 @@ impl Session {
         }
     }
 
+    /// Set mic input volume (0.0–1.0), live, on whichever voice path is active.
+    pub fn set_input_volume(&mut self, v: f64) {
+        let v = clamp_volume(v);
+        self.input_volume = v;
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(nv) = self.native_voice.as_ref() {
+            nv.set_input_volume(v);
+        }
+        if let Some(vc) = self.voice_capture.as_ref() {
+            vc.set_input_volume(v);
+        }
+    }
+
+    /// Set master speaker volume (0.0–1.0), live, on whichever voice path is active.
+    pub fn set_output_volume(&mut self, v: f64) {
+        let v = clamp_volume(v);
+        self.output_volume = v;
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
+        if let Some(nv) = self.native_voice.as_ref() {
+            nv.set_output_volume(v);
+        }
+        for p in self.voice_peers.values() {
+            p.set_output_volume(v);
+        }
+    }
+
     /// Change the voice activation mode (voice-activity / push-to-talk / always-on).
     pub fn set_activation(&self, mode: ActivationMode) {
         self.gate.lock().unwrap().set_mode(mode);
@@ -1496,6 +1557,8 @@ impl Session {
                     vc.add_peer(appsrc);
                 }
 
+                vc.set_input_volume(self.input_volume);
+
                 // A device swap mid mic-test rebuilds the capture; restore the
                 // self-monitor so the test stays audible on the new device.
                 if self.mic_testing {
@@ -1637,6 +1700,8 @@ mod tests {
                 voice_backend_announced: false,
                 gate: Arc::new(Mutex::new(Gate::new(ActivationMode::Voice { threshold: -45.0 }))),
                 dsp_config: default_dsp_config(),
+                input_volume: 1.0,
+                output_volume: 1.0,
                 input_device: None,
                 output_device: None,
                 ptt_grab: None,
