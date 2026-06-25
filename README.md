@@ -64,14 +64,25 @@ handshake.
 
 ## Development
 
-```sh
-# Backend + Postgres (containerised) for local dev:
-docker compose -f compose.dev.yml up
+**Run the always-on stack (backend + Postgres in Docker):**
 
-# Or run the workspace crates directly (needs Rust + GStreamer; the desktop
-# crate also needs GTK4). See engine/docs/windows-setup.md for the Windows box.
+```sh
+cp .env.example .env            # then set a real JWT_SECRET: openssl rand -base64 48
+make up                          # build + start the stack (detached)
+make seed                        # bootstrap dev users alice/bob
+```
+
+Backend on `:8080`, Postgres internal (persistent `hearth_pgdata` volume), both
+`restart: unless-stopped`. `make update` rebuilds the backend after a code change;
+`make logs` / `make ps` / `make psql` for ops. Secrets are age-managed
+(`make secrets-encrypt` / `secrets-decrypt`). See the `Makefile` for all targets.
+
+**Inner loop (run a crate natively against a Dockerised Postgres):**
+
+```sh
+docker compose -f compose.dev.yml up -d postgres   # Postgres only, on host :5433
 cargo run -p hearth-backend     # API + signaling on :8080
-cargo run -p desktop            # GTK4 client
+cargo run -p desktop            # GTK4 client (needs Rust + GStreamer + GTK4)
 ```
 
 ## License
