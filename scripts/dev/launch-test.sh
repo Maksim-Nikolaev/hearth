@@ -9,6 +9,10 @@
 #   --synthetic
 #             feed a synthetic videotestsrc to screenshare/preview instead of the
 #             real screen (safe for UI testing; avoids grabbing the real :0).
+#   --fresh   wipe each window's isolated config first, so alice and bob start with
+#             empty settings (useful for the latency rig: each can pick its own
+#             audio devices). Configs are always isolated per window under
+#             /tmp/hearth-test/<name>; --fresh just empties them.
 #
 # The backend must already be running on :8080 (see docs/dev/voice-test.md):
 #   docker compose -f compose.dev.yml up -d postgres
@@ -25,12 +29,14 @@ cd "$(dirname "$0")/../.."
 SKIP_BUILD=false
 SYNTHETIC=false
 RELEASE=false
+FRESH=false
 for arg in "$@"; do
   case "$arg" in
     --debug)     SKIP_BUILD=true ;;
     --release)   RELEASE=true ;;
     --synthetic) SYNTHETIC=true ;;
-    -h|--help)   sed -n '2,24p' "$0"; exit 0 ;;
+    --fresh)     FRESH=true ;;
+    -h|--help)   sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "unknown flag: $arg (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -92,9 +98,18 @@ fi
 # 6. Launch both windows, each logging to /tmp.
 launch() {
   local name="$1" log="/tmp/hearth-$1.log"
-  HEARTH_TITLE="$name" HEARTH_TOKEN="$(cat "/tmp/$name.token")" \
+  local cfg="/tmp/hearth-test/$name"
+
+  # Isolated config per window so alice and bob don't share settings (e.g. each
+  # can select its own audio devices). --fresh empties it for a clean start.
+  if [ "$FRESH" = true ]; then
+    rm -rf "$cfg"
+  fi
+  mkdir -p "$cfg"
+
+  HEARTH_TITLE="$name" HEARTH_TOKEN="$(cat "/tmp/$name.token")" HEARTH_CONFIG_DIR="$cfg" \
     "$BIN" >"$log" 2>&1 &
-  echo "  $name → pid $! (log: $log)"
+  echo "  $name → pid $! (cfg: $cfg, log: $log)"
 }
 
 echo "• launching windows on $DISPLAY…"

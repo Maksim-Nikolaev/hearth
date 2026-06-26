@@ -359,17 +359,27 @@ fn host_of(s: &str) -> String {
     s.to_string()
 }
 
+/// The config directory. `HEARTH_CONFIG_DIR` overrides it so dev harnesses can run
+/// two clients with separate, isolated configs (e.g. distinct audio devices) on
+/// one machine; otherwise it's the per-user OS config dir.
+fn config_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("HEARTH_CONFIG_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+
+    directories::ProjectDirs::from("dev", "hearth", "hearth").map(|d| d.config_dir().to_path_buf())
+}
+
 fn server_file() -> Option<PathBuf> {
-    directories::ProjectDirs::from("dev", "hearth", "hearth").map(|d| d.config_dir().join("server"))
+    config_dir().map(|d| d.join("server"))
 }
 
 fn token_file() -> Option<PathBuf> {
-    directories::ProjectDirs::from("dev", "hearth", "hearth").map(|d| d.config_dir().join("token"))
+    config_dir().map(|d| d.join("token"))
 }
 
 fn settings_file() -> Option<PathBuf> {
-    directories::ProjectDirs::from("dev", "hearth", "hearth")
-        .map(|d| d.config_dir().join("settings.json"))
+    config_dir().map(|d| d.join("settings.json"))
 }
 
 #[cfg(test)]
